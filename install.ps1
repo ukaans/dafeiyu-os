@@ -71,7 +71,7 @@ $drawerFiles = @(
     'AutoHotkey64.exe','AutoHotkey64.exe.manifest','DesktopPage.ahk','dsh-agent.ps1',
     'npix.cs','npix.exe','npix.manifest','hwmon.ps1','wxmon.ps1','dock-add.ps1','dock-add-host.ps1',
     'DesktopIcons.ps1','DesktopPositions.ps1','Build-IconCache.ps1','recycle_tmp.ps1','start-all.vbs',
-    'agent-watch.ps1','ensure-all.ps1','ensure-all.vbs'
+    'agent-watch.ps1','ensure-all.ps1','ensure-all.vbs','wheel-bridge.ps1'
 )
 if ($DryRun) {
     foreach ($f in $drawerFiles) { Say ("  [dry] copy " + $f) }

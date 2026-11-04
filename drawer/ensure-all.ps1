@@ -127,6 +127,27 @@ if (-not (DrawerAlive)) {
     }
 }
 
+# 1b) 滚轮桥（wheel-bridge.ps1 → 由 powershell.exe 承载）
+# 为什么要有它：本机 AHK 进程的鼠标通道会整条哑掉（WheelDown/WheelUp 热键不触发、
+# WM_INPUT 一条都收不到），而同一时刻普通 .NET 进程装 WH_MOUSE_LL 能稳定收到滚轮
+# （2026-11-04 23:2x 对照实测）。编译成 exe 的同一份代码反而收不到事件，
+# 所以桥由 powershell.exe 承载（23:44–23:50 三组对照）。存活判定看命令行里有没有
+# wheel-bridge.ps1；桥自带互斥体，重复拉起会立刻自己退出。
+$bridgeScript = Join-Path $appDir 'wheel-bridge.ps1'
+if (Test-Path $bridgeScript) {
+    $bridgeAlive = $false
+    try {
+        $bridgeAlive = [bool](Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like '*wheel-bridge.ps1*' })
+    } catch { $bridgeAlive = $false }
+    if (-not $bridgeAlive) {
+        StartHidden 'powershell.exe' @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $bridgeScript + '"'))
+        Log 'ensure: wheel-bridge was down, started'
+    }
+} else {
+    Log 'ensure: wheel-bridge.ps1 missing'
+}
+
 # 2) 看门狗
 $watchPid = ReadPid $watchPidF
 $watchAlive = (ProcAlive $watchPid) -or (Test-Mutex 'Global\DesktopPage_agentwatch')

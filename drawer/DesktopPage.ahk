@@ -110,6 +110,16 @@ global WHEEL_HK_LOG := 0                 ; 上一条 "wheel: hk ..." 的时间�
 ;   RAW_WHEEL_TICKS = 其中真正的 RI_MOUSE_WHEEL 且 delta<>0 的条数
 ; RAW_TICKS 与 RAW_MOVE_TICKS 同步累加，保留旧字段只为不打断已有的日志读法。
 global RAW_MOVE_TICKS := 0, RAW_WHEEL_TICKS := 0
+; ---- 滚轮桥（wheel-bridge.exe）：完全不依赖 AHK 自身鼠标钩子的唤起入口 ----
+; 2026-11-04 深夜实测定案：本机的 AHK 进程会整条鼠标通道哑掉（`$WheelDown`/`~LButton`
+; 不触发、WM_INPUT 一条都收不到、A_TimeIdleMouse 一直涨），而同一时刻一个普通 .NET 进程
+; 装 WH_MOUSE_LL 能稳定收到 WM_MOUSEWHEEL(delta=±120)。所以把"看滚轮"这件事挪到
+; 独立的 C# 小进程里，它看懂之后 PostMessage(0x8001) 回来，这里只管决策。
+global BRIDGE_FILE := A_ScriptDir "\wheel-bridge.hwnd"
+global BRIDGE_ANNOUNCE_LOG := 0          ; 上一条 announce 日志的时间戳（限流用）
+global WHEEL_BRIDGE_TICK := 0            ; 桥最后一次把消息投进来的时刻
+global WHEEL_BRIDGE_HITS := 0            ; 桥投进来的滚轮消息条数（diag 用）
+global WHEEL_BRIDGE_LOG := 0             ; 上一条 "bridge: wheel ..." 日志的时间戳（限流用）
 ; ---- 屏幕边缘热区：完全不依赖任何键鼠钩子的等价唤起入口 ----
 global EDGE_SUMMON := true               ; 运行时开关：summon.cmd 写 edge=0 / edge=1
 global EDGE_PX := 6                      ; 触发厚度（96 DPI 下的像素，实际按 A_ScreenDPI 缩放）
@@ -776,6 +786,14 @@ ShowDrawer(instant := false) {
     DllCall("ShowWindow", "Ptr", hwnd, "Int", 8)   ; SW_SHOWNA（不激活，键盘仍由本脚本接管）
     EnsureOverlay()
     FadeIn(hwnd)
+    ; 实测出现过 "ShowDrawer vis=0"：ShowWindow(8) 之后窗口仍不可见（有一次是 alpha/合成卡住），
+    ; 这种时候用户只会看到"唤不出抽屉"。补一次强制显示（SW_SHOWNOACTIVATE），并把结果记下来。
+    if (!DllCall("IsWindowVisible", "Ptr", hwnd)) {
+        DllCall("SetWindowPos", "Ptr", hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", GUI_W, "Int", GUI_H, "UInt", 0x0040)
+        DllCall("ShowWindow", "Ptr", hwnd, "Int", 4)   ; SW_SHOWNOACTIVATE
+        try DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", 255, "UInt", 2)
+        LogWrite("ShowDrawer: not visible after FadeIn, forced SW_SHOWNOACTIVATE -> vis=" DllCall("IsWindowVisible", "Ptr", hwnd))
+    }
     LogWrite("ShowDrawer vis=" DllCall("IsWindowVisible", "Ptr", hwnd) " [page=" (t1 - t0) " ov=" (t2 - t1) " total=" (A_TickCount - t0) "]")
     LogWrite("overlay shown")
     AuditLog("open", "page=" curPage " src=ui")
@@ -1592,6 +1610,12 @@ StartupArgs() {
                 SetTimer(WheelHandle.Bind(Integer(wd), "selftest", false), -1500)
             }
             LogWrite("startup: --wheel=" wd)
+        } else if (SubStr(arg, 1, 9) = "--bridge=") {
+            ; 自检用：假装滚轮桥投来一条消息，走和真实桥完全相同的 OnMessage 处理函数。
+            ; 因为本机 AHK 的鼠标通道会哑、注入也不可见，这是唯一能脚本化验证桥接链路的办法。
+            bd := SubStr(arg, 10)
+            SetTimer(WheelBridgeMsg.Bind(Integer(bd), 0, 0x8001, 0), -1500)
+            LogWrite("startup: --bridge=" bd)
         }
     }
 }
@@ -1879,7 +1903,10 @@ SummonTick() {
     if !FileExist(SUMMON_FILE)
         return
     cmd := ""
-    try cmd := Trim(FileRead(SUMMON_FILE, "UTF-8"))
+    ; AHK v2 的 Trim() 默认只去空格和 Tab，**不去 CR/LF**。而 `echo show > summon.cmd`
+    ; 写出来的文件末尾一定带换行 —— 以前这种调用会被当成未知命令静默丢弃（文件已删、无日志），
+    ; 排查时看起来像"文件通道也是坏的"。这里显式把回车换行也当空白剪掉。
+    try cmd := Trim(FileRead(SUMMON_FILE, "UTF-8"), " `t`r`n")
     try FileDelete(SUMMON_FILE)
     if (cmd = "")
         return
@@ -1983,6 +2010,51 @@ OnRawWheel(wParam, lParam, *) {
     return 0
 }
 
+; ---- 滚轮桥通道 ----------------------------------------------------------
+; wheel-bridge.exe（同目录，C# 编译）装 WH_MOUSE_LL 专门看滚轮。它不吞事件，
+; 只把"看到了一次向下/向上滚"通过 PostMessage(0x8001, 1|2) 告诉这里。
+; 为什么不让抽屉自己看：本机 AHK 进程的鼠标通道会整条哑掉（键盘钩子还活着），
+; 而同一时刻普通 .NET 进程装 WH_MOUSE_LL 能稳定收到 delta=±120，所以把这件事
+; 交给一个不受 AHK 影响的小进程。详见 docs\项目地图.md §8。
+BridgeAnnounce() {
+    global BRIDGE_FILE, BRIDGE_ANNOUNCE_LOG, WHEEL_BRIDGE_TICK
+    ; 句柄写文件给桥读（桥每 2 秒重读一次，所以先起桥、后起抽屉也能接上）
+    try FileDelete(BRIDGE_FILE)
+    try FileAppend(A_ScriptHwnd "`n", BRIDGE_FILE, "UTF-8")
+    if (A_TickCount - BRIDGE_ANNOUNCE_LOG > 60000) {
+        BRIDGE_ANNOUNCE_LOG := A_TickCount
+        LogWrite("bridge: announce hwnd=" A_ScriptHwnd
+            . " bridge_age=" (WHEEL_BRIDGE_TICK ? A_TickCount - WHEEL_BRIDGE_TICK : -1)
+            . " bridge_hits=" WHEEL_BRIDGE_HITS)
+    }
+}
+
+WheelBridgeMsg(wParam, lParam, msg, hwnd) {
+    global WHEEL_HK_TICK, WHEEL_RAW_TICK, WHEEL_BRIDGE_TICK, WHEEL_BRIDGE_HITS, WHEEL_BRIDGE_LOG
+    global curPage
+    WHEEL_BRIDGE_HITS += 1
+    WHEEL_BRIDGE_TICK := A_TickCount
+    ; 热键 / Raw Input / 桥 三条通道 120ms 内只算一次（钩子活着时三条会同时到）
+    if (A_TickCount - WHEEL_HK_TICK < 120 || A_TickCount - WHEEL_RAW_TICK < 120)
+        return 0
+    WHEEL_HK_TICK := A_TickCount
+    WHEEL_RAW_TICK := A_TickCount
+    up := (wParam != 1)
+    ; 桥不吞事件，应用本来就收到了这次滚动。所以只在"抽屉真的要动作"时接管：
+    ; 抽屉关着、光标又不在桌面（或是在向上滚）→ 什么都别做，免得多滚一屏。
+    if (curPage = 0 && (up || !DesktopUnderCursor()))
+        return 0
+    if (A_TickCount - WHEEL_BRIDGE_LOG > 60000) {
+        WHEEL_BRIDGE_LOG := A_TickCount
+        mx := 0, my := 0
+        try MouseGetPos(&mx, &my)
+        LogWrite("bridge: wheel " (up ? "up" : "down") " hits=" WHEEL_BRIDGE_HITS
+            . " page=" curPage " at=" mx "," my)
+    }
+    WheelHandle(up ? -1 : 1, "bridge")
+    return 0
+}
+
 ~Esc:: {
     ; 前缀 ~ 不能少：没有它 AHK 的钩子会把 Esc 全局吞掉，其它程序都收不到 
     ; 只在抽屉可见时接管：否则确认框、重命名框和其它程序都收不到 Esc
@@ -2057,6 +2129,12 @@ BuildGui()
 ; 滚轮兜底通道（鼠标钩子被系统摘掉时靠 Raw Input 兜住）+ 本地代理看门狗
 OnMessage(0x00FF, OnRawWheel)
 WheelRawInit()
+; 滚轮桥：独立 C# 进程（wheel-bridge.exe）装 WH_MOUSE_LL 看滚轮，看懂就 PostMessage(0x8001) 回来。
+; 本机 AHK 的鼠标通道会整条哑掉（见 :92 附近注释与 docs\项目地图.md §8 的记录），
+; 桥是唯一在"AHK 收不到鼠标"时还能用的滚轮入口，所以默认常开、并且每 30 秒重新宣告一次窗口句柄。
+OnMessage(0x8001, WheelBridgeMsg)
+BridgeAnnounce()
+SetTimer(BridgeAnnounce, 30000)
 WHEEL_HK_TICK := A_TickCount
 ; 钩子：**不再调用 InstallMouseHook / InstallKeybdHook**。
 ; 对照打包前（11-01）的版本，那一版一次都没有调用过这两个函数，而滚轮上下都正常；
@@ -3313,6 +3391,7 @@ Summon_CmdDiag(arg := "") {
     global curPage, RAW_OK, RAW_ALIVE, HK_ALIVE, RAW_TICKS, WHEEL_HITS, WHEEL_LASTDIR, WHEEL_LASTSRC
     global gDrawer, WHEEL_HK_TICK, WHEEL_RAW_TICK, RAW_MSGS
     global WHEEL_HK_DOWN, WHEEL_HK_UP, RAW_WHEEL_TICKS, RAW_MOVE_TICKS
+    global BRIDGE_FILE, WHEEL_BRIDGE_HITS, WHEEL_BRIDGE_TICK
     global EDGE_SUMMON, EDGE_ARMED
     ; 一条自带上下文的现场快照：不用让用户去翻日志、也不用我远程敲命令
     mx := 0, my := 0
@@ -3335,7 +3414,9 @@ Summon_CmdDiag(arg := "") {
         . " hk_down=" WHEEL_HK_DOWN " hk_up=" WHEEL_HK_UP
         . " wheel_hits=" WHEEL_HITS " last_dir=" WHEEL_LASTDIR
         . " last_src=" WHEEL_LASTSRC " hk_age=" (A_TickCount - WHEEL_HK_TICK) " raw_age=" (A_TickCount - WHEEL_RAW_TICK)
-        . " edge=" (EDGE_SUMMON ? 1 : 0) " edge_armed=" (EDGE_ARMED ? 1 : 0))
+        . " edge=" (EDGE_SUMMON ? 1 : 0) " edge_armed=" (EDGE_ARMED ? 1 : 0)
+        . " bridge=" (FileExist(BRIDGE_FILE) ? 1 : 0) " bridge_hits=" WHEEL_BRIDGE_HITS
+        . " bridge_age=" (WHEEL_BRIDGE_TICK ? A_TickCount - WHEEL_BRIDGE_TICK : -1))
     AuditLog("summon", "cmd=diag")
 }
 
