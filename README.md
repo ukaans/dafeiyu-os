@@ -69,7 +69,7 @@ git switch main    # 发版
 ├─ 安装.cmd / 卸载.cmd                        双击入口
 ├─ 给DSH的部署指南.md    ← 让 AI 代理独立完成部署的说明
 ├─ 改造指南.md           ← 改外观/加功能/扩协议
-├─ tests\                漏洞与风险测试模块（53 条用例，退出码=高/中危失败数）
+├─ tests\                漏洞与风险测试模块（54 条用例，退出码=高/中危失败数）
 │  └─ Run-Tests.ps1      入口；报告落 tests\out\
 ├─ wallpaper\            壁纸系统（HTML/CSS/JS + assets 立绘）
 └─ drawer\               抽屉系统（AutoHotkey v2 + PowerShell）

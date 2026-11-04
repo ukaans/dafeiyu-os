@@ -294,6 +294,13 @@ function Take-Scroll {
     $sum = 0
     try {
         if (Test-Path $scrollDat) {
+            # 兜底：万一别的东西（外部脚本、旧版本、手工测试）把这个文件写到 1MB 以上，
+            # 先丢掉再返回，不让一次 ReadAllText 卡住单线程主循环。正常路径永远走不到。
+            $fi = Get-Item $scrollDat -ErrorAction SilentlyContinue
+            if ($fi -and $fi.Length -gt 1MB) {
+                try { [System.IO.File]::WriteAllText($scrollDat, '') } catch { }
+                return 0
+            }
             $raw = [System.IO.File]::ReadAllText($scrollDat)
             foreach ($ln in ($raw -split "`n")) {
                 $v = 0
@@ -347,6 +354,14 @@ $rectFile = Join-Path $appDir 'panel-rect.txt'
 $todoTxt = Join-Path $appDir 'todo.txt'
 $todoJs = if ($wallDir) { Join-Path $wallDir 'todo-data.js' } else { '' }
 
+# scroll.dat 是「滚轮意图队列」：抽屉写一行，壁纸页每 80ms 取走并清空。
+# 一旦消费方不在（Lively 没起、壁纸页面报错），它就会一直涨；而 Take-Scroll 是
+# 整份 ReadAllText —— 在单线程代理里，这等于给自己埋一颗「越滚越慢、最后连坐
+# 所有接口」的雷（铁律：单线程不许有 >200ms 的同步操作）。
+# 超过 64KB（约 1.2 万条意图，正常 80ms 就取空，根本到不了）说明消费方早就没了，
+# 旧意图没有重放价值 —— 直接丢弃，别为了几条过期滚动把整条链路拖死。
+$script:SCROLL_MAX = 65536
+
 function Get-TodoItems {
     $out = @()
     if (Test-Path $todoTxt) {
@@ -369,7 +384,13 @@ function Save-TodoItems($items) {
         if ($it.d) { $prefix = 'x ' }
         $lines += ($prefix + $it.t)
     }
-    try { [System.IO.File]::WriteAllLines($todoTxt, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    # 原子写（tmp + Move-Item 覆盖）：直接 WriteAllLines 会有一瞬文件被截断成空/半个，
+    # 而抽屉读 todo.txt、壁纸页加载 todo-data.js 正好撞上，表现就是「待办空一片」。
+    try {
+        $tt = $todoTxt + '.tmp'
+        [System.IO.File]::WriteAllLines($tt, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tt -Destination $todoTxt -Force
+    } catch { }
 
     $ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $sb = New-Object System.Text.StringBuilder
@@ -386,7 +407,14 @@ function Save-TodoItems($items) {
         $first = $false
     }
     [void]$sb.Append("];`n")
-    try { [System.IO.File]::WriteAllText($todoJs, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    # 同上：todo-data.js 是壁纸页用 <script src> 直接加载的，写到一半被读到就是整页脚本挂
+    if ($todoJs) {
+        try {
+            $tj = $todoJs + '.tmp'
+            [System.IO.File]::WriteAllText($tj, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $tj -Destination $todoJs -Force
+        } catch { }
+    }
 }
 
 # ---- 抽屉程序（DesktopPage）是否在跑 ----
@@ -457,7 +485,11 @@ function Save-Dock($items) {
     try {
         $sb = New-Object System.Text.StringBuilder
         foreach ($it in $items) { [void]$sb.AppendLine($it.p + '|' + $it.n + '|' + $it.i) }
-        [System.IO.File]::WriteAllText($dockFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+        # 原子写（与 hwmon/wxmon 同一范式）：dock.txt 由 AHK 与代理共读，
+        # 截断到一半会被读成「快捷启动少了几项」。
+        $dk = $dockFile + '.tmp'
+        [System.IO.File]::WriteAllText($dk, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $dk -Destination $dockFile -Force
     } catch { }
 }
 function Write-DockJs($ctx) {
@@ -1224,7 +1256,14 @@ function Invoke-ScrollGif($ctx, $query) {
     # 壁纸页拿不到真实滚轮事件（桌面窗口在壁纸前面），由抽屉程序转发滚动意图
     $d = 1
     if ($query.raw -match '[?&]d=(-?\d+)') { $d = [int]$matches[1] }
-    try { [System.IO.File]::AppendAllText((Join-Path $appDir 'scroll.dat'), "$d`r`n") } catch { }
+    try {
+        $sol = Join-Path $appDir 'scroll.dat'
+        # 写入方设上限（见 $script:SCROLL_MAX 的注释）：消费方停了就别无限追加。
+        # 判尺寸是元数据查询（~0.1ms），不影响这条高频路由。
+        $fi = Get-Item $sol -ErrorAction SilentlyContinue
+        if ($fi -and $fi.Length -gt $script:SCROLL_MAX) { [System.IO.File]::WriteAllText($sol, '') }
+        [System.IO.File]::AppendAllText($sol, "$d`r`n")
+    } catch { }
     Write-Raw $ctx $gif 'image/gif'
 }
 

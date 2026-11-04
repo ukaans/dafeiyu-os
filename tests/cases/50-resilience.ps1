@@ -123,8 +123,21 @@ Test-Case RES-005 '健壮' '数据落盘使用原子替换' medium {
     $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
     if ($ahk -notmatch 'FileMove\(tmp,\s*path,\s*1\)') { $bad += 'DesktopPage.ahk 缺 tmp+FileMove 原子写' }
 
+    # 代理侧三份「用户能看见的」数据：todo.txt（抽屉读）、todo-data.js（壁纸 <script> 加载）、
+    # dock.txt（AHK 与代理共读）。直接 WriteAllText 会有一瞬文件是空/半个，
+    # 撞上就是「待办空一片 / 快捷启动少几项」——2026-11-05 夜间补齐。
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    foreach ($pair in @(
+            @{ Name = 'todo.txt'; Tmp = '\$todoTxt\s*\+\s*''\.tmp'''; Dst = 'Destination\s+\$todoTxt' }
+            @{ Name = 'todo-data.js'; Tmp = '\$todoJs\s*\+\s*''\.tmp'''; Dst = 'Destination\s+\$todoJs' }
+            @{ Name = 'dock.txt'; Tmp = '\$dockFile\s*\+\s*''\.tmp'''; Dst = 'Destination\s+\$dockFile' }
+        )) {
+        if ($agent -notmatch $pair.Tmp) { $bad += ('dsh-agent.ps1 写 ' + $pair.Name + ' 没走 tmp') }
+        elseif ($agent -notmatch ('Move-Item[^\r\n]*' + $pair.Dst + '[^\r\n]*-Force')) { $bad += ('dsh-agent.ps1 写 ' + $pair.Name + ' 没做原子覆盖') }
+    }
+
     if ($bad.Count -gt 0) { throw ($bad -join '；') }
-    'hw-data / wx-data / layout 三处都是 tmp + 原子覆盖'
+    'hw-data / wx-data / layout / todo / todo-data / dock 六处都是 tmp + 原子覆盖'
 } -Hint '不要用「先删再写」：进程被杀就丢布局；tmp 要同盘同目录（跨盘 Move 会退化成复制+删除）'
 
 Test-Case RES-006 '健壮' 'panel-rect 内容合法' low {
@@ -218,3 +231,38 @@ Test-Case RES-009 '健壮' '采样进程在持续写数据' medium {
     if ($bad.Count -gt 0) { throw ($bad -join '、' + ' —— 面板会一直是 --') }
     ($rows -join '，')
 } -Hint 'hwmon 2s 一轮、wxmon 300s 一轮；没更新先看对应 pid 与 Resolve-WallpaperDir() 解析到的目录'
+
+Test-Case RES-010 '健壮' '滚轮意图队列有上限' medium {
+    # scroll.dat 是「抽屉写一行、壁纸每 80ms 取走并清空」的意图队列。
+    # 消费方一停（Lively 没起 / 壁纸页报错 / 页面脚本挂了），它就只增不减；
+    # 而 Take-Scroll 是整份 ReadAllText —— 单线程代理会被这一条队列拖死，
+    # 表现成「所有接口一起变慢」，正是铁律里最贵的那种故障。
+    $root = Get-DshRoot
+    $inst = Get-DshInstall
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+
+    # 取某个函数的源码段（到下一个顶层 function 为止）
+    $body = {
+        param($code, $fn)
+        $i = $code.IndexOf('function ' + $fn)
+        if ($i -lt 0) { return '' }
+        $j = $code.IndexOf("`nfunction ", $i + 1)
+        if ($j -lt 0) { $j = $code.Length }
+        return $code.Substring($i, $j - $i)
+    }
+
+    $gif = & $body $agent 'Invoke-ScrollGif'
+    $take = & $body $agent 'Take-Scroll'
+    $bad = @()
+    # 判据只看"有没有上限分支"，不锁死具体写法（阈值/清空方式都可以演进）
+    if ($agent -notmatch '\$script:SCROLL_MAX\s*=\s*\d+') { $bad += '没有 SCROLL_MAX 阈值定义' }
+    if ($gif -notmatch 'SCROLL_MAX') { $bad += 'Invoke-ScrollGif 写入前不检查尺寸（无限追加）' }
+    if ($gif -notmatch 'WriteAllText') { $bad += 'Invoke-ScrollGif 超限时没有清空动作' }
+    if ($take -notmatch '1MB') { $bad += 'Take-Scroll 没有超大文件兜底（外部写入会拖死主循环）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    $sz = Res-Size (Join-Path $inst 'scroll.dat')
+    $szTxt = if ($sz -lt 0) { '当前无残留' } else { Res-KB $sz }
+    if ($sz -gt 1MB) { throw ('scroll.dat 已达 ' + (Res-KB $sz) + '，超过 1MB 兜底阈值') }
+    ('写入方 64KB 截断 + 读取方 1MB 兜底都在；scroll.dat ' + $szTxt)
+} -Hint 'scroll.dat 是瞬时意图队列，旧意图无重放价值；超限直接丢弃，别为了几条过期滚动拖慢整条单线程'

@@ -95,12 +95,32 @@ Test-Case DAT-005 '数据' '生成物 JS 语法合法' medium {
     if (-not $wall -or -not (Test-Path -LiteralPath $wall)) { return @{ Status = 'skip'; Detail = '没解析到壁纸目录' } }
     $bad = @()
     $n = 0
-    foreach ($f in @('hw-data.js', 'wx-data.js', 'todo-data.js')) {
-        $p = Join-Path $wall $f
-        if (-not (Test-Path -LiteralPath $p)) { $bad += ($f + ' 缺失'); continue }
-        $n++
-        $o = & $node.Source --check $p 2>&1
-        if ($LASTEXITCODE -ne 0) { $bad += ($f + ' → ' + ((@($o) | Select-Object -First 1) -join '')) }
+    $snap = Join-Path $env:TEMP ('dsh_dat005_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.js')
+    try {
+        foreach ($f in @('hw-data.js', 'wx-data.js', 'todo-data.js')) {
+            $p = Join-Path $wall $f
+            if (-not (Test-Path -LiteralPath $p)) { $bad += ($f + ' 缺失'); continue }
+            # 先快照再验：hwmon 每 2s 用 Move-Item 覆盖 hw-data.js，node 直接打开原文件
+            # 会偶尔撞上"正在被替换"的那一瞬，报成 Cannot find module —— 假阳性
+            # （2026-11-05 夜间实测出现过一次，同一个文件手跑 120 次全绿）。
+            # 快照读失败就重试；读到的仍是一份完整内容，真语法错照样会红。
+            $copied = $false
+            for ($k = 0; $k -lt 5 -and -not $copied; $k++) {
+                try { [System.IO.File]::Copy($p, $snap, $true); $copied = $true }
+                catch { Start-Sleep -Milliseconds 120 }
+            }
+            if (-not $copied) { $bad += ($f + ' → 连续 5 次读不到（采样进程正在写？）'); continue }
+            $n++
+            $o = & $node.Source --check $snap 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                # node 的报错开头是内部栈（node:internal/process/promises），真错误在末尾
+                $hit = @($o) | Where-Object { $_ -match 'Error|error' } | Select-Object -First 1
+                if (-not $hit) { $hit = @($o) | Select-Object -Last 1 }
+                $bad += ($f + ' → ' + ([string]$hit).Trim())
+            }
+        }
+    } finally {
+        try { [System.IO.File]::Delete($snap) } catch { }
     }
     if ($bad.Count -gt 0) { throw ('生成物语法错（壁纸整页脚本会挂）：' + ($bad -join '；')) }
     ($n.ToString() + ' 份生成物语法正常（hw/wx/todo-data.js）')

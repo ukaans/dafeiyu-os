@@ -8,6 +8,9 @@
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'DesktopPage')
 )
+# Invoke-WebRequest 默认会画进度条，把 [ OK ] / [FAIL] 一行行冲掉 —— 每次自检都
+# 读成一团乱麻（"正在读取 Web 响应" 混在结论里）。自检的输出是给人看的，关掉。
+$ProgressPreference = 'SilentlyContinue'
 $fail = 0
 function Ok([string]$m)   { Write-Host ("[ OK ] " + $m) -ForegroundColor Green }
 function Bad([string]$m)  { Write-Host ("[FAIL] " + $m) -ForegroundColor Red; $script:fail++ }

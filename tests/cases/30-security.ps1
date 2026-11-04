@@ -133,22 +133,73 @@ Test-Case SEC-007 '安全' '日志里没有密钥明文' high {
 } -Hint '余额查询用的 key 在 E:\DSH\.dsh\.env；日志只能记 ok/fail，不能记请求头与 key'
 
 Test-Case SEC-008 '安全' '待办文本不能注入多行' medium {
-    if (-not (Test-DshApiUp)) { return (Test-DshAbort) }
-    $inst = Get-DshInstall
-    $todo = Join-Path $inst 'todo.txt'
-    $bak = $todo + '.sectest'
-    if (Test-Path -LiteralPath $todo) { Copy-Item -LiteralPath $todo -Destination $bak -Force }
-    $before = if (Test-Path -LiteralPath $todo) { @(Get-Content -LiteralPath $todo).Count } else { 0 }
+    # 不碰真实 todo.txt：把 dsh-agent.ps1 复制到临时目录、换掉单实例互斥体名，
+    # 用独立端口 + 只给子进程改的 LOCALAPPDATA 起一个一次性实例，注完立刻杀掉。
+    #
+    # 为什么不再是 -Intrusive：这条原来靠"备份→注一条→还原"验真实的 todo.txt，
+    # 于是日常 Safe 模式永远跳过 —— 等于没人知道清洗到底在不在（2026-11-04 的日志
+    # 就据此误判成"代码未修"，实际早就修了）。隔离实例既不改用户数据，又能真跑。
+    $srcAgent = Join-Dsh (Get-DshRoot) 'drawer\dsh-agent.ps1'
+    if (-not (Test-Path -LiteralPath $srcAgent)) { throw '源码里找不到 drawer\dsh-agent.ps1' }
+
+    $tmp = Join-Path $env:TEMP ('dsh_sec008_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $app = Join-Path $tmp 'DesktopPage'
+    [void][System.IO.Directory]::CreateDirectory($app)
+
+    # 借一个空闲端口：先绑 0 拿到号再放开，真正 Listen 的是子进程
+    $tl = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $tl.Start(); $port = [int]$tl.LocalEndpoint.Port; $tl.Stop()
+
+    $code = [System.IO.File]::ReadAllText($srcAgent, [System.Text.Encoding]::UTF8)
+    $mtxOld = "'Global\DesktopPage_dshagent'"
+    if (-not $code.Contains($mtxOld)) { throw '找不到单实例互斥体名，隔离不了（代理结构变了？）' }
+    $code = $code.Replace($mtxOld, "'Local\DesktopPage_dshagent_SEC008'")
+    $dst = Join-Path $tmp 'agent-selftest.ps1'
+    [System.IO.File]::WriteAllText($dst, $code, (New-Object System.Text.UTF8Encoding($true)))
+
+    $todo = Join-Path $app 'todo.txt'
+    [System.IO.File]::WriteAllLines($todo, [string[]]@('alpha task', 'beta task'), (New-Object System.Text.UTF8Encoding($false)))
+
+    $proc = $null
     try {
-        $payload = [System.Uri]::EscapeDataString("SEC008`r`nINJECTED-BY-TEST")
-        [void](Invoke-DshHttp -Path ('/todo.gif?op=add&t=' + $payload) -TimeoutMs 2500)
-        Start-Sleep -Milliseconds 250
-        $after = if (Test-Path -LiteralPath $todo) { @(Get-Content -LiteralPath $todo).Count } else { 0 }
-        if ($after -gt ($before + 1)) {
-            throw ('待办从 ' + $before + ' 行涨到 ' + $after + ' 行：一次 add 写进了多行（换行未过滤）')
+        # 只让子进程看到临时 LOCALAPPDATA：它的 $appDir 落到临时目录，真实待办一个字都不动。
+        # 用「改环境变量 → Start-Process → 立刻还原」而不是 ProcessStartInfo.EnvironmentVariables
+        # （后者在本机 PS 5.1 上取到 null，赋值直接抛「无法对 Null 数组进行索引」）。
+        $oldLad = $env:LOCALAPPDATA
+        $env:LOCALAPPDATA = $tmp
+        try {
+            $proc = Start-Process -FilePath 'powershell.exe' `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dst, '-Port', "$port") `
+                -WindowStyle Hidden -PassThru
+        } finally {
+            $env:LOCALAPPDATA = $oldLad
         }
-        ('add 一次只增 ' + ($after - $before) + ' 行，换行未造成多行注入')
+
+        $up = $false
+        for ($i = 0; $i -lt 50; $i++) {
+            if ($proc.HasExited) { break }
+            try {
+                $tc = New-Object System.Net.Sockets.TcpClient
+                $tc.Connect('127.0.0.1', $port); $tc.Close(); $up = $true; break
+            } catch { Start-Sleep -Milliseconds 300 }
+        }
+        if (-not $up) { throw ('隔离实例没起来（端口 ' + $port + '），SEC-008 无法验证') }
+
+        $before = @([System.IO.File]::ReadAllLines($todo)).Count
+        $payload = [System.Uri]::EscapeDataString("SEC008`r`nINJECTED-BY-TEST")
+        $req = [System.Net.WebRequest]::Create('http://127.0.0.1:' + $port + '/todo.gif?op=add&t=' + $payload)
+        $req.Timeout = 3000
+        try { $resp = $req.GetResponse(); $resp.Close() } catch { }
+        Start-Sleep -Milliseconds 400
+
+        $lines = @([System.IO.File]::ReadAllLines($todo))
+        $delta = $lines.Count - $before
+        if ($delta -gt 1) {
+            throw ('待办从 ' + $before + ' 行涨到 ' + $lines.Count + ' 行：一次 add 写进了多行（换行未过滤）')
+        }
+        ('隔离实例 add 一次只增 ' + $delta + ' 行，%0A 注入被压成单行（末行：' + $lines[-1] + '）')
     } finally {
-        if (Test-Path -LiteralPath $bak) { Copy-Item -LiteralPath $bak -Destination $todo -Force; Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+        if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch { } }
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
     }
-} -Intrusive -Hint 'Invoke-TodoGif 应在入库前把 [\r\n] 压成空格；否则一条待办能伪造多条'
+} -Hint 'Invoke-TodoGif 应在入库前把 [\r\n] 压成空格；否则一条待办能伪造多条。用例走隔离实例，不写真实 todo.txt'

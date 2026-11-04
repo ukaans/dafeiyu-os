@@ -48,6 +48,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 
 - **默认（Safe）**：只做静态分析、读文件、`*.js` 接口的 GET、`/icon/` 探测、一条 `/audit.gif` 自测行、一条 `summon.cmd=diag`（只落日志不弹窗）。
 - **`-Intrusive`**：额外允许改 `todo.txt`、`panel-rect.txt` 这类状态；用例自己负责备份与还原。
+  **2026-11-05 起已无用例需要它**——原来唯一标侵入式的 `SEC-008` 改成"临时目录 + 独立端口 + 独立 `LOCALAPPDATA` 的隔离实例"来验，不碰真实 `todo.txt`。开关保留只为兼容旧脚本。
 - **永不**：不重启进程、不调用 `schtasks`、不打开抽屉、不触碰 `layout.dat` / `items.tsv`。
 
 夜间自动任务用默认模式跑。
@@ -109,7 +110,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | SEC-005 | CSP 是否收敛 `script-src` |
 | SEC-006 | 代理只监听 `127.0.0.1`（不是 `+` / `0.0.0.0`） |
 | SEC-007 | 4 份日志里没有 `sk-` 密钥明文 |
-| SEC-008 | 待办正文换行不能注入多行（`-Intrusive`） |
+| SEC-008 | 待办正文换行不能注入多行 —— 用**隔离实例**验（临时目录 + 独立端口 + 独立 `LOCALAPPDATA`），不写真实 `todo.txt`，因此 Safe 模式也会跑 |
 
 ### 40-runtime · 运行时健康（11 条）
 | 编号 | 查什么 |
@@ -138,6 +139,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-007 | 看门狗没有"10 分钟内 ≥3 次"的重启风暴；**且最近一次重启在 60 分钟内才算"仍在风暴中"**（几小时前调试留下的旧风暴判为已恢复，数字仍写进 detail） |
 | RES-008 | `start-all.log` 最近一轮走到 `done`、无 `STILL DOWN` |
 | RES-009 | `hw-data.js` ≤15s、`wx-data.js` ≤330s 在更新 |
+| RES-010 | `scroll.dat` 有上限：写入方超 64KB 截断（`$script:SCROLL_MAX`）、读取方超 1MB 兜底；否则消费方一停就只增不减，而 `Take-Scroll` 是整份 `ReadAllText`，会拖死单线程代理 |
 
 ### 60-data · 数据完整性（7 条）
 | 编号 | 查什么 |
@@ -150,7 +152,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 53 条。
+合计 54 条。
 
 ---
 
