@@ -1,0 +1,179 @@
+{
+  "files": [
+    {
+      "file": "ASSETS.md",
+      "bytes": 3134,
+      "sha256": "64105df4bc8f3d232dfcc4097dbe7d968c730e45c006259c8d5762f4946558be"
+    },
+    {
+      "file": "LICENSE",
+      "bytes": 1088,
+      "sha256": "b2d42e810a6cf1b70e3f13083f29f6f891bb789e7430c403814acc356a5a2836"
+    },
+    {
+      "file": "THIRD_PARTY_NOTICES.md",
+      "bytes": 1135,
+      "sha256": "456c7386b78346067d166e34804595c602ed2923f6310ce19af706ac4cb0eadb"
+    },
+    {
+      "file": "app.js",
+      "bytes": 83186,
+      "sha256": "50b5620feada482f62e465936305822a1a97809ece3e36c421a52448294483ae"
+    },
+    {
+      "file": "assets/background.png",
+      "bytes": 1810524,
+      "sha256": "40c78a14a0ff8c8ea4c319ce6244b7c6510f3a9b669cfb27c5fc346391d61e5d"
+    },
+    {
+      "file": "assets/character/annoyed_1.png",
+      "bytes": 2047964,
+      "sha256": "a1134689d9b92106a748bd1c5f1d64822aad390ec9176ced7638ef0679acf48b"
+    },
+    {
+      "file": "assets/character/annoyed_2.png",
+      "bytes": 2028379,
+      "sha256": "a84e5dd370a7cc3761f7082f4f9e6d4960cafd52246b1ddcc5589dae5565d8a5"
+    },
+    {
+      "file": "assets/character/annoyed_3.png",
+      "bytes": 2030545,
+      "sha256": "e850062882675c9dbc4e3fc9a148067d0931484ac6dc308fd71ae4c2d2cbed1b"
+    },
+    {
+      "file": "assets/character/asking_hug.png",
+      "bytes": 2085173,
+      "sha256": "fa0c99455ed44b330f0b33d4bb85905f7c382197cb5b68eabf000a172a4bfceb"
+    },
+    {
+      "file": "assets/character/blink.png",
+      "bytes": 2009115,
+      "sha256": "45bad6a2a361586cddf439e22a7f057d1340d931da71d865dd08a9757f2d9c9e"
+    },
+    {
+      "file": "assets/character/crying.png",
+      "bytes": 2067130,
+      "sha256": "61f0c16f150a5ab28b934d3c442b7d8c8096a5407edef9c2ec7591c33d4a76f9"
+    },
+    {
+      "file": "assets/character/feeding_base.png",
+      "bytes": 2035615,
+      "sha256": "43d3b39c16a5c8227ec40720d688c3374df4d3238f6f4de8b795f7c8ee024278"
+    },
+    {
+      "file": "assets/character/feeding_chew.png",
+      "bytes": 2018859,
+      "sha256": "302ae7b75a532271f02adfd5e388775aa83c6f3ddaff1d9a142d637a2f1126aa"
+    },
+    {
+      "file": "assets/character/feeding_ready.png",
+      "bytes": 2120268,
+      "sha256": "acc754827c4178520f32ab411b4c1689a92619fc66f19b6232875cc4f602f58e"
+    },
+    {
+      "file": "assets/character/hugging.png",
+      "bytes": 2088632,
+      "sha256": "21193af000ae3b130eb19a16ae945013c32614034baf6d3e31a837a4ad45689c"
+    },
+    {
+      "file": "assets/character/idle.png",
+      "bytes": 2170136,
+      "sha256": "ae60c6912025955370ce8a1a3876aa831d30de14659f4bfebaacba4c9efd4dce"
+    },
+    {
+      "file": "assets/character/listening.png",
+      "bytes": 2000789,
+      "sha256": "6e72993fd12edcd532499e0ac8b53a4ad644369410cb83988ecccb02a4c68635"
+    },
+    {
+      "file": "assets/character/petting.png",
+      "bytes": 2031150,
+      "sha256": "7311f11b057baa5e6f0396b15d9393e19d84e5f679c57db517105ad34120b861"
+    },
+    {
+      "file": "assets/character/pinch_left.png",
+      "bytes": 1995616,
+      "sha256": "98b120badc41eb26dc33f4f3135aa2f780c65613e02384622ca8db2db7328b62"
+    },
+    {
+      "file": "assets/character/pinch_right.png",
+      "bytes": 2034077,
+      "sha256": "714e2d81c82fd338594ccc7e17a164992bde1a721f80edebca837ae67513e226"
+    },
+    {
+      "file": "assets/character/spoon_empty.png",
+      "bytes": 227921,
+      "sha256": "142837929592cfdbe47dee7513f42308d1c46aaca427de362f7e1d4c3e354c49"
+    },
+    {
+      "file": "assets/character/spoon_loaded.png",
+      "bytes": 241623,
+      "sha256": "11a442395a21665b61136d86fee236d5c358eac70f561b06359898e1ca2fa18d"
+    },
+    {
+      "file": "assets/character/study.png",
+      "bytes": 2097802,
+      "sha256": "678ef8471e05f471c1a98f7f62469091fbeddd399913799b7b4ccd096e20901b"
+    },
+    {
+      "file": "assets/character/study_tired.png",
+      "bytes": 2084303,
+      "sha256": "1e6e0e24870f6f4159ffe59ab293d7f7142444d9dbd75f087ef205d69c7d25d4"
+    },
+    {
+      "file": "assets/fonts/BarlowCondensed-Medium.ttf",
+      "bytes": 103360,
+      "sha256": "262bd143292ce479ee0cd09a42b47ab173fca8e9c6eb5ed0b5c8a845bc371d17"
+    },
+    {
+      "file": "assets/fonts/BarlowCondensed-OFL.txt",
+      "bytes": 4377,
+      "sha256": "186d750eb496a4c17a76385f82be6aea2ac1cf2de074a811d63786cf374ea73f"
+    },
+    {
+      "file": "assets/fonts/BarlowCondensed-Regular.ttf",
+      "bytes": 102480,
+      "sha256": "583cec5da3b84bc4dc7c9c72e2a565c94d34e431518b19d7e250b7830ad5f996"
+    },
+    {
+      "file": "assets/fonts/Oxanium-OFL.txt",
+      "bytes": 4384,
+      "sha256": "fe17c0f2581d71b4e1ea7e636e7f4877c29223e11bb1dd1a871e8c3f2a86336b"
+    },
+    {
+      "file": "assets/fonts/Oxanium-Variable.ttf",
+      "bytes": 43536,
+      "sha256": "2ce01d946e1e1ffc8d7eecfffbda8623bedd63eaf811a20488c4b69af45babb0"
+    },
+    {
+      "file": "audio-host.js",
+      "bytes": 1318,
+      "sha256": "313b3fe7f722d6d1ffa5befc3ab98c343112c727ab72149c3e94a7b73e30dd18"
+    },
+    {
+      "file": "index.html",
+      "bytes": 21170,
+      "sha256": "ba1b96f400d77980246bac4485fb00c267a71496db283fa4935676370d06c7f4"
+    },
+    {
+      "file": "layout.css",
+      "bytes": 9952,
+      "sha256": "e5e0b9907faf1e67e3c3cb59e50771a29c783d7ec0f689a815816cbf937b1968"
+    },
+    {
+      "file": "preview.gif",
+      "bytes": 433784,
+      "sha256": "1fde6a40bc6aa9685cf240c75f02895e0f1ef16277570c55eaf52539dcfb4f79"
+    },
+    {
+      "file": "project.json",
+      "bytes": 5655,
+      "sha256": "0e9a1c1dc87e01988dd2f6ad05b85c7b8779f6c1e6d5a1854ac845dd3ebf3334"
+    },
+    {
+      "file": "style.css",
+      "bytes": 34551,
+      "sha256": "200d7c205db407965a73977edf52538fc700f206a08ba3384cee9e4a993092ab"
+    }
+  ]
+}

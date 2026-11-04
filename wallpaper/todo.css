@@ -1,0 +1,609 @@
+/* 待办任务条 —— 横向、全部位于顶栏发丝线之上，沿用壁纸 HUD 语言 */
+.legacy-top[hidden] {
+  display: none !important;
+}
+
+.todo-top {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 2%;
+  width: max-content;
+  max-width: min(66vw, 1520px);
+  height: calc(6.5vh - 4px);
+  min-height: 52px;
+  box-sizing: border-box;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  border: 1px solid rgba(220, 229, 235, 0.42);
+  border-bottom-color: rgba(220, 229, 235, 0.26);
+  background: linear-gradient(90deg, rgba(15, 20, 26, 0.9), rgba(15, 20, 26, 0.62));
+  font: 400 clamp(12px, 0.86vw, 17px) / 1.1 var(--mono);
+  letter-spacing: 0.6px;
+  color: var(--ink);
+  z-index: 6;
+  pointer-events: auto;
+  overflow: hidden;
+}
+
+.todo-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  letter-spacing: 2.2px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.todo-head .barcode {
+  width: 46px;
+  height: 12px;
+  border-width: 2px;
+}
+
+.todo-sep {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 58%;
+  background: rgba(220, 229, 235, 0.26);
+}
+
+.todo-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: clamp(12px, 1.15vw, 22px);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.todo-list[hidden] {
+  display: none !important;
+}
+
+.todo-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  max-width: 32ch;
+  min-width: 0;
+  cursor: pointer;
+}
+.todo-item .box {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  font: 400 9px / 1 var(--digits);
+  color: #131a20;
+  background: transparent;
+}
+.todo-item[data-done="1"] .box {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+.todo-item .txt {
+  font: 400 clamp(12px, 0.92vw, 17px) / 1.2 var(--body);
+  letter-spacing: 0.4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.todo-item[data-done="1"] .txt {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  opacity: 0.72;
+}
+.todo-item .del {
+  flex: 0 0 auto;
+  padding: 0 1px;
+  color: rgba(189, 199, 206, 0.45);
+  font: 400 13px / 1 var(--mono);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.todo-item:hover .del {
+  opacity: 1;
+}
+.todo-item .del:hover {
+  color: #edf2f6;
+}
+
+.todo-more {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-family: var(--digits);
+  letter-spacing: 1px;
+  opacity: 0.85;
+}
+
+.todo-empty {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  letter-spacing: 2.2px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.todo-empty[hidden] {
+  display: none !important;
+}
+
+.todo-add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  width: clamp(96px, 9.5vw, 168px);
+  min-width: 0;
+}
+.todo-add .plus {
+  flex: 0 0 auto;
+  font: 400 1em / 1 var(--digits);
+  color: var(--muted);
+}
+.todo-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  padding: 0;
+  font: 400 clamp(12px, 0.9vw, 16px) / 1.2 var(--body);
+  letter-spacing: 0.4px;
+}
+.todo-add input::placeholder {
+  color: rgba(189, 199, 206, 0.5);
+  letter-spacing: 1.4px;
+  font-family: var(--mono);
+}
+
+.todo-count {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  background: #b3bdc773;
+  color: #edf2f6;
+  font-family: var(--digits);
+  font-weight: 400;
+  letter-spacing: 1.4px;
+  font-size: 0.94em;
+}
+
+/* ===== 本机硬件：隐藏壁纸自带的模拟数值，显示 hwmon 采到的真实数据 ===== */
+#cpuValue,
+#memoryValue,
+#memoryDetail,
+#uptime,
+#cpuMeter,
+#memoryMeter {
+  display: none !important;
+}
+#cpuReal,
+#gpuReal {
+  min-width: 62px;
+}
+#cpuBar,
+#gpuBar {
+  background: linear-gradient(90deg, #dce4e9, #9fb0bd);
+  transition: width 0.6s ease-out;
+}
+#detailReal,
+#uptimeReal {
+  opacity: 0.92;
+}
+#uptimeReal {
+  text-align: right;
+}
+/* ===== 天气模块（wx.js 动态生成，覆盖原 IPV6 ROOT 面板） ===== */
+#weatherInfo .wx-data {
+  margin-top: 6px;
+}
+#weatherInfo .wx-data dt {
+  letter-spacing: 0.04em;
+}
+#wxTemp {
+  font-size: 1.55em !important;
+  font-weight: 600;
+  color: #edf2f6 !important;
+  letter-spacing: 0.02em;
+}
+#weatherInfo .wx-foot {
+  margin-top: 8px;
+}
+/* ===== DSH 迷你面板（dsh.js 动态生成，替换右侧 RUNTIME 控制台） ===== */
+#dshPanel {
+  margin: 10px 0 14px;
+  padding: 8px 10px 9px;
+  border: 1px solid rgba(220, 229, 235, 0.38);
+  background: linear-gradient(180deg, rgba(12, 17, 22, 0.82), rgba(12, 17, 22, 0.62));
+  font-family: var(--mono);
+  color: var(--ink, #dce4e9);
+}
+#dshPanel .dsh-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  color: var(--muted, #bdc7ce);
+  margin-bottom: 6px;
+}
+#dshPanel .dsh-title i {
+  width: 5px;
+  height: 5px;
+  background: currentColor;
+  display: inline-block;
+}
+#dshPanel .dsh-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7d8a92;
+  margin-left: auto;
+}
+#dshPanel .dsh-dot.ok { background: #79c47b; box-shadow: 0 0 6px rgba(121, 196, 123, 0.8); }
+#dshPanel .dsh-dot.busy { background: #d7b45f; box-shadow: 0 0 6px rgba(215, 180, 95, 0.8); }
+#dshPanel .dsh-dot.off { background: #9a5a5a; }
+#dshPanel #dshLog {
+  margin: 0;
+  height: clamp(150px, 17vh, 320px);
+  min-height: 120px;
+  overflow: auto;
+  /* 永远预留滚动条槽位：内容长短切换时不会因为滚动条出现/消失而横向抖动 */
+  scrollbar-gutter: stable;
+  /* 滚到顶/底时不再把滚轮冒泡给外层（否则会被抽屉程序当成桌面手势） */
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #cfe6d4;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(220, 229, 235, 0.16);
+  padding: 6px 7px;
+}
+#dshPanel .dsh-input {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+#dshPanel #dshText {
+  flex: 1;
+  min-width: 0;
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(220, 229, 235, 0.28);
+  color: var(--ink, #dce4e9);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 5px 7px;
+  outline: none;
+}
+#dshPanel #dshText:focus { border-color: rgba(220, 229, 235, 0.6); }
+#dshPanel button {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  color: var(--ink, #dce4e9);
+  background: rgba(220, 229, 235, 0.1);
+  border: 1px solid rgba(220, 229, 235, 0.36);
+  padding: 4px 9px;
+  cursor: pointer;
+}
+#dshPanel button:hover { background: rgba(220, 229, 235, 0.22); }
+/* ▲▼ 在日志不足一屏时被置为 disabled（dsh.js 的 syncNavBtns） */
+#dshPanel .dsh-actions button:disabled { opacity: .45; cursor: default; }
+#dshPanel .dsh-actions button:disabled:hover { background: rgba(220, 229, 235, 0.1); }
+#dshPanel .dsh-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+#dshPanel .dsh-state {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted, #bdc7ce);
+  letter-spacing: 0.08em;
+}
+#dshPanel .dsh-balance {
+  display: flex;
+  align-items: baseline;
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(220, 229, 235, 0.16);
+  font-size: 11.5px;
+  letter-spacing: 0.16em;
+  color: var(--muted, #bdc7ce);
+}
+#dshPanel .dsh-balance b {
+  font-family: var(--digits);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: #eaf1f6;
+}
+/* ===== 抽屉启动按钮旁的状态点 ===== */
+.drawer-dot {
+  position: absolute;
+  left: -15px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: block;
+  background: #8f4a4a;
+  box-shadow: 0 0 6px rgba(143, 74, 74, 0.7);
+  transition: background 0.3s ease, box-shadow 0.3s ease;
+}
+#settingsButton {
+  position: relative;
+  overflow: visible;
+}.drawer-dot.on {
+  background: #79c47b;
+  box-shadow: 0 0 8px rgba(121, 196, 123, 0.9);
+}
+.drawer-dot.busy {
+  background: #d7b45f;
+  box-shadow: 0 0 8px rgba(215, 180, 95, 0.9);
+}
+
+/* 日志区滚动条：加宽一点，便于拖动 */
+#dshPanel #dshLog::-webkit-scrollbar {
+  width: 10px;
+}
+#dshPanel #dshLog::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.28);
+}
+#dshPanel #dshLog::-webkit-scrollbar-thumb {
+  background: rgba(220, 229, 235, 0.42);
+  border-radius: 5px;
+}
+#dshPanel #dshLog::-webkit-scrollbar-thumb:hover {
+  background: rgba(220, 229, 235, 0.62);
+}
+/* 操作行在窄面板里不要换行 */
+#dshPanel .dsh-actions {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+#dshPanel .dsh-actions button {
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  min-width: 0;
+}
+#dshPanel .dsh-actions button#dshUp,
+#dshPanel .dsh-actions button#dshDown {
+  padding: 2px 5px;
+  font-size: 10px;
+}
+#dshPanel .dsh-state {
+  white-space: nowrap;
+  font-size: 11px;
+}
+/* ===== 快捷启动栏（6 格：2 行 x 3 列） ===== */
+#dockPanel {
+  margin-top: 10px;
+}
+#dockPanel h2 {
+  margin: 0 0 6px;
+}
+#dockGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(2, auto);
+  gap: 6px;
+  padding: 7px;
+  border: 1px solid rgba(220, 229, 235, 0.22);
+  background: linear-gradient(180deg, rgba(12, 17, 22, 0.42), rgba(12, 17, 22, 0.26));
+}
+#dockGrid .dock-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 5px 2px 3px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+#dockGrid .dock-tile:hover {
+  background: rgba(220, 229, 235, 0.1);
+  border-color: rgba(220, 229, 235, 0.34);
+}
+#dockGrid .dock-tile.empty {
+  cursor: default;
+  opacity: 0.45;
+}
+#dockGrid .dock-tile img {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  display: block;
+}
+#dockGrid .dock-tile .dock-plus {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: var(--muted, #bdc7ce);
+  border: 1px dashed rgba(220, 229, 235, 0.34);
+}
+#dockGrid .dock-name {
+  font-size: 10.5px;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink, #dce4e9);
+}
+#dockGrid .dock-del {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 14px;
+  height: 14px;
+  line-height: 12px;
+  text-align: center;
+  font-size: 11px;
+  color: #e8b0b0;
+  background: rgba(20, 12, 12, 0.72);
+  border: 1px solid rgba(232, 176, 176, 0.5);
+  display: none;
+}
+#dockGrid .dock-tile:hover .dock-del {
+  display: block;
+}
+#dockHint {
+  margin-top: 5px;
+  font-size: 10px;
+  opacity: 0.72;
+}
+/* 紧凑化：给快捷启动栏腾出空间 */
+#infoPanel section { margin-top: 8px; }
+#infoPanel h2 { margin-bottom: 5px; }
+#infoPanel .small-data div,
+#infoPanel .environment-data div { line-height: 1.22; }
+#dockPanel .dock-hint { display: none !important; }
+#dockGrid { gap: 4px; padding: 5px; }
+#dockGrid .dock-tile { padding: 3px 2px 2px; gap: 2px; }
+#dockGrid .dock-tile img,
+#dockGrid .dock-tile .dock-plus { width: 24px; height: 24px; }
+#dockGrid .dock-tile .dock-plus { font-size: 14px; }
+#dockGrid .dock-name { font-size: 9px; }
+#dockPanel h2 { margin-bottom: 4px; }
+/* 快捷启动栏改成横向单元格（图标左、名字右），两行三列更省高度 */
+#dockGrid .dock-tile {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  padding: 2px 4px;
+}
+#dockGrid .dock-tile img,
+#dockGrid .dock-tile .dock-plus { width: 20px; height: 20px; flex: 0 0 20px; }
+#dockGrid .dock-name { font-size: 9.5px; text-align: left; }
+#dockGrid .dock-del { top: -3px; right: -3px; width: 12px; height: 12px; line-height: 10px; font-size: 10px; }
+#dockPanel h2 { font-size: 11px; letter-spacing: 0.14em; }
+#dockGrid .dock-tile.busy { opacity: .8; border-color: rgba(220,229,235,.5); }
+#dockGrid .dock-tile.busy .dock-plus { color: #dce4e9; }
+
+/* ===== 当前播放（GSMTC 由桌面代理提供） ===== */
+#mediaPanel {
+  margin-top: 8px;
+  width: calc(100% + 16px);
+  margin-left: -8px;
+  margin-right: -8px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 152px;
+}
+#mediaPanel h2 {
+  margin-bottom: 0;
+}
+#mediaPanel .media-title {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 19px;
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+  color: var(--ink, #dce4e9);
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+#mediaPanel .media-sub {
+  margin: 2px 0 0;
+  font-size: 13.5px;
+  letter-spacing: 0.04em;
+  color: rgba(220, 229, 235, 0.82);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#mediaPanel .media-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+#mediaPanel .media-btn {
+  flex: 0 0 auto;
+  min-width: 50px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid rgba(220, 229, 235, 0.38);
+  background: rgba(12, 17, 22, 0.45);
+  color: var(--ink, #dce4e9);
+  font-family: var(--digits);
+  font-size: 16px;
+  line-height: 34px;
+  cursor: pointer;
+}
+#mediaPanel .media-btn-track {
+  font-size: 12.5px;
+  letter-spacing: 0;
+  padding: 0 8px;
+}
+#mediaPanel .media-btn.pending {
+  opacity: 0.6;
+  border-color: rgba(220, 229, 235, 0.7);
+}
+#mediaPanel .media-btn:hover {
+  border-color: rgba(220, 229, 235, 0.7);
+  background: rgba(24, 32, 40, 0.7);
+}
+#mediaPanel .media-btn-main {
+  flex: 1 1 auto;
+  font-size: 19px;
+  letter-spacing: 0.1em;
+}
+#mediaPanel .media-meter {
+  margin: 0;
+  height: 8px;
+  background: rgba(220, 229, 235, 0.18);
+  overflow: hidden;
+}
+#mediaPanel .media-meter i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #dce4e9, #9fb0bd);
+  transition: width 0.4s linear;
+}
+#mediaPanel .media-time {
+  margin: 0;
+  font-family: var(--digits);
+  font-size: 13.5px;
+  letter-spacing: 0.07em;
+  color: rgba(220, 229, 235, 0.82);
+}
+#mediaPanel.idle .media-title {
+  color: var(--muted, #bdc7ce);
+}
+#mediaPanel.idle .media-btn {
+  opacity: 0.45;
+  cursor: default;
+}

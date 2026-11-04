@@ -1,0 +1,197 @@
+{
+  "title": "Deepseek 图鲸鲸 · 大肥鱼数字生命控制台",
+  "description": "把图鲸鲸接回桌面，摸摸头、喂口饭，再陪她听一首歌。\n\n暖光书房与数字生命模拟器风格的交互网页壁纸。角色会眨眼、呼吸，发梢轻轻晃动。\n\n• 移动鼠标，她会跟着看；按住头顶拖动可以摸头，左右脸都可以拖拽。\n• 捏脸会有逐级小情绪；弄哭后摸摸头，再抱抱她。\n• 喂白米饭、陪她看书，还有偶尔冒出来的小声碎碎念。学习时长可设置为 1–120 分钟。\n• 音乐播放时显示名称和频谱，并切换开心听歌的表情。音频和曲名由 Wallpaper Engine 提供，壁纸不附带歌曲。\n• 显示系统时间与当天进度，支持常见屏幕比例，默认避让底部任务栏。\n• 550W 节点控制台：i1000-550W、RTX 50900 Ti、128 TB 内存池与 MOSS OS；北京根服务器显示核心温度、冷却液温度和同步状态。\n• 可调整人物大小、动作幅度、帧率、闲聊间隔与节点读数刷新间隔，信息栏可左右切换或隐藏。\n\n曲名需在 Wallpaper Engine 中启用媒体集成，并由播放器提供信息。\n非官方同人作品；角色与场景包含 AI 辅助制作素材。看书功能是陪伴计时。",
+  "tags": [
+    "Anime"
+  ],
+  "contentrating": "Everyone",
+  "type": "web",
+  "file": "index.html",
+  "preview": "preview.gif",
+  "visibility": "private",
+  "general": {
+    "properties": {
+      "showconsole": {
+        "type": "bool",
+        "text": "显示流式控制台",
+        "value": true,
+        "index": 2
+      },
+      "showclock": {
+        "type": "bool",
+        "text": "显示系统时间和当天进度",
+        "value": true,
+        "index": 3
+      },
+      "infoside": {
+        "type": "combo",
+        "text": "节点信息与环境位置",
+        "value": "left",
+        "index": 4,
+        "options": [
+          {
+            "label": "左侧",
+            "value": "left"
+          },
+          {
+            "label": "右侧",
+            "value": "right"
+          }
+        ]
+      },
+      "mousetracking": {
+        "type": "bool",
+        "text": "身体与眼神跟随鼠标",
+        "value": true,
+        "index": 5
+      },
+      "enablepet": {
+        "type": "bool",
+        "text": "开启摸摸头",
+        "value": true,
+        "index": 6
+      },
+      "enablepinch": {
+        "type": "bool",
+        "text": "开启拖拽捏脸",
+        "value": true,
+        "index": 7
+      },
+      "characterscale": {
+        "type": "slider",
+        "text": "角色大小",
+        "value": 100,
+        "min": 75,
+        "max": 120,
+        "step": 1,
+        "precision": 0,
+        "index": 9
+      },
+      "brightness": {
+        "type": "slider",
+        "text": "环境亮度",
+        "value": 88,
+        "min": 45,
+        "max": 115,
+        "step": 1,
+        "precision": 0,
+        "index": 10
+      },
+      "motion": {
+        "type": "slider",
+        "text": "动作幅度",
+        "value": 80,
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "precision": 0,
+        "index": 11
+      },
+      "showparticles": {
+        "type": "bool",
+        "text": "漂浮微尘",
+        "value": true,
+        "index": 12
+      },
+      "fps": {
+        "type": "slider",
+        "text": "帧率上限",
+        "value": 30,
+        "min": 15,
+        "max": 60,
+        "step": 1,
+        "precision": 0,
+        "index": 13
+      },
+      "mealeffects": {
+        "type": "bool",
+        "text": "进食漫画特效",
+        "value": true,
+        "index": 14
+      },
+      "showmusic": {
+        "type": "bool",
+        "text": "显示系统播放与频谱",
+        "value": true,
+        "index": 15
+      },
+      "musicmotion": {
+        "type": "bool",
+        "text": "随音乐节奏律动",
+        "value": true,
+        "index": 16
+      },
+      "musiceffects": {
+        "type": "bool",
+        "text": "听歌漫画符号",
+        "value": true,
+        "index": 17
+      },
+      "musicsensitivity": {
+        "type": "slider",
+        "text": "节奏灵敏度",
+        "value": 100,
+        "min": 50,
+        "max": 150,
+        "step": 1,
+        "precision": 0,
+        "index": 18
+      },
+      "showchatter": {
+        "type": "bool",
+        "text": "偶尔说几句话",
+        "value": true,
+        "index": 20
+      },
+      "chatterinterval": {
+        "type": "slider",
+        "text": "两轮闲聊间隔（秒，略有浮动）",
+        "value": 45,
+        "min": 15,
+        "max": 180,
+        "step": 1,
+        "precision": 0,
+        "index": 21
+      },
+      "avoidtaskbar": {
+        "type": "bool",
+        "text": "避让系统任务栏（底部预留）",
+        "value": true,
+        "index": 22
+      },
+      "studyminutes": {
+        "type": "slider",
+        "text": "每轮学习时长（分钟，下轮生效）",
+        "value": 10,
+        "min": 1,
+        "max": 120,
+        "step": 1,
+        "precision": 0,
+        "index": 23
+      },
+      "shownodeinfo": {
+        "type": "bool",
+        "text": "显示 550W 节点信息",
+        "value": true,
+        "index": 0
+      },
+      "showrootenvironment": {
+        "type": "bool",
+        "text": "显示根服务器环境",
+        "value": true,
+        "index": 1
+      },
+      "noderefresh": {
+        "type": "slider",
+        "text": "节点读数刷新间隔（秒）",
+        "value": 5,
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "precision": 0,
+        "index": 19
+      }
+    },
+    "supportsaudioprocessing": true
+  }
+}

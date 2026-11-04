@@ -1,0 +1,22 @@
+# ---- 运行时产物（安装后生成，不入库）----
+*.log
+*.pid
+*.hb
+*.tmp
+audit-export.txt
+wheel.log
+tests/out/
+
+# ---- 备份与临时文件 ----
+*.bak
+*.bak-*
+*_old*
+*.orig
+*.rej
+
+# ---- 代理 / 编辑器 / 系统 ----
+.workbuddy/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

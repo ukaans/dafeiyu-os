@@ -1,0 +1,12 @@
+# 本项目对编码敏感：.ps1 = UTF-8 with BOM，.vbs = UTF-16LE，.ahk = UTF-8 无 BOM。
+# 关闭一切换行符转换，避免 checkout 时改坏 CRLF/BOM 导致脚本失效。
+* -text
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.ttf binary
+*.otf binary

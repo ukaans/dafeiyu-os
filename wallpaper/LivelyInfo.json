@@ -1,0 +1,17 @@
+{
+  "AppVersion": "2.2.1.0",
+  "Title": "Deepseek 图鲸鲸 · 大肥鱼数字生命控制台",
+  "Thumbnail": "lively_t.png",
+  "Preview": "lively_p.gif",
+  "Desc": "暖光书房与数字生命模拟器风格的交互网页壁纸。摸摸头、捏脸、喂白米饭、陪她看书，支持 Wallpaper Engine 音频回调。",
+  "Author": "fjdsjd",
+  "License": "MIT",
+  "Contact": "https://github.com/fjdsjd/deepseek-companion-wallpaper",
+  "Type": 1,
+  "Arguments": null,
+  "FileName": "index.html",
+  "IsAbsolutePath": false,
+  "Id": null,
+  "Tags": null,
+  "Version": 0
+}
