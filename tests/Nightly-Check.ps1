@@ -55,9 +55,16 @@ function Write-Log {
 
 function Invoke-Git {
     param([string[]]$Arguments, [switch]$AllowFail)
-    $out = & git -C $Repo @Arguments 2>&1
-    $code = $LASTEXITCODE
-    $text = ($out | Out-String).Trim()
+    # git 会往 stderr 写进度；ErrorActionPreference=Stop 下会被当成终止错误，必须临时放行
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & git -C $Repo @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $text = (($out | ForEach-Object { "$_" }) -join "`n").Trim()
     if ($code -ne 0 -and -not $AllowFail) {
         throw "git $($Arguments -join ' ') 失败（exit=$code）：$text"
     }
