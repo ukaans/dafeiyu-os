@@ -471,7 +471,7 @@ if ($quality.HasContent) {
     $null = $sb.AppendLine('| 客观指标 | 值 |')
     $null = $sb.AppendLine('|---|---|')
     $null = $sb.AppendLine("| 改动规模 | $($quality.Stat) |")
-    $null = $sb.AppendLine("| 有没有跟着改测试 | $(if ($quality.TouchedTests) { '有' } else { '**没有**（扣分项）' }) |")
+    $null = $sb.AppendLine("| 有没有跟着动测试/测试工具 | $(if ($quality.TouchedTests) { '有' } else { '**没有**（扣分项）' }) |")
     $null = $sb.AppendLine("| 有没有同步文档 | $(if ($quality.TouchedDocs) { '有' } else { '没有' }) |")
     $null = $sb.AppendLine("| 高风险文件 | $(if ($quality.RiskFiles.Count -gt 0) { $quality.RiskFiles -join '、' } else { '无' }) |")
     if ($quality.Prev -and $quality.Prev.Passed -ge 0) {
@@ -515,7 +515,9 @@ $null = $sb.AppendLine('')
 if ($report.Commits.Count -gt 0) {
     $null = $sb.AppendLine('### 改了哪些文件')
     $null = $sb.AppendLine('')
-    $stat = (Invoke-Git @('diff','--stat',"$remoteRef...$Branch") -AllowFail).Text
+    # 推送成功后 origin/dev 已追上 dev，必须用推送前的远端 sha 才能算出这批的 stat
+    $statRange = if ($report.PreRemoteSha) { "$($report.PreRemoteSha)..HEAD" } else { "$remoteRef...$Branch" }
+    $stat = (Invoke-Git @('diff','--stat',$statRange) -AllowFail).Text
     if ($stat) { $null = $sb.AppendLine('```'); $null = $sb.AppendLine($stat); $null = $sb.AppendLine('```') }
     $null = $sb.AppendLine('')
 }
