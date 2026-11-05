@@ -38,7 +38,8 @@ param(
     [string]$OutDir = 'E:\DSHWORK\nightly',
     [switch]$DryRun,
     [switch]$NoNotify,
-    [switch]$NoCommitDirty
+    [switch]$NoCommitDirty,
+    [switch]$NoAi
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,6 +110,173 @@ function Send-Toast {
     }
 }
 
+# ---------- 质量点评 ----------
+function Get-RiskHits {
+    param([string[]]$Files)
+    $patterns = @(
+        @{ Name = '抽屉主脚本 DesktopPage.ahk'; Rx = '^drawer/DesktopPage\.ahk$' },
+        @{ Name = '代理 dsh-agent.ps1';        Rx = '^drawer/dsh-agent\.ps1$' },
+        @{ Name = '启动链 start-all.vbs';      Rx = '^drawer/start-all\.vbs$' },
+        @{ Name = '巡检 ensure-all.ps1';       Rx = '^drawer/ensure-all\.ps1$' },
+        @{ Name = '滚轮桥 wheel-bridge.ps1';   Rx = '^drawer/wheel-bridge\.ps1$' },
+        @{ Name = '安装脚本 install.ps1';      Rx = '^install\.ps1$' },
+        @{ Name = '壁纸页 wallpaper/**';       Rx = '^wallpaper/' }
+    )
+    $hits = @()
+    foreach ($p in $patterns) {
+        $hit = $Files | Where-Object { $_ -match $p.Rx }
+        if ($hit) { $hits += $p.Name }
+    }
+    return $hits
+}
+
+function Get-PrevTestStats {
+    param([string]$Path)
+    $out = [pscustomobject]@{ Passed = -1; Warn = -1; Failed = -1; Date = '' }
+    if (-not (Test-Path $Path)) { return $out }
+    try {
+        $txt = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        if ($txt -match '\| 回归测试 \| ([^|]+)\|') {
+            $line = $Matches[1]
+            if ($line -match '通过\s*(\d+)') { $out.Passed = [int]$Matches[1] }
+            if ($line -match '警告\s*(\d+)') { $out.Warn = [int]$Matches[1] }
+            if ($line -match '失败\s*(\d+)') { $out.Failed = [int]$Matches[1] }
+        }
+        if ($txt -match '# 桌面系统夜间巡检 · (\d{4}-\d{2}-\d{2})') { $out.Date = $Matches[1] }
+    } catch { }
+    return $out
+}
+
+function Invoke-AiReview {
+    # 用独立进程 + 硬超时：Start-Job 里调 dsh.cmd 会卡死（实测 >180s 不返回），Start-Process 正常（2~4s）
+    param([string]$PromptText, [int]$TimeoutSec = 180, [string]$WorkDir)
+    $dsh = 'E:\DSH\dsh.cmd'
+    $helper = Join-Path $PSScriptRoot 'ai-review.ps1'
+    $ps5 = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path $ps5)) { $ps5 = 'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe' }
+    if ($NoAi) { return [pscustomobject]@{ Ok = $false; Text = ''; Note = '已跳过 AI 点评（-NoAi）' } }
+    if (-not (Test-Path $dsh)) { return [pscustomobject]@{ Ok = $false; Text = ''; Note = '已跳过 AI 点评（找不到 dsh.cmd）' } }
+    if (-not (Test-Path $helper)) { return [pscustomobject]@{ Ok = $false; Text = ''; Note = '已跳过 AI 点评（缺 tests\ai-review.ps1）' } }
+
+    $proc = $null
+    $tmp = Join-Path $WorkDir '.ai'
+    $stamp = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $pf = Join-Path $tmp "prompt-$stamp.txt"
+    $of = Join-Path $tmp "out-$stamp.txt"
+    try {
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        [System.IO.File]::WriteAllText($pf, $PromptText, (New-Object System.Text.UTF8Encoding($false)))
+        $proc = Start-Process -FilePath $ps5 -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $helper + '"'),
+            '-PromptFile', ('"' + $pf + '"'), '-OutFile', ('"' + $of + '"')
+        )
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            try { $proc.Kill() } catch { }
+            return [pscustomobject]@{ Ok = $false; Text = ''; Note = "AI 点评超时（>${TimeoutSec}s）" }
+        }
+        $text = ''
+        if (Test-Path $of) { $text = ([System.IO.File]::ReadAllText($of, [System.Text.Encoding]::UTF8)).Trim() }
+        if ($text) { return [pscustomobject]@{ Ok = $true; Text = $text; Note = '' } }
+        return [pscustomobject]@{ Ok = $false; Text = ''; Note = 'AI 没返回内容' }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Text = ''; Note = "AI 点评失败：$($_.Exception.Message)" }
+    } finally {
+        if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch { } }
+        foreach ($x in @($pf, $of)) { if (Test-Path $x) { Remove-Item $x -Force -ErrorAction SilentlyContinue } }
+    }
+}
+
+function Get-QualityReview {
+    param([object]$Commits, [object]$TestStats, [int]$AheadCount, [string]$Range = 'origin/dev..dev')
+    $r = [pscustomobject]@{
+        HasContent = $false
+        Files = @(); Stat = ''; Additions = 0; Deletions = 0; Changed = 0
+        TouchedTests = $false; TouchedDocs = $false; RiskFiles = @()
+        Prev = $null; Score = -1; Verdict = ''
+        AiText = ''; AiNote = ''
+    }
+    if (-not $Range) { return $r }
+
+    $range = $Range
+    $r.Files = @((Invoke-Git @('diff','--name-only',$range) -AllowFail).Text -split "\r?\n" | Where-Object { $_.Trim() })
+    $r.Stat = (Invoke-Git @('diff','--shortstat',$range) -AllowFail).Text
+    if ($r.Stat -match '(\d+) files? changed') { $r.Changed = [int]$Matches[1] }
+    if ($r.Stat -match '(\d+) insertions?') { $r.Additions = [int]$Matches[1] }
+    if ($r.Stat -match '(\d+) deletions?') { $r.Deletions = [int]$Matches[1] }
+    $r.TouchedTests = [bool]($r.Files | Where-Object { $_ -match '^tests/' })
+    $r.TouchedDocs = [bool]($r.Files | Where-Object { $_ -match '^(docs/|.*\.md$)' })
+    $r.RiskFiles = Get-RiskHits -Files $r.Files
+    $r.Prev = Get-PrevTestStats -Path $latestPath
+    $r.HasContent = $true
+
+    # 确定性评分：从 10 分往下扣，扣分理由逐条记下来
+    $score = 10
+    $why = @()
+    if (-not $r.TouchedTests) { $score -= 3; $why += '改了代码但没动/没加测试用例（-3）' }
+    if ($r.RiskFiles.Count -gt 0) { $score -= 2; $why += ('动了高风险文件：' + ($r.RiskFiles -join '、') + '（-2）') }
+    if (-not $r.TouchedDocs) { $score -= 1; $why += '没同步文档（-1）' }
+    if ($r.Prev.Passed -gt 0 -and $TestStats.Passed -ge 0 -and $TestStats.Passed -lt $r.Prev.Passed) {
+        $score -= 2; $why += ("用例通过数从 $($r.Prev.Passed) 掉到 $($TestStats.Passed)（-2）")
+    }
+    if ($r.Prev.Warn -ge 0 -and $TestStats.Warn -gt $r.Prev.Warn) {
+        $score -= 1; $why += ("警告数从 $($r.Prev.Warn) 涨到 $($TestStats.Warn)（-1）")
+    }
+    if ($r.Changed -gt 15) { $score -= 1; $why += ("单轮改了 $($r.Changed) 个文件（-1）") }
+    if (($r.Additions + $r.Deletions) -gt 1500) { $score -= 1; $why += ("单轮 diff 超 1500 行（-1）") }
+    if ($score -lt 0) { $score = 0 }
+    $r.Score = $score
+    $r.Verdict = if ($score -ge 8) { '可接受（自动推送）' } elseif ($score -ge 5) { '可接受，但建议人扫一眼' } else { '建议人工复核' }
+    $r | Add-Member -NotePropertyName Reasons -NotePropertyValue $why -Force
+
+    # AI 点评（可关：-NoAi）
+    if ($NoAi) {
+        $r.AiNote = '已跳过 AI 点评（-NoAi）'
+        return $r
+    }
+    $commitLines = ($Commits | ForEach-Object { "- $($_.Hash) $($_.When) $($_.Subject)" }) -join "`n"
+    $fileLines = ($r.Files | Select-Object -First 25) -join "`n"
+    # 关键：点评只用内联 diff，禁止调用工具（让 AI 自己读仓库要跑几分钟、烧几十万 token）
+    $diffText = (Invoke-Git @('diff','--unified=2',$range) -AllowFail).Text
+    if (-not $diffText) { $diffText = '(无 diff 文本)' }
+    # 截断策略：头尾各留一半，中间用省略标记——只留头部会只看到删除侧，模型会误判
+    $diffCap = 7000
+    $diffNote = ''
+    if ($diffText.Length -gt $diffCap) {
+        $half = [int]($diffCap / 2)
+        $headPart = $diffText.Substring(0, $half)
+        $tailPart = $diffText.Substring($diffText.Length - $half)
+        $diffText = $headPart + "`n…（中间省略 " + ($diffText.Length - $diffCap) + " 字符）…`n" + $tailPart
+        $diffNote = '（diff 超长，已保留头尾各 ' + $half + ' 字符）'
+    }
+    $prompt = @"
+你是严谨的代码评审人，评审「大肥鱼桌面系统」（PowerShell 5.1 + AutoHotkey v2，单线程本地代理 + 文件耦合）。
+本轮改动（未推送提交数 $AheadCount）：
+
+$commitLines
+
+改动文件：
+$fileLines
+
+规模：$($r.Stat)
+回归结果：$($TestStats.Raw)
+
+下面是本轮 diff$diffNote：
+
+$diffText
+
+要求：
+1. 只根据上面这段内容点评，不要调用任何工具，不要读文件、不要跑命令。
+2. 输出不超过 200 字的中文点评，分三小段，每段一句话：
+   【实质】这轮到底改了什么机制（不要复述 commit 标题）
+   【风险】最值得担心的一个点（具体到文件/行为；没有就写「未发现明显风险」）
+   【建议】保留 / 补测试 / 回退，三选一并给一句理由
+3. 不要客套话，不要 checklist，直接给三小段。
+"@
+    $ai = Invoke-AiReview -PromptText $prompt -WorkDir $OutDir
+    $r.AiText = $ai.Text
+    $r.AiNote = $ai.Note
+    return $r
+}
 # ---------- 主流程 ----------
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $script:LogFile = Join-Path $OutDir 'nightly.log'
@@ -252,6 +420,17 @@ catch {
     Write-Log "巡检异常：$($_.Exception.Message)" 'ERROR'
 }
 
+# ---------- 质量点评 ----------
+$quality = $null
+try {
+    $qAhead = 0
+    [int]::TryParse((Invoke-Git @('rev-list','--count','origin/dev..dev') -AllowFail).Text, [ref]$qAhead) | Out-Null
+    $qRange = if ($qAhead -gt 0) { 'origin/dev..dev' } elseif ($report.DirtyFiles.Count -gt 0) { 'HEAD' } else { '' }
+    $quality = Get-QualityReview -Commits $report.Commits -TestStats $report.Stats -AheadCount $qAhead -Range $qRange
+} catch {
+    $quality = [pscustomobject]@{ HasContent = $false; Score = -1; Verdict = ''; AiText = ''; AiNote = "质量点评计算失败：$($_.Exception.Message)"; Files = @(); Stat = ''; Reasons = @(); RiskFiles = @(); TouchedTests = $false; TouchedDocs = $false; Prev = $null }
+    Write-Log "质量点评计算失败：$($_.Exception.Message)" 'WARN'
+}
 # ---------- 出报告 ----------
 $sb = New-Object System.Text.StringBuilder
 $null = $sb.AppendLine("# 桌面系统夜间巡检 · $today")
@@ -271,9 +450,48 @@ $null = $sb.AppendLine("| 未提交改动 | $(if ($report.DirtyFiles.Count -gt 0
 $null = $sb.AppendLine("| 自动提交 | $($report.Committed)$(if ($report.CommitHash) { '（' + $report.CommitHash + '）' }) |")
 $null = $sb.AppendLine("| 推送到 dev | $($report.Pushed) |")
 $null = $sb.AppendLine("| main 分支 | 未改动（按规矩只由人放行） |")
+$null = $sb.AppendLine("| 质量点评 | $(if ($quality.HasContent) { "$($quality.Score)/10 · $($quality.Verdict)" } else { '本轮无待评审改动' }) |")
 $null = $sb.AppendLine("| dev 当前 HEAD | $($report.Head) |")
 $null = $sb.AppendLine('')
 
+$null = $sb.AppendLine('## 质量点评')
+$null = $sb.AppendLine('')
+if ($quality.HasContent) {
+    $null = $sb.AppendLine("**评分 $($quality.Score)/10 —— $($quality.Verdict)**")
+    $null = $sb.AppendLine('')
+    $null = $sb.AppendLine('| 客观指标 | 值 |')
+    $null = $sb.AppendLine('|---|---|')
+    $null = $sb.AppendLine("| 改动规模 | $($quality.Stat) |")
+    $null = $sb.AppendLine("| 有没有跟着改测试 | $(if ($quality.TouchedTests) { '有' } else { '**没有**（扣分项）' }) |")
+    $null = $sb.AppendLine("| 有没有同步文档 | $(if ($quality.TouchedDocs) { '有' } else { '没有' }) |")
+    $null = $sb.AppendLine("| 高风险文件 | $(if ($quality.RiskFiles.Count -gt 0) { $quality.RiskFiles -join '、' } else { '无' }) |")
+    if ($quality.Prev -and $quality.Prev.Passed -ge 0) {
+        $null = $sb.AppendLine("| 与上一轮比（$($quality.Prev.Date)） | 通过 $($quality.Prev.Passed) → $($report.Stats.Passed)　警告 $($quality.Prev.Warn) → $($report.Stats.Warn) |")
+    }
+    $null = $sb.AppendLine('')
+    if ($quality.Reasons -and $quality.Reasons.Count -gt 0) {
+        $null = $sb.AppendLine('扣分理由：')
+        $null = $sb.AppendLine('')
+        foreach ($rs in $quality.Reasons) { $null = $sb.AppendLine("- $rs") }
+        $null = $sb.AppendLine('')
+    } else {
+        $null = $sb.AppendLine('这轮没有触发任何扣分项（带了测试、没碰高风险文件、文档同步了、用例数没退）。')
+        $null = $sb.AppendLine('')
+    }
+    $null = $sb.AppendLine('### AI 点评')
+    $null = $sb.AppendLine('')
+    if ($quality.AiText) {
+        foreach ($ln in ($quality.AiText -split "\r?\n")) {
+            if ($ln.Trim()) { $null = $sb.AppendLine("> $($ln.Trim())") }
+        }
+    } else {
+        $null = $sb.AppendLine("（未生成：$($quality.AiNote)）")
+    }
+    $null = $sb.AppendLine('')
+} else {
+    $null = $sb.AppendLine('本轮没有待评审的改动（dev 与远端一致，也没有新的未提交改动）。')
+    $null = $sb.AppendLine('')
+}
 $null = $sb.AppendLine('## 昨晚的重构 / 改动（未推送提交）')
 $null = $sb.AppendLine('')
 if ($report.Commits.Count -gt 0) {
