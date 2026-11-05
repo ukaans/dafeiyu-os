@@ -4,9 +4,28 @@ window.onerror = function (m, s, l) { try { document.title = 'JSERR ' + m + ' @'
  * 所以走两条不触发 CORS 的老通道：
  *   读状态：动态插入 <script src="/state.js?v=...">（JSONP 式）
  *   发指令：<img src="/run.gif?t=...">（信标）
+ *
+ * 2026-11-05 改版（两件事）：
+ *  1) 会话视图：把 dsh-run.log 解析成「你发的指令 / DSH 的回复」气泡，像网页版一样上下翻，
+ *     不再是一坨原始日志尾巴。数据走新增的 /log.js（整段日志，避免只看 40 行看不到上文）。
+ *  2) 滚轮可靠化：去掉 requestAnimationFrame 缓动。壁纸页被全屏窗口盖住时 Chromium 可能
+ *     暂停 rAF，而 80ms 的 JSONP 轮询照跑 —— 意图收到了、画面却不动，看着就是「滚轮失效」。
+ *     现在意图到达后 setTimeout(0) 直接写 scrollTop，不依赖动画帧。
  */
 function dshInit() {
   'use strict';
+
+  // ---- 热重载（不导航）----
+  // Lively 的 WebView2 上 location.reload() 会把页面弄成白屏（2026-11-06 复现两次，panel-rect 不再更新），
+  // 所以改成「再插一份 dsh.js」：先清掉上一代的定时器、删掉旧面板，再跑一遍初始化。
+  var GEN = (window.__DSH_GEN = (window.__DSH_GEN || 0) + 1);
+  (window.__DSH_TIMERS || []).forEach(function (t) { clearTimeout(t); clearInterval(t); });
+  window.__DSH_TIMERS = [];
+  function alive() { return window.__DSH_GEN === GEN; }
+  function every(ms, fn) { var id = setInterval(function () { if (alive()) fn(); }, ms); window.__DSH_TIMERS.push(id); return id; }
+  function after(ms, fn) { var id = setTimeout(function () { if (alive()) fn(); }, ms); window.__DSH_TIMERS.push(id); return id; }
+  var oldPanel = document.getElementById('dshPanel');
+  if (oldPanel && oldPanel.parentNode) oldPanel.parentNode.removeChild(oldPanel);
 
   // 通信层优先走 api.js 的 window.__API；本文件单独部署时回退到内置写法（jsonp / beacon 里）
   var API = (window.__API || {}).url || 'http://127.0.0.1:17433';
@@ -25,21 +44,23 @@ function dshInit() {
   box.id = 'dshPanel';
   box.className = 'dsh-panel';
 
+  // 面板高度预算（右侧栏窄、下面还有行为参数/当前播放/时钟）：日志区尽量大，
+  // 标题、输入、按钮三行压到最小，余额并进按钮行的右端。
   box.innerHTML =
     '<div class="dsh-title"><i></i><span>DSH / DESKTOP</span>' +
-    '<b id="dshDot" class="dsh-dot" title="DSH 服务状态"></b>' +
-    '<span class="barcode short" aria-hidden="true"></span></div>' +
-    '<pre id="dshLog">连接中…</pre>' +
+    '<span id="dshState" class="dsh-state">—</span>' +
+    '<b id="dshDot" class="dsh-dot" title="DSH 服务状态"></b></div>' +
+    '<div id="dshLog" class="dsh-log"><div class="dsh-note">连接中…</div></div>' +
+    '<div id="dshErr" class="dsh-err" hidden></div>' +
     '<div class="dsh-input"><input id="dshText" type="text" placeholder="给 DSH 发指令…" autocomplete="off" spellcheck="false" /><button id="dshSend" type="button">发送</button></div>' +
     '<div class="dsh-actions">' +
     '<button id="dshLaunch" type="button">启动</button>' +
     '<button id="dshOpen" type="button">网页</button>' +
     '<button id="dshClear" type="button">清空</button>' +
-    '<button id="dshUp" type="button" title="向上翻日志">▲</button>' +
-    '<button id="dshDown" type="button" title="向下翻日志">▼</button>' +
-    '<span id="dshState" class="dsh-state">—</span>' +
-    '</div>' +
-    '<div class="dsh-balance"><span>剩余余额</span><b id="dshBal">—</b></div>';
+    '<button id="dshUp" type="button" title="向上翻对话">▲</button>' +
+    '<button id="dshDown" type="button" title="向下翻对话">▼</button>' +
+    '<b id="dshBal" class="dsh-bal">—</b>' +
+    '</div>';
 
   if (interaction && interaction.parentNode === aside) aside.insertBefore(box, interaction);
   else aside.appendChild(box);
@@ -49,13 +70,22 @@ function dshInit() {
   var stateEl = document.getElementById('dshState');
   var dotEl = document.getElementById('dshDot');
   var balEl = document.getElementById('dshBal');
+  var errEl = document.getElementById('dshErr');
   var runDot = document.getElementById('drawerDot');
 
-  var lastLines = '';
   var seq = 0;
-  var lastScroll = null;
   var lastRect = '';
   var lastPoll = 0;
+
+  // 每格滚轮折多少像素：120 的原始 deltaY 档位（Windows 默认 3 行/格）换算成面板里的可见位移
+  var SCROLL_STEP = 110;
+
+  // ---- 调试信标：只在代理侧存在 dsh-debug.flag 时落盘（验证期开关，平时零成本）----
+  var DEBUG = false;
+  function dbg(m) {
+    if (!DEBUG) return;
+    try { beacon('/dbg.gif?m=' + encodeURIComponent(String(m).slice(0, 300))); } catch (e) {}
+  }
 
   // 设置面板：打开时把整屏都算作「控制台区域」，滚轮就不会被抽屉程序当成桌面手势
   var overlayEl = document.getElementById('settingsOverlay');
@@ -63,6 +93,7 @@ function dshInit() {
   function settingsOpen() { return !!(overlayEl && !overlayEl.hidden); }
 
   var lastCls = '';
+  var failStreak = 0;
   function setState(text, cls) {
     var prev = lastCls;
     lastCls = cls || '';
@@ -136,13 +167,14 @@ function dshInit() {
       beacon('/rect.gif?' + q);
     } catch (e) {}
   }
-  // 平滑滚动：轮询只更新目标位置，实际位移用 requestAnimationFrame 缓动插值
-  var scrollHost = null;
-  var scrollTarget = null;
-  var scrollRAF = 0;
-  var scrollBusy = false;
+  // ===== 滚轮 =====
+  // 两个来源都会把位移堆到 scrollPending：页面原生 wheel 事件、抽屉程序转发的意图（__DSH_SCROLL）。
+  // 处理方式改成「立即写 scrollTop」：不排 rAF。壁纸被全屏窗口遮住时 rAF 可能整段不跑，
+  // 而 setTimeout/JSONP 轮询还在跑 —— 那就是用户看到「滚轮没反应」的直接原因。
+  var scrollPending = 0;
+  var scrollTimer = 0;
 
-  function scrollTargetEl() {
+  function scrollHostEl() {
     return (settingsOpen() && settingsScroll) ? settingsScroll : logEl;
   }
 
@@ -151,32 +183,39 @@ function dshInit() {
     return Math.max(0, Math.min(max, v));
   }
 
-  function scrollTick() {
-    scrollRAF = 0;
-    if (!scrollHost || scrollTarget === null) return;
-    // 元素被 [hidden] 或移出文档后，scrollTop 恒为 0，再算下去就是死循环
-    if (!scrollHost.isConnected || scrollHost.offsetParent === null) { scrollTarget = null; return; }
-    var cur = scrollHost.scrollTop;
-    var target = clampScroll(scrollTarget, scrollHost);
-    if (target !== scrollTarget) { scrollTarget = null; return; }
-    var diff = target - cur;
-    if (Math.abs(diff) < 0.8) { scrollTarget = null; return; }
-    scrollHost.scrollTop = cur + diff * 0.045;
-    // 内容变短 / 已到顶到底时 scrollTop 会被夹住，位移为 0 就停，避免 60fps 空转
-    if (Math.abs(scrollHost.scrollTop - cur) < 0.5) { scrollTarget = null; return; }
-    scrollRAF = requestAnimationFrame(scrollTick);
+  function scrollByPx(px) {
+    var host = scrollHostEl();
+    if (!host) return;
+    // 元素被 [hidden] 或移出文档后 scrollTop 恒为 0，别在这里死循环
+    if (!host.isConnected || host.offsetParent === null) { scrollPending = 0; return; }
+    var before = host.scrollTop;
+    host.scrollTop = clampScroll(before + px, host);
+    syncNavBtns();
+    dbg('scroll gen=' + GEN + ' d=' + px + ' at=' + Math.round(before) + '->' + Math.round(host.scrollTop) +
+      ' max=' + Math.max(0, host.scrollHeight - host.clientHeight) + ' ch=' + host.clientHeight);
+  }
+
+  function flushScroll() {
+    scrollTimer = 0;
+    if (!scrollPending) return;
+    var d = scrollPending;
+    scrollPending = 0;
+    scrollByPx(d);
+  }
+
+  function queueScroll(px) {
+    if (!px) return;
+    scrollPending += px;
+    // 立即写 scrollTop：不排 setTimeout —— 壁纸被全屏窗口盖住时定时器可能被节流，
+    // 而且多等一帧就是用户说的"滚轮发黏、卡卡的"。
+    flushScroll();
   }
 
   function onScrollData() {
     var d = window.__DSH_SCROLL || 0;
     window.__DSH_SCROLL = 0;
     if (!d) return;
-    var host = scrollTargetEl();
-    if (!host) return;
-    scrollHost = host;
-    var base = (scrollTarget === null) ? host.scrollTop : scrollTarget;
-    scrollTarget = clampScroll(base + d * 120, host);
-    if (!scrollRAF) scrollRAF = requestAnimationFrame(scrollTick);
+    queueScroll(d * SCROLL_STEP);
   }
 
   var scrollPolling = false;
@@ -186,13 +225,202 @@ function dshInit() {
       jsonp('/scroll.js', function () { scrollPolling = false; onScrollData(); },
         function () { scrollPolling = false; });
     }
-    setTimeout(scrollPoll, 80);
+    // 40ms 一轮：80ms 时"一格滚轮要等小半秒"的感觉很明显，40ms 是本地 HTTP 轮询还能稳住的频率
+    after(40, scrollPoll);
+  }
+
+  // ===== 会话视图 =====
+  // dsh-run.log 的格式（dsh-agent.ps1 的 Start-Run）：
+  //   [23:41:02] >>> 用户的指令
+  //   <DSH 的最终回答，stdout 多行>
+  //   （stderr 已改到 dsh-run.err.log；旧日志里混进来的 "dsh: reasoning:" 段一律跳过）
+  var parsedMsgs = [];       // [{role:'user'|'dsh'|'err', time:'HH:MM:SS', text:''}]
+  var msgEls = [];           // 与 parsedMsgs 对齐的 DOM
+  var logSig = null;         // 已成功取回的日志签名
+  var logWant = '';          // 最近一次 /state.js 报的签名
+  var logBusy = false;
+  var logFails = 0;
+  var busyNow = false;
+  var pendingSend = null;    // 刚发出、日志里还没出现的那条指令 → 先乐观显示
+
+  function hhmm(t) { return t ? String(t).slice(0, 5) : ''; }
+
+  function trimMsg(s) {
+    var t = String(s || '').replace(/[ \t]+$/mg, '').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '');
+    // 单条上限 12000 字符：够放一整段长回复（面板本身 200px 高，再多也只是滚动量），
+    // 又不至于让一次长回答把 DOM 撑爆；截断处留一句提示，全文去「网页」里看。
+    if (t.length > 12000) t = t.slice(0, 12000) + '\n…（过长已截断，全文点「网页」看）';
+    return t;
+  }
+
+  function parseLog(text) {
+    var raw = String(text || '').split('\n');
+    var msgs = [];
+    var cur = null;      // 正在累积的回复块
+    var skip = false;    // 处在 "dsh: reasoning:" 块里（旧日志的思考过程）
+    for (var i = 0; i < raw.length; i++) {
+      var ln = raw[i].replace(/\r$/, '');
+      var m = /^\[(\d{2}:\d{2}:\d{2})\]\s*>>>\s?(.*)$/.exec(ln);
+      if (m) {
+        skip = false;
+        cur = null;
+        msgs.push({ role: 'user', time: m[1], text: trimMsg(m[2]) });
+        continue;
+      }
+      if (/^dsh:\s*reasoning:/.test(ln)) { skip = true; cur = null; continue; }
+      if (/^(dsh:|FATAL:|Unhandled)/.test(ln)) {
+        skip = false;
+        cur = null;
+        msgs.push({ role: 'err', time: '', text: trimMsg(ln) });
+        continue;
+      }
+      if (skip) continue;
+      if (!cur) {
+        // 回复块的时间锚 = 最近一条用户指令的时间
+        var t = '';
+        for (var k = msgs.length - 1; k >= 0; k--) { if (msgs[k].role === 'user') { t = msgs[k].time; break; } }
+        cur = { role: 'dsh', time: t, text: '' };
+        msgs.push(cur);
+      }
+      cur.text += (cur.text ? '\n' : '') + ln;
+    }
+    // 去掉空块；只保留最近的 200 条（日志还有 /log.js 的 60KB 上限兜底）
+    var out = [];
+    for (var j = 0; j < msgs.length; j++) {
+      var mm = msgs[j];
+      if (mm.role !== 'user' && mm.role !== 'err') {
+        mm.text = trimMsg(mm.text);
+        if (!mm.text) continue;
+      }
+      out.push(mm);
+    }
+    if (out.length > 200) out = out.slice(out.length - 200);
+    return out;
+  }
+
+  function viewMsgs() {
+    var v = parsedMsgs.slice();
+    if (pendingSend && !hasUserTail(parsedMsgs, pendingSend.text)) {
+      v.push({ role: 'user', time: pendingSend.time, text: pendingSend.text, temp: true });
+    }
+    if (busyNow) {
+      var last = v.length ? v[v.length - 1] : null;
+      if (!last || last.role === 'user') v.push({ role: 'dsh', time: '', text: '思考中…', thinking: true });
+    }
+    return v;
+  }
+
+  function hasUserTail(list, text) {
+    for (var i = list.length - 1; i >= 0 && i >= list.length - 3; i--) {
+      if (list[i].role === 'user' && list[i].text === text) return true;
+    }
+    return false;
+  }
+
+  function msgSig(m) { return (m.role || '') + '|' + (m.time || '') + '|' + (m.text || ''); }
+
+  function buildMsgEl(m) {
+    var el = document.createElement('div');
+    el.className = 'dsh-msg ' + (m.role === 'user' ? 'you' : (m.role === 'err' ? 'err' : 'dsh')) + (m.thinking ? ' thinking' : '');
+    var meta = document.createElement('div');
+    meta.className = 'dsh-meta';
+    var who = document.createElement('span');
+    who.className = 'dsh-who';
+    who.textContent = m.role === 'user' ? '你' : (m.role === 'err' ? '错误' : 'DSH');
+    meta.appendChild(who);
+    if (m.time) {
+      var tt = document.createElement('span');
+      tt.className = 'dsh-time';
+      tt.textContent = hhmm(m.time);
+      meta.appendChild(tt);
+    }
+    el.appendChild(meta);
+    var body = document.createElement('div');
+    body.className = 'dsh-text';
+    body.textContent = m.text || '';
+    el.appendChild(body);
+    el.__sig = msgSig(m);
+    return el;
+  }
+
+  function noteEl(text) {
+    var d = document.createElement('div');
+    d.className = 'dsh-note';
+    d.textContent = text;
+    return d;
+  }
+
+  function atBottom() {
+    return (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 28;
+  }
+
+  function renderMessages(list) {
+    var atB = atBottom();
+    var keep = 0;
+    if (msgEls.length && msgEls.length <= list.length) {
+      keep = msgEls.length;
+      for (var i = 0; i < keep; i++) {
+        if (msgEls[i].__sig !== msgSig(list[i])) { keep = i; break; }
+      }
+    }
+    while (msgEls.length > keep) {
+      var dead = msgEls.pop();
+      if (dead && dead.parentNode) dead.parentNode.removeChild(dead);
+    }
+    if (!keep) logEl.textContent = '';
+    if (!list.length && !msgEls.length) {
+      logEl.appendChild(noteEl('还没有对话，发一条指令试试'));
+      syncNavBtns();
+      return;
+    }
+    for (var j = keep; j < list.length; j++) {
+      var el = buildMsgEl(list[j]);
+      logEl.appendChild(el);
+      msgEls.push(el);
+    }
+    // 最后一条的内容可能还在增长（运行中/流式），只重绘它的正文
+    if (msgEls.length) {
+      var lastNew = list[list.length - 1];
+      var lastEl = msgEls[msgEls.length - 1];
+      if (lastEl.__sig !== msgSig(lastNew)) {
+        var body = lastEl.querySelector('.dsh-text');
+        if (body && body.textContent !== (lastNew.text || '')) body.textContent = lastNew.text || '';
+        lastEl.__sig = msgSig(lastNew);
+      }
+    }
+    if (atB) logEl.scrollTop = logEl.scrollHeight;
+    syncNavBtns();
+  }
+
+  function fetchLog() {
+    if (logBusy) return;
+    logBusy = true;
+    jsonp('/log.js', function () {
+      logBusy = false;
+      logFails = 0;
+      var t = '';
+      try {
+        t = window.__DSH_LOG;
+        window.__DSH_LOG = '';
+      } catch (e) {}
+      if (typeof t !== 'string') { logFails += 1; return; }
+      logSig = logWant;
+      parsedMsgs = parseLog(t);
+      if (pendingSend && hasUserTail(parsedMsgs, pendingSend.text)) pendingSend = null;
+      dbg('log n=' + parsedMsgs.length + ' sig=' + logSig);
+      renderMessages(viewMsgs());
+      if (logWant !== logSig) fetchLog();   // 取的这段时间又有新内容 → 立刻补一次
+    }, function () {
+      logBusy = false;
+      logFails += 1;
+    });
   }
 
   var stateSeq = 0;
   var stateBusy = false;
-  var failStreak = 0;     // 连续失败次数：1-2 次只算「重试中」，≥3 次才判离线
   var lastErr = '';
+  var lastReload = 0;
+  try { lastReload = parseInt(localStorage.getItem('dsh.reload') || '0', 10) || 0; } catch (e) {}
 
   // 失败分级：代理是单线程，偶发一条请求排队（几百毫秒到 1 秒）不该让整块日志区
   // 变成「连接失败」。1-2 次保留上次内容只提升级，连续 3 次（≈4 秒）才判死。
@@ -204,10 +432,13 @@ function dshInit() {
       return;
     }
     setState('离线', 'off');
-    lastLines = null;     // 哨兵：恢复后的第一份数据必定触发重绘
-    logEl.textContent = '本地代理无响应（连续 ' + failStreak + ' 次）。\n' +
+    parsedMsgs = [];
+    msgEls = [];
+    logSig = null;
+    logEl.textContent = '';
+    logEl.appendChild(noteEl('本地代理无响应（连续 ' + failStreak + ' 次）\n' +
       '最后一次错误：' + (lastErr || '未知') + '\n' +
-      '双击 %LOCALAPPDATA%\\DesktopPage\\start-all.vbs 可重启。';
+      '双击 %LOCALAPPDATA%\\DesktopPage\\start-all.vbs 可重启。'));
     syncNavBtns();
   }
 
@@ -227,20 +458,35 @@ function dshInit() {
       if (!st) { pollFailed('/state.js 没有定义 __DSH_STATE（响应被截断）'); return; }
       failStreak = 0;
       lastErr = '';
+      // 热重载令牌（/reload.gif）：改完壁纸文件没法从外部刷新页面，代理借令牌让页面自己 reload
+      if (st.reload && st.reload !== lastReload) {
+        lastReload = st.reload;
+        try { localStorage.setItem('dsh.reload', String(lastReload)); } catch (e) {}
+        dbg('reload token=' + lastReload);
+        location.reload();
+        return;
+      }
+      DEBUG = !!st.dbg;
       if (balEl) balEl.textContent = st.bal || '—';
       if (runDot) {
         runDot.className = 'drawer-dot ' + (st.drawer ? 'on' : 'off');
         runDot.title = st.drawer ? '桌面抽屉：运行中' : '桌面抽屉：未启动';
       }
-      var txt = (st.lines || []).join('\n');
-      if (txt !== lastLines) {
-        var atBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 24;
-        lastLines = txt;
-        logEl.textContent = txt || '（还没有输出）';
-        if (atBottom) logEl.scrollTop = logEl.scrollHeight;
-        syncNavBtns();
+      // 上一轮失败原因（stderr 里的 dsh: xxx）挂成一行提示，不占对话气泡
+      if (errEl) {
+        if (st.err) { errEl.textContent = '⚠ ' + st.err; errEl.hidden = false; }
+        else if (!errEl.hidden) { errEl.textContent = ''; errEl.hidden = true; }
       }
-      // 抽屉程序转发的滚轮意图：st.scroll 单调递增，差值×40px 就是页面要滚的距离
+      logWant = st.sig || '';
+      busyNow = !!st.busy;
+      if (logWant !== logSig) fetchLog();
+      // 没有 /log.js 时退化成只显示 /state.js 的尾巴（老代理兼容）
+      if (logFails >= 2 && !parsedMsgs.length && st.lines && st.lines.length) {
+        parsedMsgs = parseLog(st.lines.join('\n'));
+        renderMessages(viewMsgs());
+      } else {
+        renderMessages(viewMsgs());
+      }
 
       if (st.busy) setState('运行中', 'busy');
       else if (st.web) setState('就绪', 'ok');
@@ -258,18 +504,19 @@ function dshInit() {
     if (!text) return;
     inputEl.value = '';
     setState('已发送', 'busy');
+    pendingSend = { text: text, time: new Date().toTimeString().slice(0, 8) };
     audit('dsh.send', 'chars=' + text.length);
     beacon('/run.gif?t=' + encodeURIComponent(text));
-    setTimeout(poll, 1200);
+    after(1200, poll);
   }
 
   // 日志区：手动处理滚轮（壁纸里原生滚动条点不到 / 拖不动）
   if (logEl) {
     logEl.addEventListener('wheel', function (e) {
-      scrollTarget = null;
-      var before = logEl.scrollTop;
-      logEl.scrollTop = before + (e.deltaY || 0);
-      if (logEl.scrollTop !== before) e.preventDefault();
+      var host = logEl;
+      var before = host.scrollTop;
+      host.scrollTop = before + (e.deltaY || 0);
+      if (host.scrollTop !== before) e.preventDefault();
       e.stopPropagation();
     }, { passive: false });
   }
@@ -278,7 +525,6 @@ function dshInit() {
   function wheelScroll(host) {
     return function (e) {
       if (!host) return;
-      scrollTarget = null;
       var before = host.scrollTop;
       host.scrollTop = before + (e.deltaY || 0);
       e.preventDefault();
@@ -309,7 +555,7 @@ function dshInit() {
   var btnUp = document.getElementById('dshUp');
   var btnDown = document.getElementById('dshDown');
 
-  // 日志不足一屏时 ▲▼ 点了也没反应，索性禁用并说明原因（避免用户以为按钮坏了）
+  // 对话不足一屏时 ▲▼ 点了也没反应，索性禁用并说明原因（避免用户以为按钮坏了）
   function syncNavBtns() {
     if (!logEl) return;
     var few = logEl.scrollHeight <= logEl.clientHeight + 4;
@@ -320,30 +566,34 @@ function dshInit() {
       b.disabled = few;
       if (few) {
         b.classList.add('dim');
-        b.title = '日志不足一屏';
+        b.title = '对话不足一屏';
       } else {
         b.classList.remove('dim');
-        b.title = (b === btnUp) ? '向上翻日志' : '向下翻日志';
+        b.title = (b === btnUp) ? '向上翻对话' : '向下翻对话';
       }
     }
   }
 
-  // 用 scrollBy + smooth：直接改 scrollTop 在 Lively 里会一帧跳到底，看着像"没动"
+  // ▲▼ 用 scrollBy + smooth：直接跳一屏在 Lively 里会一帧到底，看着像"没动"
   if (btnUp) btnUp.addEventListener('click', function () {
-    scrollTarget = null;
     logEl.scrollBy({ top: -logEl.clientHeight * 0.8, behavior: 'smooth' });
   });
   if (btnDown) btnDown.addEventListener('click', function () {
-    scrollTarget = null;
     logEl.scrollBy({ top: logEl.clientHeight * 0.8, behavior: 'smooth' });
   });
   if (logEl) logEl.addEventListener('scroll', syncNavBtns);
   document.getElementById('dshClear').addEventListener('click', function () {
-    lastLines = '';
-    logEl.textContent = '（已清空）';
+    parsedMsgs = [];
+    msgEls = [];
+    logSig = null;
+    pendingSend = null;
+    logEl.textContent = '';
+    logEl.appendChild(noteEl('已清空'));
+    if (errEl) { errEl.textContent = ''; errEl.hidden = true; }
     syncNavBtns();
     audit('dsh.clear', '');
     beacon('/clear.gif');
+    after(400, poll);
   });
   syncNavBtns();
 
@@ -358,7 +608,7 @@ function dshInit() {
       runDot.className = 'drawer-dot busy';
       audit('dsh.drawer', '');
       beacon('/drawer.gif');
-      setTimeout(poll, 1200);
+      after(1200, poll);
     }, true);
     btn.addEventListener('contextmenu', function (e) {
       e.preventDefault();
@@ -377,7 +627,7 @@ function dshInit() {
   try {
     if (window.ResizeObserver) new ResizeObserver(function () { reportRect(); }).observe(box);
     window.addEventListener('resize', function () { reportRect(); syncNavBtns(); });
-    setInterval(function () { reportRect(true); }, 4000);
+    every(4000, function () { reportRect(true); });
   } catch (e) {}
 
   // 设置面板开关：立刻重报矩形（打开=整屏，关闭=控制台面板），并把焦点从输入框挪走
@@ -408,12 +658,25 @@ function dshInit() {
     syncNavBtns();   // 隐藏时 scrollHeight 被算成 0，重新显示后要把 ▲▼ 的状态纠正回来
   }
   syncConsole();
-  setInterval(syncConsole, 1000);
+  every(1000, syncConsole);
   window.addEventListener('storage', syncConsole);
 
+  dbg('boot ' + API);
   poll();
-  setInterval(poll, 1200);
+  every(1200, poll);
   scrollPoll();
+
+  // 代理热重载入口：/scroll.js 读到令牌时会调它（老页面没有这个钩子，代理会退回 location.reload）
+  window.__DSH_RELOAD_OK = function () {
+    try {
+      var s = document.createElement('script');
+      s.src = 'dsh.js?hot=' + Date.now();
+      s.async = true;
+      (document.body || document.documentElement).appendChild(s);
+    } catch (e) {
+      document.title = 'JSERR reload ' + e.message;
+    }
+  };
   // ===== 快捷启动栏（6 格，2 行 x 3 列）=====
   var dockGrid = document.getElementById('dockGrid');
   var dockHint = document.getElementById('dockHint');
@@ -452,13 +715,13 @@ function dshInit() {
   if (dockGrid) {
     dockGrid.addEventListener('click', function (ev) {
       var del = ev.target.closest ? ev.target.closest('[data-del]') : null;
-      if (del) { ev.stopPropagation(); beacon('/dock.gif?op=del&i=' + del.getAttribute('data-del')); setTimeout(dockPoll, 400); return; }
+      if (del) { ev.stopPropagation(); beacon('/dock.gif?op=del&i=' + del.getAttribute('data-del')); after(400, dockPoll); return; }
       var add = ev.target.closest ? ev.target.closest('[data-add]') : null;
       if (add) {
         if (window.__DOCK_BUSY === 1) return;
         add.querySelector('.dock-name').textContent = '选择中…';
         beacon('/adddock.gif');
-        setTimeout(dockPoll, 900);
+        after(900, dockPoll);
         return;
       }
       var tile = ev.target.closest ? ev.target.closest('.dock-tile[data-i]') : null;
@@ -478,7 +741,7 @@ function dshInit() {
     }, function () { dockBusy = false; });
   }
   dockPoll();
-  setInterval(dockPoll, 1500);
+  every(1500, dockPoll);
 }
 
 try {

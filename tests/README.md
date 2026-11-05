@@ -1,4 +1,4 @@
-# tests\ —— 漏洞与风险测试模块
+﻿# tests\ —— 漏洞与风险测试模块
 
 一句话：**不改代码就能判断"这套系统现在还健康吗、哪里藏着雷"**，输出一份机器可读的报告给夜里自动跑的修复任务，也给人看。
 
@@ -87,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（9 条）
+### 20-contract · 契约一致性（11 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -97,8 +97,10 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-005 | `index.html` 脚本加载顺序（`todo-data` → `todo` → `api` → `audit` → `dsh` → `media` 最后） |
 | CON-006 | CSP 的 `connect-src` / `object-src` / `base-uri` 仍为 `none` |
 | CON-007 | 壁纸侧不出现 `fetch` / `XMLHttpRequest` |
-| CON-008 | 7 个 JSONP / 数据变量名（`window.__X`）生产端与消费端一致 |
+| CON-008 | 8 个 JSONP / 数据变量名（`window.__X`）生产端与消费端一致 |
 | CON-009 | `index.html` 引用的每个 `<script src>` 文件都存在 |
+| CON-010 | **PowerShell 5.1 兼容**：全部 `.ps1` 不出现 `[Environment]::TickCount64`（5.1 里静默 `$null` → 缓存 age 恒 0 → 面板永远显示旧内容），且 `dsh-agent.ps1` 必须用 `$script:clock`/`Stopwatch` 做缓存时钟 |
+| CON-011 | **桥通道不吞向上滚 + 滚动立即生效**：`WheelBridgeMsg` 不许再出现 `(up \|\| !DesktopUnderCursor())`、`curPage=0` 必须调用 `WheelHandle(up ? -1 : 1, "bridge")`；`dsh.js` 的 `/scroll.js` 轮询必须是 40ms、`queueScroll` 不许排 `setTimeout`（2026-11-06 用户报"只能向下滚、卡"的回归） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -112,14 +114,14 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | SEC-007 | 4 份日志里没有 `sk-` 密钥明文 |
 | SEC-008 | 待办正文换行不能注入多行 —— 用**隔离实例**验（临时目录 + 独立端口 + 独立 `LOCALAPPDATA`），不写真实 `todo.txt`，因此 Safe 模式也会跑 |
 
-### 40-runtime · 运行时健康（11 条）
+### 40-runtime · 运行时健康（12 条）
 | 编号 | 查什么 |
 |---|---|
 | RUN-001 | 抽屉 / 代理 / 看门狗 / Lively 存活，且抽屉只有 1 个实例 |
 | RUN-002 | `drawer.pid` 等 pid 文件与实际进程一致 |
 | RUN-003 | 心跳 ≤45s **且空闲也前进**（历史事故：只在有请求时刷 → 被看门狗误杀） |
 | RUN-004 | 4 个数据接口 200 且 **<200ms**（单线程代理的连坐红线） |
-| RUN-005 | `/state.js` 6 个字段齐全 |
+| RUN-005 | `/state.js` 10 个字段齐全（含 `sig/err/reload/dbg`） |
 | RUN-006 | `state.lines` 是可渲染字符串数组（防空 `System.Object[]`） |
 | RUN-007 | `/state.js` 连测 5 次无抖动 |
 | RUN-008 | `/media.js` 8 个字段齐全 |
@@ -127,6 +129,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-010 | `OPTIONS` 回 204、`.js` 的 `Content-Type` 是 `application/javascript` |
 | RUN-011 | **抽屉文件通道可达**：写 `summon.cmd=diag`，验证 400ms 内被消费且 `wheel.log` 落了 `diag:` 快照（唯一能验到 AHK 主循环的手段） |
 | RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子；hwnd 文件比日志新且不到 30 秒时降级 `warn`（抽屉刚 announce、桥还没到下一个 5 秒 tick） |
+| RUN-013 | **`/log.js` 会话正文通道**：`window.__DSH_LOG="…"` 前缀、≤60000 字符（超了单线程代理会排队）、`Content-Type` 是 `application/javascript`；日志为空时 `sig` 尚未生成属正常 |
 
 ### 50-resilience · 健壮性与容量（9 条）
 | 编号 | 查什么 |
@@ -153,7 +156,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 54 条。
+合计 58 条。
 
 ---
 
@@ -196,5 +199,5 @@ Test-Case XXX-002 '分类' '需要人工判断的' low {
 - **STA-005 / STA-009 在"故意只改源工程、还没部署"时会红**：这是设计意图，不是误报 —— 那正是最容易骗人的状态。
 - **SEC-003 会在 `audit.log` 留一行 `SELFTEST-INJECT`**：这是探针本身，`grep -v SELFTEST` 可以滤掉。
 - **RUN-011 会往 `wheel.log` 追加一行 `diag:`**，并临时创建/由抽屉删除 `summon.cmd`。`diag` 只写快照不弹窗，但确实会改一个运行时文件；不想要它就 `-Case` 排除。
-- **AHK 无法做语法校验**：本机安全策略会掐掉 `AutoHotkey64.exe /validate`（exit=2 且无输出），所以 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征，**改完仍需人工复查 + 手测**。`RUN-011` 只能证明"主循环还在转"，证明不了具体交互逻辑。
+- **AHK 不能靠 `/validate` 证明没问题**：本机 `AutoHotkey64.exe /validate <script>` 返回 exit=0 且无任何输出（既不是 Syntax OK，也不是失败），所以别把它当验收。 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征；**改完仍要重启抽屉看 `wheel.log` / `audit.log` 里动作对不对**。`RUN-011` 只能证明"主循环还在转"。滚轮判定层可脚本化验证：`summon.cmd` 写 `classify=<hwnd>`，壁纸页 WebView2 的 RenderWidgetHost 应回 `desk=1`（root=Progman），Chrome 的应回 `desk=0`。
 - **`schtasks` 被拉黑**：所以测试不验证计划任务是否注册（那是 `verify.ps1` 用 `Get-ScheduledTask` 查的，走的是 COM 不是 exe）。

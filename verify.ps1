@@ -79,7 +79,7 @@ if (Test-Tcp 17433 600) { Ok "127.0.0.1:17433 可连接" } else { Bad "127.0.0.1
 
 Write-Host "== HTTP 接口"
 $state = ''
-foreach ($ep in @('/state.js','/media.js','/scroll.js','/dock.js','/todo.gif','/rect.gif')) {
+foreach ($ep in @('/state.js','/log.js','/media.js','/scroll.js','/dock.js','/todo.gif','/rect.gif')) {
     try {
         $r = Invoke-WebRequest -Uri ('http://127.0.0.1:17433' + $ep) -TimeoutSec 6 -UseBasicParsing
         if ($r.StatusCode -ne 200) { Bad "GET $ep 状态码 $($r.StatusCode)" ; continue }
