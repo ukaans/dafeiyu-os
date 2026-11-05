@@ -194,8 +194,9 @@ function dshInit() {
   function queueScroll(px) {
     if (!px) return;
     scrollPending += px;
-    if (scrollTimer) return;
-    scrollTimer = setTimeout(flushScroll, 0);
+    // 立即写 scrollTop：不排 setTimeout —— 壁纸被全屏窗口盖住时定时器可能被节流，
+    // 而且多等一帧就是用户说的"滚轮发黏、卡卡的"。
+    flushScroll();
   }
 
   function onScrollData() {
@@ -212,7 +213,8 @@ function dshInit() {
       jsonp('/scroll.js', function () { scrollPolling = false; onScrollData(); },
         function () { scrollPolling = false; });
     }
-    setTimeout(scrollPoll, 80);
+    // 40ms 一轮：80ms 时"一格滚轮要等小半秒"的感觉很明显，40ms 是本地 HTTP 轮询还能稳住的频率
+    setTimeout(scrollPoll, 40);
   }
 
   // ===== 会话视图 =====

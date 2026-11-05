@@ -252,7 +252,8 @@ function Get-ErrText {
     if (-not $txt) { return '' }
     $hits = New-Object System.Collections.Generic.List[string]
     foreach ($ln in ($txt -split "`r?`n")) {
-        if ($ln -match '^(dsh:\s*(?!reasoning)|FATAL:|Unhandled)') { $hits.Add($ln.Trim()) }
+        # 只收"有内容"的错误行：裸的 "dsh: reasoning:" 是流式推理的开头标记，不是错误（2026-11-05 面板上一直挂它）
+        if ($ln -match '^(dsh:(?!\s*reasoning:)\s*\S|FATAL:|Unhandled)') { $hits.Add($ln.Trim()) }
     }
     if ($hits.Count -eq 0) { return '' }
     $take = [Math]::Min(2, $hits.Count)
@@ -1353,11 +1354,12 @@ function Invoke-LaunchPath($ctx, $query) {
 function Invoke-ScrollJs($ctx, $query) {
     $sd = Take-Scroll
     $js = 'window.__DSH_SCROLL=' + [int]$sd + ';'
-    # 热重载搭这条 80ms 通道的便车：/reload.gif 写了令牌，就让页面执行一次 location.reload()。
-    # 只发一次（发完清令牌）；老页面也认 location.reload()，所以换 dsh.js/todo.css 能立即生效。
+    # 热重载搭这条 40ms 通道的便车：/reload.gif 写了令牌，就让页面执行一次 location.reload()。
+    # 必须延迟 60ms 再 reload：在 JSONP 脚本执行中途导航，Lively 的 WebView2 会白屏（2026-11-06 实测）。
+    # 只发一次（发完清令牌）。
     try {
         if (Test-Path $reloadFile) {
-            $js += 'location.reload();'
+            $js += 'setTimeout(function(){location.reload();},60);'
             Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
             # 安全策略拦 Remove-Item 时退化成写空文件：Get-ReloadToken 读到空 → 0，不会重复触发
             if (Test-Path $reloadFile) { [System.IO.File]::WriteAllText($reloadFile, '', (New-Object System.Text.UTF8Encoding($false))) }

@@ -2056,19 +2056,30 @@ BridgeAnnounce() {
 
 WheelBridgeMsg(wParam, lParam, msg, hwnd) {
     global WHEEL_HK_TICK, WHEEL_RAW_TICK, WHEEL_BRIDGE_TICK, WHEEL_BRIDGE_HITS, WHEEL_BRIDGE_LOG
-    global curPage
+    global curPage, WHEEL_LASTSRC
     WHEEL_BRIDGE_HITS += 1
     WHEEL_BRIDGE_TICK := A_TickCount
-    ; 热键 / Raw Input / 桥 三条通道 120ms 内只算一次（钩子活着时三条会同时到）
-    if (A_TickCount - WHEEL_HK_TICK < 120 || A_TickCount - WHEEL_RAW_TICK < 120)
+    ; 三条通道去重：钩子活着时同一格会从 HK / RawInput / 桥 各到一次，120ms 内只算一条。
+    ; 但桥自己连着来的相邻两格不能当成回声丢掉 —— 以前这里一律丢，快速滚动时一半的格子
+    ; 直接消失，用户的感觉就是「滚起来卡卡的、只走一半」。
+    if ((A_TickCount - WHEEL_HK_TICK < 120 || A_TickCount - WHEEL_RAW_TICK < 120) && WHEEL_LASTSRC != "bridge")
         return 0
     WHEEL_HK_TICK := A_TickCount
     WHEEL_RAW_TICK := A_TickCount
     up := (wParam != 1)
     ; 桥不吞事件，应用本来就收到了这次滚动。所以只在"抽屉真的要动作"时接管：
-    ; 抽屉关着、光标又不在桌面（或是在向上滚）→ 什么都别做，免得多滚一屏。
-    if (curPage = 0 && (up || !DesktopUnderCursor()))
+    ; 抽屉关着时：光标不在桌面 → 什么都不做，免得多滚一屏；
+    ;             光标在面板上 → 上下都交给决策层（以前这里把 up 也丢了，面板只能向下滚）；
+    ;             光标在桌面空白处 → 只有向下才召唤抽屉。
+    if (curPage = 0) {
+        if (!DesktopUnderCursor())
+            return 0
+        if (ConsoleUnderCursor())
+            WheelHandle(up ? -1 : 1, "bridge")
+        else if (!up)
+            WheelHandle(1, "bridge")
         return 0
+    }
     if (A_TickCount - WHEEL_BRIDGE_LOG > 60000) {
         WHEEL_BRIDGE_LOG := A_TickCount
         mx := 0, my := 0

@@ -256,3 +256,25 @@ Test-Case CON-010 '契约' 'PowerShell 5.1 兼容：不用 .NET Core 专有计�
     if ($agent -notmatch 'Cache-Get' -or $agent -notmatch 'ElapsedMilliseconds') { throw 'Cache-Get 没接 $script:clock.ElapsedMilliseconds，缓存会退回永不失效' }
     ('扫描 ' + $files.Count + ' 个 .ps1：无 TickCount64，缓存时钟走 Stopwatch')
 } -Hint '本机只跑 Windows PowerShell 5.1：TickCount64 / [TimeProvider] 之类 .NET Core API 会静默变 $null → 缓存 age 恒为 0 → 面板永远显示第一次取到的旧内容'
+
+Test-Case CON-011 '契约' '桥通道不吞向上滚 + 滚动立即生效' high {
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $m = [regex]::Match($ahk, 'WheelBridgeMsg\(wParam,\s*lParam,\s*msg,\s*hwnd\)\s*\{(?<body>[\s\S]*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 WheelBridgeMsg 函数体，AHK 结构变了' }
+    $body = $m.Groups['body'].Value
+    if ($body -match '\(up \|\| !DesktopUnderCursor\(\)\)') {
+        throw 'WheelBridgeMsg 又把 up 并进丢弃条件了 —— 抽屉关着时向上滚整条消失（面板只能向下滚）'
+    }
+    if ($body -notmatch 'WheelHandle\(up \? -1 : 1, "bridge"\)') {
+        throw 'WheelBridgeMsg 的 curPage=0 分支不再把上下都交给 WheelHandle'
+    }
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    if ($js -notmatch 'setTimeout\(scrollPoll,\s*40\)') { throw 'dsh.js 的 /scroll.js 轮询不是 40ms（80ms 时一格滚轮要等小半秒）' }
+    $q = [regex]::Match($js, 'function queueScroll\(px\)\s*\{(?<q>[\s\S]*?)\r?\n  \}')
+    if (-not $q.Success) { throw '找不到 queueScroll 函数体' }
+    # 只看代码行：注释里会解释「为什么不排 setTimeout」，不能拿注释判失败
+    $qcode = (($q.Groups['q'].Value -split "\r?\n") | Where-Object { $_ -notmatch '^\s*//' }) -join "`n"
+    if ($qcode -match 'setTimeout') { throw 'queueScroll 又排 setTimeout 了 —— 多等一帧就是「滚轮发黏」' }
+    '桥通道上下都接线；/scroll.js 40ms；scrollTop 立即落'
+} -Hint '2026-11-06 用户报「只能向下滚、延迟大、卡卡的」：根因是桥把 up 丢了（curPage=0 直接 return）+ 80ms 轮询 + 排一帧 setTimeout'
