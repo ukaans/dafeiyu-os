@@ -18,9 +18,15 @@
 #      （否则抽屉自己 WheelPassThrough 的 Send("{WheelDown}") 会被当成召唤信号，死循环）
 #   3) delta<0（滚轮向下）→ PostMessage(抽屉窗口, 0x8001, 1, 0)
 #      delta>0（滚轮向上）→ PostMessage(抽屉窗口, 0x8001, 2, 0)
-#   4) 抽屉窗口句柄从 wheel-bridge.hwnd 读（每 2 秒重读，IsWindow 校验）
-#   5) 每 55 秒写心跳；180 秒没有回调而系统最近有输入 → 摘钩重装（抗钩子被摘）
+#   4) 抽屉窗口句柄从 wheel-bridge.hwnd 读，并且**热跟随**：每 5 秒定时器里看一眼、
+#      每次投递前再看一眼；当前目标已经不在（IsWindow=0）就立刻丢权重读。
+#      抽屉重启会换 A_ScriptHwnd，文件由抽屉每 30 秒重写一次 → 桥不需要重启
+#   5) 每 55 秒写心跳（hits/posts/failpost/follows/target/alive）；
+#      180 秒没有回调而系统最近有输入 → 摘钩重装（抗钩子被摘）
 #   6) 日志 wheel-bridge.log，256KB 两代轮转；单实例（互斥体）
+#   7) 自检：`powershell -NoProfile -File wheel-bridge.ps1 --probe [--up]`
+#      —— 不装钩子、不进消息循环，只按 hwnd 文件找抽屉投一条 0x8001 再退出，
+#      用来验「桥能不能把消息送到抽屉」（抽屉 diag 的 bridge_hits 会 +1）
 # ---------------------------------------------------------------------------
 
 $ErrorActionPreference = 'Stop'
@@ -77,8 +83,8 @@ public static class DshWheelBridge
     static IntPtr _target = IntPtr.Zero;
     static IntPtr _win = IntPtr.Zero;
     static string _logPath, _hwndPath, _id = "", _dir;
-    static long _hits, _posts, _failPost, _rearms;
-    static DateTime _lastEvent = DateTime.MinValue, _lastBeat = DateTime.MinValue, _lastRead = DateTime.MinValue;
+    static long _hits, _posts, _failPost, _rearms, _follows;
+    static DateTime _lastEvent = DateTime.MinValue, _lastBeat = DateTime.MinValue, _lastRead = DateTime.MinValue, _lastFailLog = DateTime.MinValue;
 
     public static void Log(string s)
     {
@@ -94,32 +100,69 @@ public static class DshWheelBridge
         catch { }
     }
 
-    static void ReadTarget()
+    // 热跟随：目标 hwnd 只从 wheel-bridge.hwnd 来（抽屉每 30 秒重写一次），
+    // 这里在「每 5 秒的心跳 tick」和「每次投递前」都重读一次，
+    // 并且发现当前目标已经不在了就立刻丢权重读 —— 于是重启抽屉后**不用重启桥**。
+    static void ReadTarget(bool force)
     {
         _lastRead = DateTime.Now;
         try
         {
-            if (!File.Exists(_hwndPath)) return;
+            if (!File.Exists(_hwndPath))
+            {
+                if (force && _target != IntPtr.Zero && !IsWindow(_target)) _target = IntPtr.Zero;
+                return;
+            }
             string s = File.ReadAllText(_hwndPath).Trim();
-            if (s.Length == 0) return;
+            if (s.Length == 0) return;      // 抽屉 FileDelete+FileAppend 的空窗期，5 秒后再读
             IntPtr h = new IntPtr(long.Parse(s));
-            if (h != _target && IsWindow(h)) { _target = h; Log("target: drawer hwnd=" + h); }
+            if (h == _target) return;
+            if (!IsWindow(h))
+            {
+                if (force && h != IntPtr.Zero) Log("target: skip dead hwnd=" + h);
+                return;
+            }
+            Log("target: follow hwnd=" + h + " (prev=" + _target + ")");
+            _target = h;
+            _follows++;
         }
         catch { }
     }
 
+    static void EnsureTarget(bool force)
+    {
+        if (force || _target == IntPtr.Zero || !IsWindow(_target) ||
+            DateTime.Now - _lastRead > TimeSpan.FromSeconds(5))
+        {
+            if (_target != IntPtr.Zero && !IsWindow(_target)) _target = IntPtr.Zero;
+            ReadTarget(force);
+        }
+    }
+
     static void PostWheel(int dir, string via)
     {
-        if (DateTime.Now - _lastRead > TimeSpan.FromSeconds(2)) ReadTarget();
+        EnsureTarget(true);
         if (_target != IntPtr.Zero && IsWindow(_target) &&
             PostMessageW(_target, WM_BRIDGE_WHEEL, new IntPtr(dir), IntPtr.Zero))
         {
             _posts++;
+            return;
         }
-        else
+        _failPost++;
+        // 目标可能刚好被重启换掉：丢权、立刻重读、再试一次，成功就不刷日志
+        _target = IntPtr.Zero;
+        ReadTarget(false);
+        if (_target != IntPtr.Zero && IsWindow(_target) &&
+            PostMessageW(_target, WM_BRIDGE_WHEEL, new IntPtr(dir), IntPtr.Zero))
         {
-            _failPost++;
-            Log("post FAILED dir=" + dir + " via=" + via + " target=" + _target);
+            _posts++;
+            return;
+        }
+        // 连续失败只每 60 秒记一行，免得把日志刷满
+        if (DateTime.Now - _lastFailLog > TimeSpan.FromSeconds(60))
+        {
+            _lastFailLog = DateTime.Now;
+            Log("post FAILED dir=" + dir + " via=" + via + " target=" + _target + " failpost=" + _failPost);
         }
     }
 
@@ -172,16 +215,37 @@ public static class DshWheelBridge
 
     static void Housekeeping()
     {
+        EnsureTarget(false);            // 每 5 秒 tick 都看一眼目标还在不在（热跟随）
         if (DateTime.Now - _lastBeat < TimeSpan.FromSeconds(55)) return;
         _lastBeat = DateTime.Now;
         double quiet = (_lastEvent == DateTime.MinValue)
             ? (_lastBeat - _started).TotalSeconds
             : (DateTime.Now - _lastEvent).TotalSeconds;
-        Log("beat hits=" + _hits + " posts=" + _posts + " failpost=" + _failPost + " quiet=" + (int)quiet + "s target=" + _target);
+        Log("beat hits=" + _hits + " posts=" + _posts + " failpost=" + _failPost +
+            " follows=" + _follows + " quiet=" + (int)quiet + "s target=" + _target +
+            " alive=" + (_target != IntPtr.Zero && IsWindow(_target) ? 1 : 0));
         if (quiet > 180 && RecentInput(2000)) RearmHook();
     }
 
     static DateTime _started;
+
+    // 自检入口：powershell -File wheel-bridge.ps1 --probe
+    // 不装钩子、不进消息循环，只按 wheel-bridge.hwnd 找抽屉、投一条 0x8001，
+    // 用来回答「桥能不能把消息送到抽屉」这件事（抽屉那边的 diag 会看到 bridge_hits +1）。
+    public static void Probe(string dir, int wheelDir)
+    {
+        _dir = dir;
+        _logPath = Path.Combine(_dir, "wheel-bridge.log");
+        _hwndPath = Path.Combine(_dir, "wheel-bridge.hwnd");
+        EnsureTarget(true);
+        if (_target == IntPtr.Zero || !IsWindow(_target))
+        {
+            Log("probe: no target (file=" + _hwndPath + ")");
+            return;
+        }
+        PostWheel(wheelDir, "probe");
+        Log("probe: dir=" + wheelDir + " target=" + _target + " posts=" + _posts + " failpost=" + _failPost);
+    }
 
     public static int Run(string dir, string idSuffix)
     {
@@ -205,7 +269,7 @@ public static class DshWheelBridge
             ushort atom = RegisterClassExW(ref wc);
             _win = CreateWindowExW(0, cls, "DshWheelBridge", 0x80000000, 0, 0, 0, 0,
                                    IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
-            ReadTarget();
+            ReadTarget(true);
             InstallHook();
             Log("start: pid=" + System.Diagnostics.Process.GetCurrentProcess().Id +
                 " host=" + System.Diagnostics.Process.GetCurrentProcess().ProcessName +
@@ -230,6 +294,13 @@ try {
 } catch {
     # 已加载过同名类型时忽略
     if ($_.Exception.Message -notmatch 'already exists') { throw }
+}
+
+if ($args -contains '--probe') {
+    # 自检：按 wheel-bridge.hwnd 找到抽屉，投一条 0x8001，看完日志就退出
+    $dir = if ($args -contains '--up') { 2 } else { 1 }
+    [DshWheelBridge]::Probe($scriptDir, $dir)
+    exit 0
 }
 
 [void][DshWheelBridge]::Run($scriptDir, '')

@@ -2021,9 +2021,19 @@ OnRawWheel(wParam, lParam, *) {
 ; 交给一个不受 AHK 影响的小进程。详见 docs\项目地图.md §8。
 BridgeAnnounce() {
     global BRIDGE_FILE, BRIDGE_ANNOUNCE_LOG, WHEEL_BRIDGE_TICK
-    ; 句柄写文件给桥读（桥每 2 秒重读一次，所以先起桥、后起抽屉也能接上）
-    try FileDelete(BRIDGE_FILE)
-    try FileAppend(A_ScriptHwnd "`n", BRIDGE_FILE, "UTF-8")
+    ; 句柄写文件给桥读。桥那边是「热跟随」：每 5 秒 + 每次投递前重读，
+    ; 发现当前目标没了就立刻丢权重读 → 抽屉重启后不需要重启桥。
+    ; 写入用「临时文件 + 覆盖移动」，避免桥正好读在 FileDelete 与 FileAppend 之间的空窗。
+    ; 注意：AHK v2 的 FileDelete 在「没有文件可删」时会抛 (2) 系统找不到指定的文件，
+    ; 所以它必须单独 try —— 放在同一个 try 里会让整个落盘流程一次都不执行（2026-11-05 踩过）。
+    tmp := BRIDGE_FILE ".tmp"
+    try FileDelete(tmp)
+    try {
+        FileAppend(A_ScriptHwnd "`n", tmp, "UTF-8")
+        FileMove(tmp, BRIDGE_FILE, 1)
+    } catch as e {
+        LogWrite("bridge: announce 落盘失败 file=" BRIDGE_FILE " err=" e.Message)
+    }
     if (A_TickCount - BRIDGE_ANNOUNCE_LOG > 60000) {
         BRIDGE_ANNOUNCE_LOG := A_TickCount
         LogWrite("bridge: announce hwnd=" A_ScriptHwnd

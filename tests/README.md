@@ -126,6 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-009 | `/dock.js` 项数 ≤6、`__DOCK_BUSY` 存在 |
 | RUN-010 | `OPTIONS` 回 204、`.js` 的 `Content-Type` 是 `application/javascript` |
 | RUN-011 | **抽屉文件通道可达**：写 `summon.cmd=diag`，验证 400ms 内被消费且 `wheel.log` 落了 `diag:` 快照（唯一能验到 AHK 主循环的手段） |
+| RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子；hwnd 文件比日志新且不到 30 秒时降级 `warn`（抽屉刚 announce、桥还没到下一个 5 秒 tick） |
 
 ### 50-resilience · 健壮性与容量（9 条）
 | 编号 | 查什么 |

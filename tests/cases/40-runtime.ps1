@@ -232,3 +232,49 @@ Test-Case RUN-011 '运行时' '抽屉文件通道可达（AHK 真在跑）' medi
     }
     ('summon.cmd 被消费，wheel.log 新增 diag 快照（diag 行 ' + $before + ' → ' + $after + '）')
 } -Hint '这条红了先看 wheel.log 有没有在增长；抽屉卡死时 Ctrl+Alt+D 也救不回桌面图标，需重启 Autostart 任务'
+
+Test-Case RUN-012 '运行时' '滚轮桥热跟随（桥没在旧 hwnd 上打转）' medium {
+    # 桥把抽屉的脚本窗口 hwnd 缓存成投递目标，抽屉重启后 hwnd 会变。
+    # 改前必须手动 kill 掉桥再跑一次 start-all，忘了就出现「滚轮完全没反应」，
+    # 而 wheel-bridge.log 里一直刷 post FAILED target=<旧hwnd>（日志看着像桥活着，其实投给死窗口）。
+    # 改后桥每 5 秒 tick 和每次投递前都重读 wheel-bridge.hwnd，并丢掉已死的目标。
+    # 这条用例只读文件、不碰钩子：beat 行里有 follows= 说明跑的是新代码，beat 的 target 应等于抽屉 announce 的 hwnd。
+    $inst = Get-DshInstall
+    if (-not (Test-Path -LiteralPath $inst)) { return (Test-DshAbort) }
+    $log = Join-Path $inst 'wheel-bridge.log'
+    $hwndFile = Join-Path $inst 'wheel-bridge.hwnd'
+    if (-not (Test-Path -LiteralPath $log)) { return (Test-DshAbort) }
+    $beats = @(Sec-ReadShared $log 400 | Where-Object { $_ -match 'beat ' })
+    if ($beats.Count -eq 0) {
+        return @{ Status = 'warn'; Detail = 'wheel-bridge.log 里没有 beat 行（桥没跑，或刚起来还没到第一个 5 秒 tick）' }
+    }
+    $last = $beats[-1].Trim()
+    if ($last -notmatch 'follows=') {
+        throw ('桥还在跑旧代码（beat 里没有 follows= 字段）：' + $last + ' → kill 掉 powershell 桥再跑一次 start-all，新代码才会热跟随')
+    }
+    $mFollow = [regex]::Match($last, 'follows=(\d+)')
+    $mTarget = [regex]::Match($last, 'target=(\d+)')
+    $mAlive = [regex]::Match($last, 'alive=(\d+)')
+    $follows = if ($mFollow.Success) { $mFollow.Groups[1].Value } else { '?' }
+    $beatTarget = if ($mTarget.Success) { [long]$mTarget.Groups[1].Value } else { 0 }
+    $alive = if ($mAlive.Success) { $mAlive.Groups[1].Value } else { '?' }
+
+    $fileHwnd = 0
+    if (Test-Path -LiteralPath $hwndFile) {
+        try { $raw = ([System.IO.File]::ReadAllText($hwndFile)).Trim() } catch { $raw = '' }
+        if ($raw -match '^\d+$') { $fileHwnd = [long]$raw }
+    }
+    if ($fileHwnd -le 0) {
+        return @{ Status = 'warn'; Detail = ('wheel-bridge.hwnd 空着或不是数字（抽屉还没 announce 成功）：beat=' + $last) }
+    }
+    if ($beatTarget -ne $fileHwnd) {
+        $fileAge = ((Get-Date) - (Get-Item -LiteralPath $hwndFile).LastWriteTime).TotalSeconds
+        $logAge = ((Get-Date) - (Get-Item -LiteralPath $log).LastWriteTime).TotalSeconds
+        if ($fileAge -lt 30 -and $fileAge -lt $logAge) {
+            # 抽屉刚 announce、桥还没走到下一个 tick：不是故障，别误报
+            return @{ Status = 'warn'; Detail = ('抽屉 ' + [int]$fileAge + ' 秒前才 announce，桥还没等到下一个 tick：beat target=' + $beatTarget + '，文件=' + $fileHwnd) }
+        }
+        throw ('桥没跟随：beat target=' + $beatTarget + '，但 wheel-bridge.hwnd=' + $fileHwnd + '（同一次 tick 里目标该换成新 hwnd；差得久说明跟随逻辑失效）')
+    }
+    ('桥热跟随正常：beat target = wheel-bridge.hwnd = ' + $fileHwnd + '，follows=' + $follows + ' alive=' + $alive)
+} -Hint '红了先看 wheel-bridge.log 末尾：target=0/alive=0 说明抽屉没 announce（回 wheel.log 搜 announce 落盘失败）；没有 follows= 字段说明桥还在跑旧脚本，kill 掉重启一次'
