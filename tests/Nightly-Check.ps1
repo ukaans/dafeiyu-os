@@ -381,6 +381,7 @@ try {
 
         # 6b) 推送 dev
         if ($hasRemote) {
+            $report.PreRemoteSha = (Invoke-Git @('rev-parse','--verify',$remoteRef) -AllowFail).Text
             $ahead = (Invoke-Git @('rev-list','--count',"$remoteRef..$Branch") -AllowFail).Text
             $aheadN = 0; [int]::TryParse($ahead, [ref]$aheadN) | Out-Null
             if ($aheadN -eq 0) {
@@ -425,7 +426,15 @@ $quality = $null
 try {
     $qAhead = 0
     [int]::TryParse((Invoke-Git @('rev-list','--count','origin/dev..dev') -AllowFail).Text, [ref]$qAhead) | Out-Null
-    $qRange = if ($qAhead -gt 0) { 'origin/dev..dev' } elseif ($report.DirtyFiles.Count -gt 0) { 'HEAD' } else { '' }
+    $headSha = (Invoke-Git @('rev-parse','HEAD') -AllowFail).Text
+    $qRange = ''
+    if ($report.PreRemoteSha -and $report.PreRemoteSha -ne $headSha -and (Invoke-Git @('cat-file','-t',$report.PreRemoteSha) -AllowFail).Code -eq 0) {
+        $qRange = "$($report.PreRemoteSha)..HEAD"      # 已经推上去了：评刚才那一批
+    } elseif ($qAhead -gt 0) {
+        $qRange = 'origin/dev..dev'                     # 还没推：评待推的
+    } elseif ($report.DirtyFiles.Count -gt 0) {
+        $qRange = 'HEAD'                                # 只有工作区：评未提交改动
+    }
     $quality = Get-QualityReview -Commits $report.Commits -TestStats $report.Stats -AheadCount $qAhead -Range $qRange
 } catch {
     $quality = [pscustomobject]@{ HasContent = $false; Score = -1; Verdict = ''; AiText = ''; AiNote = "质量点评计算失败：$($_.Exception.Message)"; Files = @(); Stat = ''; Reasons = @(); RiskFiles = @(); TouchedTests = $false; TouchedDocs = $false; Prev = $null }
