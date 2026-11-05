@@ -15,6 +15,18 @@ window.onerror = function (m, s, l) { try { document.title = 'JSERR ' + m + ' @'
 function dshInit() {
   'use strict';
 
+  // ---- 热重载（不导航）----
+  // Lively 的 WebView2 上 location.reload() 会把页面弄成白屏（2026-11-06 复现两次，panel-rect 不再更新），
+  // 所以改成「再插一份 dsh.js」：先清掉上一代的定时器、删掉旧面板，再跑一遍初始化。
+  var GEN = (window.__DSH_GEN = (window.__DSH_GEN || 0) + 1);
+  (window.__DSH_TIMERS || []).forEach(function (t) { clearTimeout(t); clearInterval(t); });
+  window.__DSH_TIMERS = [];
+  function alive() { return window.__DSH_GEN === GEN; }
+  function every(ms, fn) { var id = setInterval(function () { if (alive()) fn(); }, ms); window.__DSH_TIMERS.push(id); return id; }
+  function after(ms, fn) { var id = setTimeout(function () { if (alive()) fn(); }, ms); window.__DSH_TIMERS.push(id); return id; }
+  var oldPanel = document.getElementById('dshPanel');
+  if (oldPanel && oldPanel.parentNode) oldPanel.parentNode.removeChild(oldPanel);
+
   // 通信层优先走 api.js 的 window.__API；本文件单独部署时回退到内置写法（jsonp / beacon 里）
   var API = (window.__API || {}).url || 'http://127.0.0.1:17433';
 
@@ -179,7 +191,7 @@ function dshInit() {
     var before = host.scrollTop;
     host.scrollTop = clampScroll(before + px, host);
     syncNavBtns();
-    dbg('scroll d=' + px + ' at=' + Math.round(before) + '->' + Math.round(host.scrollTop) +
+    dbg('scroll gen=' + GEN + ' d=' + px + ' at=' + Math.round(before) + '->' + Math.round(host.scrollTop) +
       ' max=' + Math.max(0, host.scrollHeight - host.clientHeight) + ' ch=' + host.clientHeight);
   }
 
@@ -214,7 +226,7 @@ function dshInit() {
         function () { scrollPolling = false; });
     }
     // 40ms 一轮：80ms 时"一格滚轮要等小半秒"的感觉很明显，40ms 是本地 HTTP 轮询还能稳住的频率
-    setTimeout(scrollPoll, 40);
+    after(40, scrollPoll);
   }
 
   // ===== 会话视图 =====
@@ -235,7 +247,9 @@ function dshInit() {
 
   function trimMsg(s) {
     var t = String(s || '').replace(/[ \t]+$/mg, '').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '');
-    if (t.length > 3000) t = t.slice(0, 3000) + '\n…（过长已截断）';
+    // 单条上限 12000 字符：够放一整段长回复（面板本身 200px 高，再多也只是滚动量），
+    // 又不至于让一次长回答把 DOM 撑爆；截断处留一句提示，全文去「网页」里看。
+    if (t.length > 12000) t = t.slice(0, 12000) + '\n…（过长已截断，全文点「网页」看）';
     return t;
   }
 
@@ -493,7 +507,7 @@ function dshInit() {
     pendingSend = { text: text, time: new Date().toTimeString().slice(0, 8) };
     audit('dsh.send', 'chars=' + text.length);
     beacon('/run.gif?t=' + encodeURIComponent(text));
-    setTimeout(poll, 1200);
+    after(1200, poll);
   }
 
   // 日志区：手动处理滚轮（壁纸里原生滚动条点不到 / 拖不动）
@@ -579,7 +593,7 @@ function dshInit() {
     syncNavBtns();
     audit('dsh.clear', '');
     beacon('/clear.gif');
-    setTimeout(poll, 400);
+    after(400, poll);
   });
   syncNavBtns();
 
@@ -594,7 +608,7 @@ function dshInit() {
       runDot.className = 'drawer-dot busy';
       audit('dsh.drawer', '');
       beacon('/drawer.gif');
-      setTimeout(poll, 1200);
+      after(1200, poll);
     }, true);
     btn.addEventListener('contextmenu', function (e) {
       e.preventDefault();
@@ -613,7 +627,7 @@ function dshInit() {
   try {
     if (window.ResizeObserver) new ResizeObserver(function () { reportRect(); }).observe(box);
     window.addEventListener('resize', function () { reportRect(); syncNavBtns(); });
-    setInterval(function () { reportRect(true); }, 4000);
+    every(4000, function () { reportRect(true); });
   } catch (e) {}
 
   // 设置面板开关：立刻重报矩形（打开=整屏，关闭=控制台面板），并把焦点从输入框挪走
@@ -644,13 +658,25 @@ function dshInit() {
     syncNavBtns();   // 隐藏时 scrollHeight 被算成 0，重新显示后要把 ▲▼ 的状态纠正回来
   }
   syncConsole();
-  setInterval(syncConsole, 1000);
+  every(1000, syncConsole);
   window.addEventListener('storage', syncConsole);
 
   dbg('boot ' + API);
   poll();
-  setInterval(poll, 1200);
+  every(1200, poll);
   scrollPoll();
+
+  // 代理热重载入口：/scroll.js 读到令牌时会调它（老页面没有这个钩子，代理会退回 location.reload）
+  window.__DSH_RELOAD_OK = function () {
+    try {
+      var s = document.createElement('script');
+      s.src = 'dsh.js?hot=' + Date.now();
+      s.async = true;
+      (document.body || document.documentElement).appendChild(s);
+    } catch (e) {
+      document.title = 'JSERR reload ' + e.message;
+    }
+  };
   // ===== 快捷启动栏（6 格，2 行 x 3 列）=====
   var dockGrid = document.getElementById('dockGrid');
   var dockHint = document.getElementById('dockHint');
@@ -689,13 +715,13 @@ function dshInit() {
   if (dockGrid) {
     dockGrid.addEventListener('click', function (ev) {
       var del = ev.target.closest ? ev.target.closest('[data-del]') : null;
-      if (del) { ev.stopPropagation(); beacon('/dock.gif?op=del&i=' + del.getAttribute('data-del')); setTimeout(dockPoll, 400); return; }
+      if (del) { ev.stopPropagation(); beacon('/dock.gif?op=del&i=' + del.getAttribute('data-del')); after(400, dockPoll); return; }
       var add = ev.target.closest ? ev.target.closest('[data-add]') : null;
       if (add) {
         if (window.__DOCK_BUSY === 1) return;
         add.querySelector('.dock-name').textContent = '选择中…';
         beacon('/adddock.gif');
-        setTimeout(dockPoll, 900);
+        after(900, dockPoll);
         return;
       }
       var tile = ev.target.closest ? ev.target.closest('.dock-tile[data-i]') : null;
@@ -715,7 +741,7 @@ function dshInit() {
     }, function () { dockBusy = false; });
   }
   dockPoll();
-  setInterval(dockPoll, 1500);
+  every(1500, dockPoll);
 }
 
 try {

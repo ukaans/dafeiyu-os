@@ -270,7 +270,7 @@ Test-Case CON-011 '契约' '桥通道不吞向上滚 + 滚动立即生效' high 
         throw 'WheelBridgeMsg 的 curPage=0 分支不再把上下都交给 WheelHandle'
     }
     $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
-    if ($js -notmatch 'setTimeout\(scrollPoll,\s*40\)') { throw 'dsh.js 的 /scroll.js 轮询不是 40ms（80ms 时一格滚轮要等小半秒）' }
+    if ($js -notmatch 'setTimeout\(scrollPoll,\s*40\)' -and $js -notmatch 'after\(40,\s*scrollPoll\)') { throw 'dsh.js 的 /scroll.js 轮询不是 40ms（80ms 时一格滚轮要等小半秒）' }
     $q = [regex]::Match($js, 'function queueScroll\(px\)\s*\{(?<q>[\s\S]*?)\r?\n  \}')
     if (-not $q.Success) { throw '找不到 queueScroll 函数体' }
     # 只看代码行：注释里会解释「为什么不排 setTimeout」，不能拿注释判失败

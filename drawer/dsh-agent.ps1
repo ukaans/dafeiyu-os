@@ -1355,11 +1355,12 @@ function Invoke-ScrollJs($ctx, $query) {
     $sd = Take-Scroll
     $js = 'window.__DSH_SCROLL=' + [int]$sd + ';'
     # 热重载搭这条 40ms 通道的便车：/reload.gif 写了令牌，就让页面执行一次 location.reload()。
-    # 必须延迟 60ms 再 reload：在 JSONP 脚本执行中途导航，Lively 的 WebView2 会白屏（2026-11-06 实测）。
+    # 不走 location.reload()：Lively 的 WebView2 上导航会白屏（2026-11-06 两次实测，panel-rect 直接不再更新）。
+    # 新页面暴露 window.__DSH_RELOAD_OK（清旧定时器 + 删旧面板 + 重插脚本）；老页面没这个钩子才退回 reload。
     # 只发一次（发完清令牌）。
     try {
         if (Test-Path $reloadFile) {
-            $js += 'setTimeout(function(){location.reload();},60);'
+            $js += 'if(window.__DSH_RELOAD_OK){window.__DSH_RELOAD_OK()}else{setTimeout(function(){location.reload()},60)}'
             Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
             # 安全策略拦 Remove-Item 时退化成写空文件：Get-ReloadToken 读到空 → 0，不会重复触发
             if (Test-Path $reloadFile) { [System.IO.File]::WriteAllText($reloadFile, '', (New-Object System.Text.UTF8Encoding($false))) }
