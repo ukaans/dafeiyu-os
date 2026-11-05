@@ -278,3 +278,37 @@ Test-Case CON-011 '契约' '桥通道不吞向上滚 + 滚动立即生效' high 
     if ($qcode -match 'setTimeout') { throw 'queueScroll 又排 setTimeout 了 —— 多等一帧就是「滚轮发黏」' }
     '桥通道上下都接线；/scroll.js 40ms；scrollTop 立即落'
 } -Hint '2026-11-06 用户报「只能向下滚、延迟大、卡卡的」：根因是桥把 up 丢了（curPage=0 直接 return）+ 80ms 轮询 + 排一帧 setTimeout'
+
+Test-Case CON-012 '契约' '热重载只走软重载（不硬刷页面）' high {
+    # 背景：Lively 的 WebView2 上 location.reload() 会白屏（panel-rect 不再更新 → 抽屉滚轮落点全错）。
+    # 令牌有两个入口：/scroll.js（40ms 搭便车）与 /state.js 的 reload 字段（1.2s，带 500ms 缓存）。
+    # 2026-11-06 只改了前者，后者仍硬刷 —— 且「/scroll.js 已消费、/state.js 缓存未过期」那半秒
+    # 里页面照样能收到同一个令牌，所以那条硬刷路径真实可达。
+    $root = Get-DshRoot
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    # 只判代码行：注释里本来就会提到 location.reload（解释为什么不许用）
+    $code = @(($js -split "\r?\n") | Where-Object { $_ -notmatch '^\s*(//|\*|/\*)' })
+    $calls = @($code | Where-Object { $_ -match 'location\.reload\s*\(' })
+    if ($calls.Count -gt 1) {
+        throw ("dsh.js 里有 $($calls.Count) 处裸 location.reload()，只允许 softReload() 里那 1 处老页面兜底：`n" + ($calls -join "`n"))
+    }
+    # 先查真正的旁路（/state.js 那条），它才是历史上漏掉的那个入口
+    $st = [regex]::Match($js, 'if \(st\.reload && st\.reload !== lastReload\)\s*\{(?<b>[\s\S]*?)\r?\n      \}')
+    if (-not $st.Success) { throw '找不到 /state.js 的 reload 令牌分支（st.reload 判断）' }
+    $stBody = $st.Groups['b'].Value
+    if ($stBody -match 'location\.reload') { throw '/state.js 的令牌分支又直接 location.reload() 了 —— 这是条会白屏的旁路' }
+    if ($stBody -notmatch 'softReload\(') { throw '/state.js 的令牌分支没有调用 softReload()' }
+    $sr = [regex]::Match($js, 'function softReload\(tag\)\s*\{(?<b>[\s\S]*?)\r?\n  \}')
+    if (-not $sr.Success) { throw '找不到 softReload() 函数体 —— 热重载又被摊成两套写法了' }
+    $srBody = $sr.Groups['b'].Value
+    if ($srBody -notmatch '__DSH_RELOAD_OK') { throw 'softReload() 没有先试 __DSH_RELOAD_OK —— 有钩子的页面也会被硬刷成白屏' }
+    if ($calls.Count -eq 1 -and $srBody -notmatch 'location\.reload\s*\(') {
+        throw '那唯一一处 location.reload() 不在 softReload() 里'
+    }
+    # 代理侧：/scroll.js 必须优先调钩子，只给老页面留兜底
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $m = [regex]::Match($agent, 'function Invoke-ScrollJs\((?<b>[\s\S]*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 Invoke-ScrollJs 函数体' }
+    if ($m.Groups[1].Value -notmatch 'window\.__DSH_RELOAD_OK') { throw 'Invoke-ScrollJs 不再调 window.__DSH_RELOAD_OK，软重载链路断了' }
+    '两条令牌入口（/scroll.js、/state.js）都走 softReload；裸 location.reload 只剩 1 处老页面兜底'
+} -Hint '2026-11-06：热重载改软重载时只改了 /scroll.js 那条，/state.js 的 reload 字段仍 location.reload()；加上 500ms 令牌缓存，这条白屏旁路真实可达'

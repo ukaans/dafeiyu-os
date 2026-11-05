@@ -422,6 +422,21 @@ function dshInit() {
   var lastReload = 0;
   try { lastReload = parseInt(localStorage.getItem('dsh.reload') || '0', 10) || 0; } catch (e) {}
 
+  // ---- 热重载：只有「软重载」一条路 ----
+  // 两条入口都会拿到令牌 —— /scroll.js（40ms，搭便车）与 /state.js 的 reload 字段（1.2s，兜底）。
+  // 两条必须走同一个函数，否则走 /state.js 那条就会退回 location.reload() 把页面刷成白屏
+  // （2026-11-06 实测两次：白屏后 panel-rect 不再更新，抽屉的滚轮落点全错）。
+  // 给 /state.js 加了 500ms 缓存，所以「/scroll.js 已消费令牌、/state.js 缓存还没过期」这半秒里
+  // 页面仍会收到同一个令牌 —— 这就是那条硬重载路径真实可达的原因。
+  function softReload(tag) {
+    dbg('reload ' + tag);
+    if (typeof window.__DSH_RELOAD_OK === 'function') {
+      try { window.__DSH_RELOAD_OK(); return; } catch (e) { document.title = 'JSERR reload ' + e.message; }
+    }
+    // 老页面（没有钩子）才退回硬重载
+    setTimeout(function () { location.reload(); }, 60);
+  }
+
   // 失败分级：代理是单线程，偶发一条请求排队（几百毫秒到 1 秒）不该让整块日志区
   // 变成「连接失败」。1-2 次保留上次内容只提升级，连续 3 次（≈4 秒）才判死。
   function pollFailed(why) {
@@ -458,12 +473,12 @@ function dshInit() {
       if (!st) { pollFailed('/state.js 没有定义 __DSH_STATE（响应被截断）'); return; }
       failStreak = 0;
       lastErr = '';
-      // 热重载令牌（/reload.gif）：改完壁纸文件没法从外部刷新页面，代理借令牌让页面自己 reload
+      // 热重载令牌（/reload.gif → page-reload.txt）：改完壁纸文件没法从外部刷新页面，代理借令牌让页面自己重载。
+      // 只做软重载（重插 dsh.js?hot=），绝不 location.reload()。
       if (st.reload && st.reload !== lastReload) {
         lastReload = st.reload;
         try { localStorage.setItem('dsh.reload', String(lastReload)); } catch (e) {}
-        dbg('reload token=' + lastReload);
-        location.reload();
+        softReload('token=' + lastReload);
         return;
       }
       DEBUG = !!st.dbg;

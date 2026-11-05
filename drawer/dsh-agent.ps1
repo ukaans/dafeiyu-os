@@ -19,7 +19,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 #    /drawer.gif        ← 通过计划任务启动桌面抽屉（DesktopPage.ahk）
 #    /rect.gif?x&y&w&h  ← 壁纸右侧控制台的屏幕矩形（万分比）→ panel-rect.txt
 #    /scroll.gif?d=±1   ← 滚轮意图 → scroll.dat；/scroll.js ← 取走增量（并放行热重载令牌）
-#    /reload.gif        ← 写 page-reload.txt：让壁纸页自己 location.reload()（改完 JS/CSS 用）
+#    /reload.gif        ← 写 page-reload.txt：让壁纸页软重载（重插 dsh.js?hot=，不导航）
 #    /dbg.gif?m=        ← 壁纸页调试信标 → dsh-debug.log（仅 dsh-debug.flag 存在时落盘）
 #    /todo.gif?op=&t=   ← 待办增删改 → todo.txt + todo-data.js
 #    /dock.js | /dock.gif?op=del&i= | /adddock.gif | /launchpath.gif?t= | /icon/<file>
@@ -1354,9 +1354,10 @@ function Invoke-LaunchPath($ctx, $query) {
 function Invoke-ScrollJs($ctx, $query) {
     $sd = Take-Scroll
     $js = 'window.__DSH_SCROLL=' + [int]$sd + ';'
-    # 热重载搭这条 40ms 通道的便车：/reload.gif 写了令牌，就让页面执行一次 location.reload()。
+    # 热重载搭这条 40ms 通道的便车：/reload.gif 写了令牌，就让页面重插一次 dsh.js（软重载）。
     # 不走 location.reload()：Lively 的 WebView2 上导航会白屏（2026-11-06 两次实测，panel-rect 直接不再更新）。
     # 新页面暴露 window.__DSH_RELOAD_OK（清旧定时器 + 删旧面板 + 重插脚本）；老页面没这个钩子才退回 reload。
+    # 注意：/state.js 的 reload 字段是**同一份令牌的第二个入口**（见 dsh.js 的 softReload），两条必须一致。
     # 只发一次（发完清令牌）。
     try {
         if (Test-Path $reloadFile) {
@@ -1413,7 +1414,7 @@ function Invoke-DbgGif($ctx, $query) {
     Write-Raw $ctx $gif 'image/gif'
 }
 
-# ---- GET /reload.gif ← 写 page-reload.txt，让壁纸页下一次 /scroll.js 时 location.reload() ----
+# ---- GET /reload.gif ← 写 page-reload.txt，壁纸页下一次 /scroll.js 时软重载（重插 dsh.js?hot=） ----
 function Invoke-ReloadGif($ctx, $query) {
     try {
         [System.IO.File]::WriteAllText($reloadFile, [string][long]$script:clock.ElapsedMilliseconds, (New-Object System.Text.UTF8Encoding($false)))
