@@ -198,6 +198,7 @@ Test-Case CON-008 '契约' 'JSONP 变量名两头对齐' medium {
         @{ Var = '__MEDIA'; Js = 'media.js'; Producers = @($agent) }
         @{ Var = '__DOCK'; Js = 'dsh.js'; Producers = @($agent) }
         @{ Var = '__DSH_SCROLL'; Js = 'dsh.js'; Producers = @($agent) }
+        @{ Var = '__DSH_LOG'; Js = 'dsh.js'; Producers = @($agent) }
         @{ Var = '__TODO'; Js = 'todo.js'; Producers = @($agent, (Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk'))) }
         @{ Var = '__HW'; Js = 'hw.js'; Producers = @($hwmon) }
         @{ Var = '__WX'; Js = 'wx.js'; Producers = @($wxmon) }
@@ -213,7 +214,7 @@ Test-Case CON-008 '契约' 'JSONP 变量名两头对齐' medium {
         }
     }
     if ($bad.Count -gt 0) { throw ($bad -join '；') }
-    ('7 个 JSONP / 数据变量名两端一致')
+    ('8 个 JSONP / 数据变量名两端一致')
 } -Hint '改名必须两端同时改：window.__X 是唯一契约，改一侧等于断链（且不报错）'
 
 Test-Case CON-009 '契约' 'index.html 引用的脚本都存在' high {
@@ -232,3 +233,26 @@ Test-Case CON-009 '契约' 'index.html 引用的脚本都存在' high {
     }
     ('index.html 的 ' + $refs.Count + ' 个脚本引用全部存在')
 } -Hint '新增脚本要同时进 wallpaper\ 与 Lively 运行时目录；漏一个就是 404（兜底会掩盖问题）'
+
+Test-Case CON-010 '契约' 'PowerShell 5.1 兼容：不用 .NET Core 专有计时器' high {
+    $root = Get-DshRoot
+    $files = @(Get-ChildItem -LiteralPath $root -Filter '*.ps1' -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\\.git\\' })
+    if ($files.Count -eq 0) { throw '没找到任何 .ps1，路径规则可能变了' }
+    # 拼出来再匹配：本文件里不能出现这串原文，否则自己测自己永远失败
+    $needle = '\[Environment\]::' + 'TickCount64'
+    $disp = '[Environment]::' + 'TickCount64'
+    $bad = @()
+    foreach ($f in $files) {
+        # 只看代码行：注释里允许写「别再碰 TickCount64」这类说明，否则文档和测试对着干
+        $code = (((Read-Raw $f.FullName) -split "\r?\n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        if ($code -match $needle) { $bad += $f.FullName.Substring($root.Length).TrimStart('\') }
+    }
+    if ($bad.Count -gt 0) {
+        throw (($bad -join '、') + ' 用了 ' + $disp + ' —— 5.1/.NET Framework 里它不存在，取值是 $null（不报错）')
+    }
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    if ($agent -notmatch '\$script:clock\s*=.*Stopwatch') { throw 'dsh-agent.ps1 缺 $script:clock = [Diagnostics.Stopwatch]::StartNew()（缓存时钟的唯一来源）' }
+    if ($agent -notmatch 'Cache-Get' -or $agent -notmatch 'ElapsedMilliseconds') { throw 'Cache-Get 没接 $script:clock.ElapsedMilliseconds，缓存会退回永不失效' }
+    ('扫描 ' + $files.Count + ' 个 .ps1：无 TickCount64，缓存时钟走 Stopwatch')
+} -Hint '本机只跑 Windows PowerShell 5.1：TickCount64 / [TimeProvider] 之类 .NET Core API 会静默变 $null → 缓存 age 恒为 0 → 面板永远显示第一次取到的旧内容'

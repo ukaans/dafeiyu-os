@@ -1788,6 +1788,13 @@ WheelHandle(dir, src := "hk", force := false) {
             return
         }
         if ConsoleUnderCursor() {
+            ; 只认「真的在桌面上」的滚轮。浏览器最大化盖住面板时，光标仍可能落在
+            ; panel-rect 里，但滚的是浏览器的页面 —— 以前这里直接吞掉（act=console），
+            ; 结果浏览器不滚、壁纸页也看不见，用户的感觉就是「滚轮又失效了」。
+            if (!force && !DesktopUnderCursor()) {
+                WheelPassThrough(-1)
+                return
+            }
             AgentScroll(-1)
             LogWrite("wheel-up console-scroll")
             AuditLog("wheel", "dir=-1 src=" src " act=console")
@@ -1806,6 +1813,11 @@ WheelHandle(dir, src := "hk", force := false) {
         return
     }
     if ConsoleUnderCursor() {
+        ; 同上：被别的窗口盖住时必须透传，否则滚轮被吞
+        if (!force && !DesktopUnderCursor()) {
+            WheelPassThrough(1)
+            return
+        }
         AgentScroll(1)
         LogWrite("wheel-down console-scroll")
         AuditLog("wheel", "dir=1 src=" src " act=console")

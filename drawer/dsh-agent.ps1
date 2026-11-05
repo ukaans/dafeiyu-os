@@ -10,14 +10,17 @@ $ErrorActionPreference = 'SilentlyContinue'
 #    · *.js  → 返回 window.__XXX=... 的一段脚本，页面用 <script src> 加载
 #    · *.gif → 返回 1x1 透明 GIF 作为信标，页面用 <img src> 触发动作
 #  路由表：
-#    /state.js | /state ← window.__DSH_STATE {web,busy,bal,drawer,lines[]}
-#    /run.gif?t=        ← 让 DSH 跑一条指令（headless）
+#    /state.js | /state ← window.__DSH_STATE {web,busy,bal,drawer,lines[],sig,err,reload,dbg}
+#    /log.js            ← window.__DSH_LOG（整段 dsh-run.log，供页面渲染会话气泡）
+#    /run.gif?t=        ← 让 DSH 跑一条指令（headless；stdout→dsh-run.log，stderr→dsh-run.err.log）
 #    /launch.gif        ← DSH 没在跑时启动它
 #    /open.gif          ← 用浏览器打开 DSH 网页
-#    /clear.gif         ← 清空 dsh-run.log
+#    /clear.gif         ← 清空 dsh-run.log + dsh-run.err.log
 #    /drawer.gif        ← 通过计划任务启动桌面抽屉（DesktopPage.ahk）
 #    /rect.gif?x&y&w&h  ← 壁纸右侧控制台的屏幕矩形（万分比）→ panel-rect.txt
-#    /scroll.gif?d=±1   ← 滚轮意图 → scroll.dat；/scroll.js ← 取走增量
+#    /scroll.gif?d=±1   ← 滚轮意图 → scroll.dat；/scroll.js ← 取走增量（并放行热重载令牌）
+#    /reload.gif        ← 写 page-reload.txt：让壁纸页自己 location.reload()（改完 JS/CSS 用）
+#    /dbg.gif?m=        ← 壁纸页调试信标 → dsh-debug.log（仅 dsh-debug.flag 存在时落盘）
 #    /todo.gif?op=&t=   ← 待办增删改 → todo.txt + todo-data.js
 #    /dock.js | /dock.gif?op=del&i= | /adddock.gif | /launchpath.gif?t= | /icon/<file>
 #    /media.js | /media.gif?op=toggle|back|fwd  ← 当前播放（GSMTC 优先 + 网易云兜底）
@@ -31,6 +34,13 @@ $root = if ($env:DSH_ROOT) { $env:DSH_ROOT } else { 'E:\DSH' }
 $dshCmd = Join-Path $root 'dsh.cmd'
 $appDir = Join-Path $env:LOCALAPPDATA 'DesktopPage'
 $logFile = Join-Path $appDir 'dsh-run.log'
+# 2026-11-05：reasoning 走 stderr、最终回答走 stdout（dsh-headless 的契约），
+# 所以把两股流分开落盘：面板只读 dsh-run.log（干净的「指令 + 回答」），
+# 报错/思考过程进 dsh-run.err.log（同样 256KB 轮转，不再污染会话视图）。
+$errFile = Join-Path $appDir 'dsh-run.err.log'
+$dbgFile = Join-Path $appDir 'dsh-debug.log'
+$dbgFlag = Join-Path $appDir 'dsh-debug.flag'
+$reloadFile = Join-Path $appDir 'page-reload.txt'
 $pidFile = Join-Path $appDir 'dsh-run.pid'
 # 心跳文件：主循环每轮刷新一次时间戳。抽屉/start-all 用它区分
 # 「进程还在但已经卡死」和「真的在服务」——只查 pid 会被假活骗过。
@@ -185,14 +195,81 @@ function Get-RunBusy {
     return $true
 }
 
-function Get-LogTail([int]$n) {
-    if (-not (Test-Path $logFile)) { return @() }
+# 读共享日志：写方是 cmd 的 >> 重定向，整条命令跑完前句柄不释放。
+# 老实现用 [IO.File]::ReadAllLines，Windows 上会直接抛 IOException，被 catch 吞掉后
+# 面板只剩「（还没有输出）」—— 这就是「日志不更新」的老坑。必须 FileShare.ReadWrite|Delete。
+function Read-TextShared([string]$path) {
+    if (-not (Test-Path $path)) { return '' }
+    $fs = $null
+    $sr = $null
     try {
-        $lines = [System.IO.File]::ReadAllLines($logFile, [System.Text.Encoding]::UTF8)
-        if ($lines.Count -eq 0) { return @() }
-        if ($lines.Count -le $n) { return $lines }
-        return $lines[($lines.Count - $n)..($lines.Count - 1)]
-    } catch { return @() }
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8, $true)
+        return $sr.ReadToEnd()
+    } catch { return '' }
+    finally {
+        if ($sr) { try { $sr.Dispose() } catch { } }
+        if ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
+function Get-LogTail([int]$n) {
+    $txt = Read-TextShared $logFile
+    if (-not $txt) { return @() }
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($ln in ($txt -split "`r?`n")) { $out.Add($ln) }
+    while ($out.Count -gt 0 -and $out[$out.Count - 1] -eq '') { $out.RemoveAt($out.Count - 1) }
+    if ($out.Count -eq 0) { return @() }
+    if ($out.Count -le $n) { return $out.ToArray() }
+    return $out.GetRange($out.Count - $n, $n).ToArray()
+}
+
+# 会话视图用：整段日志（有上限，避免一条 /log.js 把单线程代理拖住）
+function Get-LogText([int]$maxChars) {
+    $txt = Read-TextShared $logFile
+    if (-not $txt) { return '' }
+    if ($txt.Length -le $maxChars) { return $txt }
+    $cut = $txt.Length - $maxChars
+    # 从半行处切开会把一行的中文截成乱码，往下找第一个换行，从下一行开始
+    $nl = $txt.IndexOf("`n", $cut)
+    if ($nl -ge 0) { return $txt.Substring($nl + 1) }
+    return $txt.Substring($cut)
+}
+
+# 日志身份：长度 + mtime。页面拿它判断「要不要再拉一次 /log.js」，比传全文便宜得多。
+function Get-LogSig {
+    try {
+        $fi = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($fi) { return ([string]$fi.Length + '-' + [string]$fi.LastWriteTimeUtc.Ticks) }
+    } catch { }
+    return ''
+}
+
+# 最近一次失败原因：只挑 dsh 的 "dsh: <code>: <msg>"（reasoning 段不算）+ 崩溃行
+function Get-ErrText {
+    $txt = Read-TextShared $errFile
+    if (-not $txt) { return '' }
+    $hits = New-Object System.Collections.Generic.List[string]
+    foreach ($ln in ($txt -split "`r?`n")) {
+        if ($ln -match '^(dsh:\s*(?!reasoning)|FATAL:|Unhandled)') { $hits.Add($ln.Trim()) }
+    }
+    if ($hits.Count -eq 0) { return '' }
+    $take = [Math]::Min(2, $hits.Count)
+    $out = ($hits.GetRange($hits.Count - $take, $take) -join ' · ')
+    if ($out.Length -gt 220) { $out = $out.Substring($out.Length - 220) }
+    return $out
+}
+
+# 热重载令牌（/reload.gif 写入）。0 = 无令牌。
+function Get-ReloadToken {
+    try {
+        if (Test-Path $reloadFile) {
+            $v = [long]0
+            if ([long]::TryParse(([System.IO.File]::ReadAllText($reloadFile)).Trim(), [ref]$v)) { return $v }
+        }
+    } catch { }
+    return [long]0
 }
 
 function Escape-Js([string]$s) {
@@ -209,10 +286,15 @@ function Escape-Js([string]$s) {
 $script:stateCache = @{}
 $script:stateCacheAt = @{}
 $script:missKeys = @()                      # 本次请求重算了哪些项（空 = 全部命中）
-$script:stateLogAt = [Environment]::TickCount64 - 20000
+# 单调时钟：Windows PowerShell 5.1 跑在 .NET Framework 4.8，[Environment]::TickCount64 是
+# .NET Core 才有的属性，在这里取到 $null —— 于是 $age 恒为 0、缓存永不失效，/state.js 的
+# lines/sig/log 全被冻在第一次算出来的值上（2026-11-05 实测：日志涨了 sig 还是 89 字节）。
+# 用 Stopwatch 自己维护毫秒时钟，别再碰 Environment.TickCount64。
+$script:clock = [System.Diagnostics.Stopwatch]::StartNew()
+$script:stateLogAt = [long]$script:clock.ElapsedMilliseconds - 20000
 
 function Cache-Get([string]$key, [int]$ttlMs, [scriptblock]$producer, $fallback = $null) {
-    $now = [Environment]::TickCount64
+    $now = [long]$script:clock.ElapsedMilliseconds
     $had = $script:stateCache.ContainsKey($key)
     if ($had) {
         $age = $now - [long]$script:stateCacheAt[$key]
@@ -244,7 +326,7 @@ function Write-Raw($ctx, [byte[]]$bytes, [string]$type) {
     $res.OutputStream.Close()
 }
 
-function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll) {
+function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err, $reload, $dbg) {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('window.__DSH_STATE = {web:')
     [void]$sb.Append($(if ($web) { 'true' } else { 'false' }))
@@ -253,6 +335,15 @@ function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll) {
     [void]$sb.Append($(if ($busy) { 'true' } else { 'false' }))
     [void]$sb.Append(',bal:"').Append((Escape-Js $bal)).Append('",drawer:')
     [void]$sb.Append($(if ($drawer) { 'true' } else { 'false' }))
+    # 2026-11-05 会话视图新增三个薄字段（都是小标量，别在这里塞正文）：
+    #   sig    日志身份（长度-mtime），页面据此决定是否拉 /log.js
+    #   err    上一轮失败原因（stderr 的 dsh: 行），面板顶部挂一行警告
+    #   reload 热重载令牌，/reload.gif 写入
+    [void]$sb.Append(',sig:"').Append((Escape-Js $sig)).Append('"')
+    [void]$sb.Append(',err:"').Append((Escape-Js $err)).Append('"')
+    [void]$sb.Append(',reload:').Append([string][long]$reload)
+    [void]$sb.Append(',dbg:')
+    [void]$sb.Append($(if ($dbg) { 'true' } else { 'false' }))
     [void]$sb.Append(',lines:[')
     $first = $true
     foreach ($ln in $lines) {
@@ -446,18 +537,24 @@ function Start-NoConsole([string]$exe, [string[]]$argv, [string]$workDir) {
 
 function Start-Run([string]$text) {
     $stamp = (Get-Date).ToString('HH:mm:ss')
-    # dsh-run.log 是 cmd 用 >> 重定向追加的，没法在写入处判断尺寸 —— 只能在每次启动前查一次。
-    # 超过 256KB 就轮转成 dsh-run.log.1（Move-Item -Force；本机安全策略会拦 Remove-Item）。
-    # 轮转后必须补一个空文件，否则 Get-LogTail 的 Test-Path 会短路，面板上看不到新输出。
+    # 两个日志都是 cmd 用 >> / 2>> 追加的，没法在写入处判断尺寸 —— 只能在每次启动前查一次。
+    # 超过 256KB 就轮转成 .1（Move-Item -Force；本机安全策略会拦 Remove-Item）。
+    # 轮转后必须补一个空文件，否则 Test-Path 短路，面板上看不到新输出。
     try {
-        if ((Test-Path $logFile) -and ((Get-Item $logFile -ErrorAction SilentlyContinue).Length -gt 262144)) {
-            Move-Item -LiteralPath $logFile -Destination ($logFile + '.1') -Force -ErrorAction SilentlyContinue
-            [System.IO.File]::WriteAllText($logFile, '', (New-Object System.Text.UTF8Encoding($false)))
+        foreach ($f in @($logFile, $errFile)) {
+            if ((Test-Path $f) -and ((Get-Item $f -ErrorAction SilentlyContinue).Length -gt 262144)) {
+                Move-Item -LiteralPath $f -Destination ($f + '.1') -Force -ErrorAction SilentlyContinue
+                [System.IO.File]::WriteAllText($f, '', (New-Object System.Text.UTF8Encoding($false)))
+            }
         }
+        # 新一轮开始先清掉上一轮的错误：否则面板会一直挂着旧报错
+        [System.IO.File]::WriteAllText($errFile, '', (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
     try { [System.IO.File]::AppendAllText($logFile, "[$stamp] >>> $text`r`n", (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    foreach ($k in @('lines', 'sig', 'log', 'err')) { Cache-Drop $k }
     $safe = $text -replace '"', '\"'
-    $cmdLine = '/c chcp 65001 >nul & "' + $dshCmd + '" headless "' + $safe + '" >> "' + $logFile + '" 2>&1'
+    # 2>> 把 reasoning / 报错分到 err 文件：面板只渲染「指令 + 回答」，思考过程不该混进取景框
+    $cmdLine = '/c chcp 65001 >nul & "' + $dshCmd + '" headless "' + $safe + '" >> "' + $logFile + '" 2>> "' + $errFile + '"'
     $p = Start-NoConsole 'cmd.exe' @($cmdLine) $null
     $st = ''
     try { $st = (Get-Process -Id $p.Id).StartTime.ToString('yyyy-MM-dd HH:mm:ss') } catch { }
@@ -1103,7 +1200,7 @@ function New-QueryBag($req, [string]$path) {
     return @{ raw = $raw; req = $req; nvc = $nvc; path = $path }
 }
 
-# ---- GET /state.js | /state ← window.__DSH_STATE {web,scroll,busy,bal,drawer,lines[]} ----
+# ---- GET /state.js | /state ← window.__DSH_STATE {web,scroll,busy,bal,drawer,sig,err,reload,dbg,lines[]} ----
 function Invoke-StateJs($ctx, $query) {
     # 分层 TTL：每次只重算过期项；每项各自 try/catch（见 Cache-Get），
     # 任何一项失败都不会把整条响应变成 500 或半个响应。
@@ -1112,7 +1209,13 @@ function Invoke-StateJs($ctx, $query) {
     $lines = Cache-Get 'lines' 500 { Get-LogTail 40 }
     $bal = [string](Cache-Get 'bal' 300000 { Get-Balance })
     $drawer = [bool](Cache-Get 'drawer' 2000 { Get-DrawerRunning })
-    Write-Js $ctx $web $busy $lines $bal $drawer 0
+    # 会话视图的两个指针：sig 变了页面才去拉 /log.js（正文在那边，这里不塞）
+    $sig = [string](Cache-Get 'sig' 500 { Get-LogSig })
+    $err = [string](Cache-Get 'err' 500 { Get-ErrText })
+    $reload = [long](Cache-Get 'reload' 500 { Get-ReloadToken })
+    # 调试旗标每次看盘（没有缓存）：改完不用重启代理就能开/关信标
+    $dbg = Test-Path $dbgFlag
+    Write-Js $ctx $web $busy $lines $bal $drawer 0 $sig $err $reload $dbg
     # cache=1 → 全部命中；cache=0:lines → 只重算了日志尾巴
     # 用 $script: 是因为 handler 是函数：局部变量传不回主循环的日志行
     $script:stateTag = if ($script:missKeys.Count -eq 0) { ' (cache=1)' } else { ' (cache=0:' + ($script:missKeys -join ',') + ')' }
@@ -1249,7 +1352,19 @@ function Invoke-LaunchPath($ctx, $query) {
 
 function Invoke-ScrollJs($ctx, $query) {
     $sd = Take-Scroll
-    Write-Raw $ctx ([Text.Encoding]::UTF8.GetBytes('window.__DSH_SCROLL=' + [int]$sd + ';')) 'application/javascript'
+    $js = 'window.__DSH_SCROLL=' + [int]$sd + ';'
+    # 热重载搭这条 80ms 通道的便车：/reload.gif 写了令牌，就让页面执行一次 location.reload()。
+    # 只发一次（发完清令牌）；老页面也认 location.reload()，所以换 dsh.js/todo.css 能立即生效。
+    try {
+        if (Test-Path $reloadFile) {
+            $js += 'location.reload();'
+            Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
+            # 安全策略拦 Remove-Item 时退化成写空文件：Get-ReloadToken 读到空 → 0，不会重复触发
+            if (Test-Path $reloadFile) { [System.IO.File]::WriteAllText($reloadFile, '', (New-Object System.Text.UTF8Encoding($false))) }
+            Agent-Log 'scroll: page-reload emitted'
+        }
+    } catch { }
+    Write-Raw $ctx ([Text.Encoding]::UTF8.GetBytes($js)) 'application/javascript'
 }
 
 function Invoke-ScrollGif($ctx, $query) {
@@ -1264,6 +1379,43 @@ function Invoke-ScrollGif($ctx, $query) {
         if ($fi -and $fi.Length -gt $script:SCROLL_MAX) { [System.IO.File]::WriteAllText($sol, '') }
         [System.IO.File]::AppendAllText($sol, "$d`r`n")
     } catch { }
+    Write-Raw $ctx $gif 'image/gif'
+}
+
+# ---- GET /log.js ← window.__DSH_LOG（整段 dsh-run.log，页面自己切气泡） ----
+function Invoke-LogJs($ctx, $query) {
+    # /state.js 只给 sig（长度-mtime），正文走这条：sig 没变页面就不来拿。
+    # 上限 60000 字符 ≈ 最近几十轮对话；采样正常时一条 60KB 的 JSONP 只要几毫秒。
+    $txt = [string](Cache-Get 'log' 400 { Get-LogText 60000 })
+    $js = 'window.__DSH_LOG="' + (Escape-Js $txt) + '";'
+    Write-Raw $ctx ([Text.Encoding]::UTF8.GetBytes($js)) 'application/javascript'
+}
+
+# ---- GET /dbg.gif?m= ← 壁纸页调试信标（仅 dsh-debug.flag 存在时落 dsh-debug.log） ----
+function Invoke-DbgGif($ctx, $query) {
+    $m = ''
+    if ($query.raw -match '[?&]m=([^&]*)') {
+        try { $m = [System.Uri]::UnescapeDataString($matches[1]) } catch { $m = $matches[1] }
+    }
+    if ($m.Length -gt 400) { $m = $m.Substring(0, 400) }
+    $m = $m -replace '[\r\n\t]', ' '
+    try {
+        if (Test-Path $dbgFlag) {
+            $fi = Get-Item $dbgFile -ErrorAction SilentlyContinue
+            if ($fi -and $fi.Length -gt 2097152) { [System.IO.File]::WriteAllText($dbgFile, '', (New-Object System.Text.UTF8Encoding($false))) }
+            $line = (Get-Date).ToString('HH:mm:ss.fff') + ' ' + $m + "`r`n"
+            [System.IO.File]::AppendAllText($dbgFile, $line, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    } catch { }
+    Write-Raw $ctx $gif 'image/gif'
+}
+
+# ---- GET /reload.gif ← 写 page-reload.txt，让壁纸页下一次 /scroll.js 时 location.reload() ----
+function Invoke-ReloadGif($ctx, $query) {
+    try {
+        [System.IO.File]::WriteAllText($reloadFile, [string][long]$script:clock.ElapsedMilliseconds, (New-Object System.Text.UTF8Encoding($false)))
+        Agent-Log 'reload: token written'
+    } catch { Agent-Log ('reload: failed ' + $_.Exception.Message) }
     Write-Raw $ctx $gif 'image/gif'
 }
 
@@ -1358,7 +1510,10 @@ function Invoke-DrawerGif($ctx, $query) {
 }
 
 function Invoke-ClearGif($ctx, $query) {
+    # 「清空」必须连错误文件一起清：否则清完会话，顶部还挂着上一轮的 ⚠ 报错
     try { [System.IO.File]::WriteAllText($logFile, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    try { [System.IO.File]::WriteAllText($errFile, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    foreach ($k in @('lines', 'sig', 'log', 'err')) { Cache-Drop $k }
     Write-Raw $ctx $gif 'image/gif'
 }
 
@@ -1389,6 +1544,7 @@ function Invoke-AuditGif($ctx, $query) {
 $script:ROUTES = @{
     '/state.js'       = @{ handler = 'Invoke-StateJs';    kind = 'state';      poll = $true;  audit = $false }
     '/state'          = @{ handler = 'Invoke-StateJs';    kind = 'state';      poll = $true;  audit = $false }
+    '/log.js'         = @{ handler = 'Invoke-LogJs';      kind = 'log';        poll = $true;  audit = $false }
     '/media.js'       = @{ handler = 'Invoke-MediaJs';    kind = 'media';      poll = $true;  audit = $false }
     '/media.gif'      = @{ handler = 'Invoke-MediaGif';   kind = 'media';      poll = $false; audit = $false }
     '/dock.js'        = @{ handler = 'Invoke-DockJs';     kind = 'dock';       poll = $true;  audit = $false }
@@ -1405,6 +1561,8 @@ $script:ROUTES = @{
     '/open.gif'       = @{ handler = 'Invoke-OpenGif';    kind = 'other';      poll = $false; audit = $true }
     '/drawer.gif'     = @{ handler = 'Invoke-DrawerGif';  kind = 'other';      poll = $false; audit = $true }
     '/clear.gif'      = @{ handler = 'Invoke-ClearGif';   kind = 'clear';      poll = $false; audit = $true }
+    '/reload.gif'     = @{ handler = 'Invoke-ReloadGif';  kind = 'other';      poll = $false; audit = $false }
+    '/dbg.gif'        = @{ handler = 'Invoke-DbgGif';     kind = 'other';      poll = $true;  audit = $false }
     '/audit.gif'      = @{ handler = 'Invoke-AuditGif';   kind = 'other';      poll = $true;  audit = $true }
 }
 $script:ROUTES_PREFIX = @(
@@ -1518,7 +1676,7 @@ while ($listener.IsListening) {
     if ($script:stateTag) {
         # 命中缓存后 /state.js 一般 5-40ms，永远进不了 >800ms 的条件，日志里就看不到它了。
         # 每 10 秒采一条样本（不刷屏），事后 grep 'cache=1' 就能确认缓存是否生效。
-        $n64 = [Environment]::TickCount64
+        $n64 = [long]$script:clock.ElapsedMilliseconds
         if (($n64 - $script:stateLogAt) -gt 10000) { $script:stateLogAt = $n64; $doLog = $true }
     }
     if ($doLog) { Agent-Log ('req done ' + $path + ' ' + $ms + 'ms' + $script:stateTag) }

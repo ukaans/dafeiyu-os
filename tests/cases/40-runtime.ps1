@@ -112,12 +112,12 @@ Test-Case RUN-005 '运行时' 'state.js 字段齐全' high {
     Assert-True $r.Ok ('请求失败：' + $r.Error)
     $b = [string]$r.Body
     Assert-Match $b 'window\.__DSH_STATE\s*=' 'JSONP 赋值前缀'
-    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines')
+    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines', 'sig', 'err', 'reload', 'dbg')
     $miss = @()
     foreach ($k in $need) { if ($null -eq (Run-Prop $b $k)) { $miss += $k } }
     if ($miss.Count -gt 0) { throw ('缺字段：' + ($miss -join '、') + '（前端会显示 -- 或不更新）') }
-    ('6 个字段齐全：web=' + (Run-Prop $b 'web') + ' busy=' + (Run-Prop $b 'busy') + ' bal=' + (Run-Prop $b 'bal') + ' drawer=' + (Run-Prop $b 'drawer'))
-} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1'
+    ('10 个字段齐全：web=' + (Run-Prop $b 'web') + ' busy=' + (Run-Prop $b 'busy') + ' bal=' + (Run-Prop $b 'bal') + ' drawer=' + (Run-Prop $b 'drawer') + ' sig=' + (Run-Prop $b 'sig'))
+} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1（sig/err/reload/dbg 是 2026-11-05 会话视图加的）'
 
 Test-Case RUN-006 '运行时' 'state.lines 是可渲染字符串数组' medium {
     if (-not (Test-DshApiUp)) { return (Test-DshAbort) }
@@ -278,3 +278,24 @@ Test-Case RUN-012 '运行时' '滚轮桥热跟随（桥没在旧 hwnd 上打转�
     }
     ('桥热跟随正常：beat target = wheel-bridge.hwnd = ' + $fileHwnd + '，follows=' + $follows + ' alive=' + $alive)
 } -Hint '红了先看 wheel-bridge.log 末尾：target=0/alive=0 说明抽屉没 announce（回 wheel.log 搜 announce 落盘失败）；没有 follows= 字段说明桥还在跑旧脚本，kill 掉重启一次'
+
+Test-Case RUN-013 '运行时' 'log.js 会话正文通道可用' high {
+    # 2026-11-05 起，桌面控制台不再把日志尾巴当纯文本刷，而是渲染成「我说的话 + DSH 的回答」。
+    # 正文走 /log.js（一次 ≤60000 字符），/state.js 只给 sig 让页面判断要不要来拿。
+    if (-not (Test-DshApiUp)) { return (Test-DshAbort) }
+    $r = Invoke-DshHttp -Path '/log.js' -TimeoutMs 5000
+    if (-not $r.Ok) { throw ('/log.js 请求失败：' + $r.Error) }
+    if ($r.Status -ne 200) { throw ('/log.js 状态码 ' + $r.Status) }
+    if ($r.ContentType -notmatch 'javascript') { throw ('/log.js Content-Type=' + $r.ContentType + '，应为 application/javascript') }
+    $b = [string]$r.Body
+    Assert-Match $b 'window\.__DSH_LOG\s*="' 'JSONP 赋值前缀'
+    # 60KB 正文 + 转义余量：超过就说明 Get-LogText 的上限没生效，单线程代理会被拖死
+    if ($b.Length -gt 70000) { throw ('/log.js 响应 ' + $b.Length + ' 字符，超过 60000 上限（页面会卡，代理也会排队）') }
+    $st = [string](Invoke-DshHttp -Path '/state.js' -TimeoutMs 3000).Body
+    $sig = Run-Prop $st 'sig'
+    if ([string]::IsNullOrWhiteSpace($sig) -or $sig -eq '""') {
+        # 日志文件不存在时 sig 是空串，属于正常（还没发过指令）
+        return ('__DSH_LOG ' + $b.Length + ' 字符（' + $r.Ms + 'ms）；日志为空，sig 未生成')
+    }
+    ('__DSH_LOG ' + $b.Length + ' 字符（' + $r.Ms + 'ms）；sig=' + $sig)
+} -Hint '红了先 curl http://127.0.0.1:17433/log.js 看回包；sig 一直不变说明 Get-LogSig 读不到 dsh-run.log（代理没权限或路径不对）'

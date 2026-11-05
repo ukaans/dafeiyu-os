@@ -54,7 +54,9 @@ Test-Case RES-001 '健壮' '无轮转的日志会无限增长' medium {
     if ($ahk -notmatch 'WPLOG_MAX') { $noCap += 'wheel.log 没有尺寸阈值（WPLOG_MAX）' }
     elseif ($ahk -notmatch 'FileMove\(wpath,\s*wpath\s*"\.1"') { $noCap += 'wheel.log 有阈值但没做 FileMove 轮转' }
     $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
-    if ($agent -notmatch 'Move-Item[^\r\n]*\$logFile[^\r\n]*-Force') { $noCap += 'dsh-run.log 没有轮转（Start-Run 里缺 Move-Item $logFile .1）' }
+    $rotDirect = ($agent -match 'Move-Item[^\r\n]*\$logFile[^\r\n]*-Force')
+    $rotLoop = (($agent -match '@\(\$logFile[^\r\n]*\)') -and ($agent -match 'Move-Item[^\r\n]*\$f[^\r\n]*-Force'))
+    if (-not ($rotDirect -or $rotLoop)) { $noCap += 'dsh-run.log 没有轮转（Start-Run 里缺 Move-Item $logFile .1，或循环版 @($logFile,$errFile)）' }
     if ($big.Count -gt 0) { throw ($big -join '、' + ' —— 超过 1MB，长期运行会把磁盘和读取速度拖住') }
     if ($noCap.Count -gt 0) {
         return @{ Status = 'warn'; Detail = (($rows -join '，') + ' —— ' + ($noCap -join '；')) }
