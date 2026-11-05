@@ -137,7 +137,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-005 | 数据落盘用 tmp + 原子覆盖（hw / wx / layout 三处） |
 | RES-006 | `panel-rect.txt` 是 4 个 0..10000 的整数 |
 | RES-007 | 看门狗没有"10 分钟内 ≥3 次"的重启风暴；**且最近一次重启在 60 分钟内才算"仍在风暴中"**（几小时前调试留下的旧风暴判为已恢复，数字仍写进 detail） |
-| RES-008 | `start-all.log` 最近一轮走到 `done`、无 `STILL DOWN` |
+| RES-008 | `start-all.log` **最近一轮**走到 `done`、无 `STILL DOWN`。按 `start: appDir=` 切轮次，不拿末尾 N 行一刀切（一轮只写 4~6 行，40 行窗口里能躺 8 轮，一次失败会连着红七八轮）；最新一轮若还在跑（无 `done` 且 ≤120 秒）先跳过、判上一轮；**没 `done` 又超过 120 秒 = 卡住了**（2026-11-05 `start-all.vbs` 漏 `Dim`，wscript 弹不可见模态框，日志停在中途、计划任务一直 `Running`，旧判据只会报 `STILL DOWN` 或干脆看不出来） |
 | RES-009 | `hw-data.js` ≤15s、`wx-data.js` ≤330s 在更新 |
 | RES-010 | `scroll.dat` 有上限：写入方超 64KB 截断（`$script:SCROLL_MAX`）、读取方超 1MB 兜底；否则消费方一停就只增不减，而 `Take-Scroll` 是整份 `ReadAllText`，会拖死单线程代理 |
 

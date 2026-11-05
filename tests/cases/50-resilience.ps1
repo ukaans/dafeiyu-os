@@ -205,13 +205,51 @@ Test-Case RES-007 '健壮' '看门狗没有在反复重启代理' high {
 
 Test-Case RES-008 '健壮' '启动链没有失败记录' high {
     $inst = Get-DshInstall
-    $lines = Res-ReadLog (Join-Path $inst 'start-all.log') 40
+    $lines = Res-ReadLog (Join-Path $inst 'start-all.log') 300
     if ($lines.Count -eq 0) { return @{ Status = 'skip'; Detail = 'start-all.log 还没生成（没通过计划任务启动过）' } }
-    $down = @($lines | Where-Object { $_ -match 'STILL DOWN' })
-    if ($down.Count -gt 0) { throw ('最近一轮启动有 STILL DOWN：' + $down[-1]) }
-    $done = @($lines | Where-Object { $_ -match 'done' })
-    ('最近一轮启动走到 done，无 STILL DOWN（' + $lines.Count + ' 行）')
-} -Hint 'STILL DOWN 说明某件套没起来；按顺序手动拉一次并看对应日志'
+
+    # 判据必须是「最近一轮」，不能拿末尾 N 行一刀切：一轮启动只写 4~6 行，
+    # 四十行窗口里能同时躺着好几轮，一次失败会连着红七八轮 —— 而红/黄一多就没人看了
+    # （同一个坑 RES-007 已经踩过一次，那边也是改成"最近一次"）。
+    # 所以按 "start: appDir=" 切轮次，只看最近一轮能判的：
+    #   有 done            → 成功，再确认这一轮没有 STILL DOWN
+    #   没 done 且 > 120s  → 卡住了（2026-11-05 的 start-all.vbs 漏 Dim 就是这样：wscript
+    #                        弹了个不可见模态框，日志停在中间，计划任务一直 Running）
+    #   没 done 且 ≤ 120s  → 这一轮还在跑（只跳过最新那一轮，更早的轮次照样要判）
+    $rounds = @()
+    $cur = $null
+    foreach ($l in $lines) {
+        if ($l -match 'start:\s*appDir=') { if ($cur) { $rounds += , @($cur) }; $cur = @($l) }
+        elseif ($cur) { $cur += $l }
+    }
+    if ($cur) { $rounds += , @($cur) }
+    if ($rounds.Count -eq 0) { return @{ Status = 'skip'; Detail = 'start-all.log 里没有轮次标记（start: appDir=）' } }
+
+    # 从最新一轮往回找「第一个能判的轮次」：最新一轮若刚开始（≤120s 还没 done）就先跳过，
+    # 免得把"正在进行"误报成"卡住"；更早的轮次不论有没有 done 都要判。
+    $judged = $null
+    for ($i = $rounds.Count - 1; $i -ge 0; $i--) {
+        $r = @($rounds[$i])
+        $startAt = $null
+        if ($r[0] -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+            try { $startAt = [datetime]::ParseExact($matches[1], 'yyyy-MM-dd HH:mm:ss', $null) } catch { $startAt = $null }
+        }
+        $ageSec = 999999.0
+        if ($startAt) { $ageSec = ((Get-Date) - $startAt).TotalSeconds }
+        $hasDone = [bool]($r -match 'done\s*$')
+
+        if (-not $hasDone -and $i -eq ($rounds.Count - 1) -and $ageSec -le 120) { continue }  # 还在跑，先不下结论
+        $down = @($r -match 'STILL DOWN')
+        if ($down.Count -gt 0) { throw ('启动链最近有 STILL DOWN：' + $down[-1]) }
+        if (-not $hasDone) {
+            throw ('启动链最近一轮卡住了（已 ' + [int]$ageSec + ' 秒没走到 done，计划任务会一直 Running）：' + $r[-1])
+        }
+        $judged = $r
+        break
+    }
+    if (-not $judged) { return @{ Status = 'skip'; Detail = '最新一轮还在跑，窗口内没有可判的轮次' } }
+    ('最近一轮启动走到 done，无 STILL DOWN（本轮 ' + $judged.Count + ' 行；窗口内共 ' + $rounds.Count + ' 轮）')
+} -Hint 'STILL DOWN 说明某件套没起来；按顺序手动拉一次并看对应日志；卡住（没 done）看 wscript 有没有弹模态错误框、start-all.vbs 有没有漏 Dim'
 
 Test-Case RES-009 '健壮' '采样进程在持续写数据' medium {
     $wall = Get-DshWall

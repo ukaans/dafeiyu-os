@@ -137,11 +137,12 @@ global SUMMON_FILE := A_ScriptDir "\summon.cmd"
 ;   fn      处理函数，签名 Summon_CmdXxx(arg)
 ;   prefix  true = 前缀匹配，arg = 去掉前缀后的剩余部分（log=N / foldertest=.. / dirtest=..）
 ;   匹配顺序固定为「先精确、再前缀」，与原来的 if/elseif 顺序等价；
-;   所以 log= / foldertest= / dirtest= 这三条必须带 prefix: true。
+;   所以 log= / foldertest= / dirtest= / classify= 这几条必须带 prefix: true。
 global SUMMON_CMDS := Map(
     "show",        {fn: Summon_CmdShow,       prefix: false},
     "hide",        {fn: Summon_CmdHide,       prefix: false},
     "diag",        {fn: Summon_CmdDiag,       prefix: false},
+    "classify=",   {fn: Summon_CmdClassify,   prefix: true},
     "edge=0",      {fn: Summon_CmdEdgeOff,    prefix: false},
     "edge=1",      {fn: Summon_CmdEdgeOn,     prefix: false},
     "log=",        {fn: Summon_CmdLog,        prefix: true},
@@ -1474,7 +1475,20 @@ WinProcNameOf(h) {
     return ""
 }
 
-; 判定某个窗口算不算「桌面/壁纸」。单独拆出来是为了能手测（见 --diag 输出）。
+; 判定某个窗口算不算「桌面/壁纸」。单独拆出来是为了能手测（summon.cmd 的 `classify=<hwnd>`）。
+;
+; 2026-11-05 定案：**只顶到顶层窗口（GA_ROOT）再判**，绝不看光标命中的内层子窗口类名。
+;   踩过的坑：Windows 11 的文件资源管理器（CabinetWClass）内部也挂着整套"桌面类名"的子窗口，实测树是
+;     CabinetWClass → ShellTabWindowClass → DUIViewWndClassName → DirectUIHWND → CtrlNotifySink
+;       → SHELLDLL_DefView → FileExplorer_FolderViewIsland   （文件列表区）
+;       → NamespaceTreeControl → SysTreeView32               （左侧导航栏）
+;   旧版这里是「从命中窗口往上 8 层，见到 Progman/WorkerW/SysListView32/SHELLDLL_DefView/SysHeader32
+;   就算桌面」，于是光标落在资源管理器文件列表上就 desk=1，滚轮下滑直接召唤抽屉：
+;     wheel.log: hover: desk=1 cls=SHELLDLL_DefView proc=explorer.exe at=149,235
+;   而桌面图标层确实长这样（Progman → SHELLDLL_DefView → SysListView32 → SysHeader32），
+;   所以这几个类名只能当"证据"，不能当"判据" —— 判据是：这条窗口链顶到哪个顶层窗口。
+;   以后再遇到"某个应用里滚轮召唤了抽屉"，先用 `classify=<hwnd>` 看 root_cls，
+;   别又把内层类名加回白名单。
 ClassifyDeskWindow(h) {
     global curPage, gDrawer, gOverlay
     ; 抽屉自己也算法外：抽屉开着时光标就在它上面。
@@ -1486,40 +1500,29 @@ ClassifyDeskWindow(h) {
         if (IsObject(gOverlay) && h = gOverlay.Hwnd)
             return true
     }
-    ; 从命中窗口往上找：图标层可能是 SysListView32，壁纸层可能是 WorkerW 的子窗口、
-    ; 也可能被 WebView2 / CefSharp 宿主包一层，所以不能只看一级父窗口
-    w := h
-    loop 8 {
-        if !w
-            break
-        cls := WinClassOf(w)
-        if (cls = "Shell_TrayWnd" || cls = "Shell_SecondaryTrayWnd" || cls = "NotifyIconOverflowWindow")
-            return false     ; 任务栏/托盘不算桌面
-        if (cls = "Progman" || cls = "WorkerW" || cls = "SysListView32" || cls = "SHELLDLL_DefView" || cls = "SysHeader32")
-            return true
-        ; 只认 Lively 壁纸窗口；不能用 Chrome_WidgetWin/WebView —— 那会把浏览器等所有 WebView2 应用都算成桌面
-        if (InStr(cls, "Lively"))
-            return true
-        ; 兜底：Lively 系进程（壁纸主体渲染在 Lively.Player.WebView2.exe 里，
-        ; 它自己的窗口全是 vis=0，真正的可见表面挂在 CefSharp 子进程上）
-        pn := WinProcNameOf(w)
-        if (pn = "Lively.exe" || InStr(pn, "Lively") = 1)
-            return true
-        w := DllCall("GetAncestor", "Ptr", w, "UInt", 1, "Ptr")   ; GA_PARENT
-    }
-    ; 顶层窗口是桌面壳（Progman/WorkerW）才算桌面；
-    ; 不能按 explorer.exe 进程名判，否则光标在「文件资源管理器」窗口上也会被当成桌面
+    if !h
+        return false
+    ; 一律先顶到顶层窗口：命中的是哪个内层子窗口（DirectUIHWND / Chrome_RenderWidgetHostHWND …）不重要
     root := DllCall("GetAncestor", "Ptr", h, "UInt", 2, "Ptr")    ; GA_ROOT
-    if root {
-        rc := WinClassOf(root)
-        if (rc = "Progman" || rc = "WorkerW")
-            return true
-        ; 壁纸被 CefSharp/WebView2 包一层时，根窗口是 WorkerW 就不再往下判进程名，
-        ; 但只要根进程是 Lively/CefSharp 系也放行（这台机器的 Lively Web 壁纸就是这种）
-        rp := WinProcNameOf(root)
-        if (InStr(rp, "Lively") = 1 || InStr(rp, "CefSharp") = 1)
-            return true
-    }
+    if !root
+        root := h
+    rc := WinClassOf(root)
+    ; 任务栏/托盘不算桌面（它们同样是 explorer.exe 的顶层窗口，得先排掉）
+    if (rc = "Shell_TrayWnd" || rc = "Shell_SecondaryTrayWnd" || rc = "NotifyIconOverflowWindow")
+        return false
+    ; 桌面壳本体：Progman（壁纸 + 图标层）、WorkerW（Win10 的图标层/壁纸层挂在它下面）
+    if (rc = "Progman" || rc = "WorkerW")
+        return true
+    ; Lively 壁纸：顶层窗口类名带 Lively 就放行
+    if (InStr(rc, "Lively"))
+        return true
+    ; 兜底：根窗口进程是 Lively / CefSharp 系。壁纸真正渲染在 Lively.Player.WebView2.exe /
+    ; CefSharp 子进程里（类名是 WindowsForms10 / Chrome_WidgetWin 之类），只能靠进程名认。
+    ; 不能按 explorer.exe 判 —— 那是文件资源管理器，不是桌面。
+    rp := WinProcNameOf(root)
+    if (InStr(rp, "Lively") = 1 || InStr(rp, "CefSharp") = 1)
+        return true
+    ; 其余一律不是桌面：文件资源管理器（CabinetWClass / ShellTabWindowClass）、浏览器、任何应用。
     return false
 }
 
@@ -3418,6 +3421,33 @@ Summon_CmdDiag(arg := "") {
         . " bridge=" (FileExist(BRIDGE_FILE) ? 1 : 0) " bridge_hits=" WHEEL_BRIDGE_HITS
         . " bridge_age=" (WHEEL_BRIDGE_TICK ? A_TickCount - WHEEL_BRIDGE_TICK : -1))
     AuditLog("summon", "cmd=diag")
+}
+
+Summon_CmdClassify(arg := "") {
+    ; 自检：classify=<hwnd> —— 直接问判定层「这个窗口算不算桌面」，不用挪鼠标。
+    ; 排查「某个应用里滚轮误召唤抽屉」的标准动作：
+    ;   1) 用 dump 子窗口树的探针拿到那个应用里命中的 hwnd（比如资源管理器的 SHELLDLL_DefView）；
+    ;   2) 往 summon.cmd 写 classify=<hwnd>，看 wheel.log 新增的 classify: 行；
+    ;   3) desk=1 就该看 root_cls 锚到了哪个顶层窗口，desk=0 说明判定层是对的，问题在别处。
+    global curPage
+    AuditLog("summon", "cmd=classify")
+    h := 0
+    try h := Integer(Trim(arg))
+    catch
+        h := 0
+    if !h {
+        LogWrite("classify: bad arg=" arg)
+        return
+    }
+    vis := 0
+    try vis := DllCall("IsWindowVisible", "Ptr", h, "Int")
+    root := 0
+    try root := DllCall("GetAncestor", "Ptr", h, "UInt", 2, "Ptr")
+    desk := "?"
+    try desk := ClassifyDeskWindow(h) ? 1 : 0
+    LogWrite("classify: hwnd=" h " cls=" WinClassOf(h) " proc=" WinProcNameOf(h)
+        . " vis=" vis " root=" root " root_cls=" WinClassOf(root)
+        . " root_proc=" WinProcNameOf(root) " desk=" desk " page=" curPage)
 }
 
 Summon_CmdLog(arg := "") {
