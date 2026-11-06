@@ -125,7 +125,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 |---|---|
 | RUN-001 | 抽屉 / 代理 / 看门狗 / Lively 存活，且抽屉只有 1 个实例 |
 | RUN-002 | `drawer.pid` 等 pid 文件与实际进程一致 |
-| RUN-003 | 心跳 ≤45s **且空闲也前进**（历史事故：只在有请求时刷 → 被看门狗误杀） |
+| RUN-003 | 心跳 ≤45s **且空闲也前进**（历史事故：只在有请求时刷 → 被看门狗误杀）；采样最多 3 次 × 800ms，三次都不动才红（单次 1.3s 会因整机瞬时抢占假红，2026-11-07 实测一次） |
 | RUN-004 | 4 个数据接口 200 且 **<200ms**（单线程代理的连坐红线） |
 | RUN-005 | `/state.js` 10 个字段齐全（含 `sig/err/reload/dbg`） |
 | RUN-006 | `state.lines` 是可渲染字符串数组（防空 `System.Object[]`） |
