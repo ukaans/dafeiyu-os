@@ -230,9 +230,10 @@ function dshInit() {
   }
 
   // ===== 会话视图 =====
-  // dsh-run.log 的格式（dsh-agent.ps1 的 Start-Run）：
+  // dsh-run.log 的格式（dsh-agent.ps1 的 Start-Run；巡检等机器来源另有 <<<）：
   //   [23:41:02] >>> 用户的指令
   //   <DSH 的最终回答，stdout 多行>
+  //   [07:30:12] <<< 机器发言（每日巡检结果等，不跟用户指令锚定，自带时间）
   //   （stderr 已改到 dsh-run.err.log；旧日志里混进来的 "dsh: reasoning:" 段一律跳过）
   var parsedMsgs = [];       // [{role:'user'|'dsh'|'err', time:'HH:MM:SS', text:''}]
   var msgEls = [];           // 与 parsedMsgs 对齐的 DOM
@@ -265,6 +266,14 @@ function dshInit() {
         skip = false;
         cur = null;
         msgs.push({ role: 'user', time: m[1], text: trimMsg(m[2]) });
+        continue;
+      }
+      var n = /^\[(\d{2}:\d{2}:\d{2})\]\s*<<<\s?(.*)$/.exec(ln);
+      if (n) {
+        // 机器发言（每日巡检等）：自带时间，成一条独立的 DSH 气泡；后续行继续并入这条
+        skip = false;
+        cur = { role: 'dsh', time: n[1], text: n[2] };
+        msgs.push(cur);
         continue;
       }
       if (/^dsh:\s*reasoning:/.test(ln)) { skip = true; cur = null; continue; }

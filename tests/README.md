@@ -87,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（12 条）
+### 20-contract · 契约一致性（14 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -102,6 +102,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-010 | **PowerShell 5.1 兼容**：全部 `.ps1` 不出现 `[Environment]::TickCount64`（5.1 里静默 `$null` → 缓存 age 恒 0 → 面板永远显示旧内容），且 `dsh-agent.ps1` 必须用 `$script:clock`/`Stopwatch` 做缓存时钟 |
 | CON-011 | **桥通道不吞向上滚 + 滚动立即生效**：`WheelBridgeMsg` 不许再出现 `(up \|\| !DesktopUnderCursor())`、`curPage=0` 必须调用 `WheelHandle(up ? -1 : 1, "bridge")`；`dsh.js` 的 `/scroll.js` 轮询必须是 40ms、`queueScroll` 不许排 `setTimeout`（2026-11-06 用户报"只能向下滚、卡"的回归） |
 | CON-012 | **热重载只走软重载**：`dsh.js` 里裸 `location.reload()` 只允许 `softReload()` 里那 1 处老页面兜底；`/state.js` 的 `st.reload` 分支必须调 `softReload()`（不许硬刷）、`softReload()` 必须先试 `__DSH_RELOAD_OK`；代理 `Invoke-ScrollJs` 仍须调该钩子（Lively WebView2 上硬刷会白屏） |
+| CON-013 | **巡检结果落进桌面控制台**：`parseLog` 必须认 `[HH:mm:ss] <<< 文本` 并生成带自己时间的 DSH 气泡；`Nightly-Check.ps1` 必须有 `Send-ConsoleNote`，把结果以 `<<<` 写进 `DesktopPage\dsh-run.log`（写成 `>>>` 就变成"用户说的话"了） |
+| CON-014 | **巡检报告不乱码**：`Nightly-Check.ps1` 调 git 前必须把 `[Console]::OutputEncoding` 切到 UTF-8，且 git 带 `-c core.quotepath=false`（PS 5.1 默认用 GBK 解 git 的 UTF-8 输出 → `琛ユ湰…`） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -115,7 +117,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | SEC-007 | 4 份日志里没有 `sk-` 密钥明文 |
 | SEC-008 | 待办正文换行不能注入多行 —— 用**隔离实例**验（临时目录 + 独立端口 + 独立 `LOCALAPPDATA`），不写真实 `todo.txt`，因此 Safe 模式也会跑 |
 
-### 40-runtime · 运行时健康（12 条）
+### 40-runtime · 运行时健康（13 条）
 | 编号 | 查什么 |
 |---|---|
 | RUN-001 | 抽屉 / 代理 / 看门狗 / Lively 存活，且抽屉只有 1 个实例 |
@@ -132,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子；hwnd 文件比日志新且不到 30 秒时降级 `warn`（抽屉刚 announce、桥还没到下一个 5 秒 tick） |
 | RUN-013 | **`/log.js` 会话正文通道**：`window.__DSH_LOG="…"` 前缀、≤60000 字符（超了单线程代理会排队）、`Content-Type` 是 `application/javascript`；日志为空时 `sig` 尚未生成属正常 |
 
-### 50-resilience · 健壮性与容量（9 条）
+### 50-resilience · 健壮性与容量（10 条）
 | 编号 | 查什么 |
 |---|---|
 | RES-001 | `wheel.log` / `dsh-run.log` **有 256KB 轮转**（查写入方代码里的阈值 + `FileMove`/`Move-Item` 改名，不只看尺寸）+ 未超 1MB |
@@ -157,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 58 条。
+合计 61 条。
 
 ---
 

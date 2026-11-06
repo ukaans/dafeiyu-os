@@ -45,6 +45,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# git 的输出是 UTF-8，而 PowerShell 5.1 默认按控制台代码页（简体中文机是 GBK）解码原生命令输出，
+# 结果是报告里的中文提交标题和中文路径全变乱码（琛ユ湰…）。这里显式切到 UTF-8。
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+
 # ---------- 基础设施 ----------
 $script:LogFile = $null
 function Write-Log {
@@ -60,7 +64,8 @@ function Invoke-Git {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & git -C $Repo @Arguments 2>&1
+        # core.quotepath=false：中文路径不转成 \346\226\207 这种八进制转义
+        $out = & git -c core.quotepath=false -C $Repo @Arguments 2>&1
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEap
@@ -107,6 +112,25 @@ function Send-Toast {
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
     } catch {
         Write-Log "通知发送失败（不影响巡检结果）：$($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Send-ConsoleNote {
+    # 桌面控制台的会话读的是 %LOCALAPPDATA%\DesktopPage\dsh-run.log：
+    # 用户行是 "[HH:mm:ss] >>> 指令"，而 "[HH:mm:ss] <<< 文本" 是机器发言，
+    # dsh.js 会把它渲染成一条独立的 DSH 气泡（带自己的时间），不冒充用户的指令。
+    param([string]$Text)
+    try {
+        $log = Join-Path $env:LOCALAPPDATA 'DesktopPage\dsh-run.log'
+        if (-not (Test-Path -LiteralPath (Split-Path -Parent $log))) { return }
+        $flat = (($Text -replace "`r?`n", ' ') -replace '\s+', ' ').Trim()
+        if ($flat.Length -gt 240) { $flat = $flat.Substring(0, 240) + '…' }
+        $line = '[' + (Get-Date -Format 'HH:mm:ss') + '] <<< ' + $flat
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::AppendAllText($log, $line + "`r`n", $enc)
+        Write-Log "已写入桌面控制台：$line"
+    } catch {
+        Write-Log "桌面控制台通知失败（不影响巡检结果）：$($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -544,6 +568,23 @@ $md = $sb.ToString()
 [System.IO.File]::WriteAllText($reportPath, $md, (New-Object System.Text.UTF8Encoding($false)))
 [System.IO.File]::WriteAllText($latestPath, $md, (New-Object System.Text.UTF8Encoding($false)))
 Write-Log "报告：$reportPath"
+
+# ---------- 桌面控制台（每天把结果发到 DSH 面板） ----------
+$noteParts = @()
+if ($DryRun) { $noteParts += '[DryRun]' }
+if ($report.Severe) {
+    $noteParts += "每日巡检 $today：发现严重缺陷，未推送（$($report.SevereWhy -join '；')）"
+} else {
+    # 只用 通过/失败/警告 三个数字：面板一行放得下，「跳过 0」这种对日常没意义
+    $noteParts += if ($report.Stats -and $report.Stats.Passed -ge 0) {
+        "每日巡检 $today：$($report.Stats.Passed) 通过 / $($report.Stats.Failed) 失败 / $($report.Stats.Warn) 警告"
+    } else {
+        "每日巡检 $today：$($report.TestRaw)"
+    }
+    $noteParts += $report.Pushed
+}
+$noteParts += "报告 nightly\$today.md"
+Send-ConsoleNote -Text ($noteParts -join ' · ')
 
 # ---------- 通知 ----------
 if (-not $NoNotify) {
