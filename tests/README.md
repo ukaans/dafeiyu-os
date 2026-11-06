@@ -87,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（11 条）
+### 20-contract · 契约一致性（12 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -101,6 +101,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-009 | `index.html` 引用的每个 `<script src>` 文件都存在 |
 | CON-010 | **PowerShell 5.1 兼容**：全部 `.ps1` 不出现 `[Environment]::TickCount64`（5.1 里静默 `$null` → 缓存 age 恒 0 → 面板永远显示旧内容），且 `dsh-agent.ps1` 必须用 `$script:clock`/`Stopwatch` 做缓存时钟 |
 | CON-011 | **桥通道不吞向上滚 + 滚动立即生效**：`WheelBridgeMsg` 不许再出现 `(up \|\| !DesktopUnderCursor())`、`curPage=0` 必须调用 `WheelHandle(up ? -1 : 1, "bridge")`；`dsh.js` 的 `/scroll.js` 轮询必须是 40ms、`queueScroll` 不许排 `setTimeout`（2026-11-06 用户报"只能向下滚、卡"的回归） |
+| CON-012 | **热重载只走软重载**：`dsh.js` 里裸 `location.reload()` 只允许 `softReload()` 里那 1 处老页面兜底；`/state.js` 的 `st.reload` 分支必须调 `softReload()`（不许硬刷）、`softReload()` 必须先试 `__DSH_RELOAD_OK`；代理 `Invoke-ScrollJs` 仍须调该钩子（Lively WebView2 上硬刷会白屏） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
