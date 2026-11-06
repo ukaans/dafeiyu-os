@@ -312,3 +312,61 @@ Test-Case CON-012 '契约' '热重载只走软重载（不硬刷页面）' high 
     if ($m.Groups[1].Value -notmatch 'window\.__DSH_RELOAD_OK') { throw 'Invoke-ScrollJs 不再调 window.__DSH_RELOAD_OK，软重载链路断了' }
     '两条令牌入口（/scroll.js、/state.js）都走 softReload；裸 location.reload 只剩 1 处老页面兜底'
 } -Hint '2026-11-06：热重载改软重载时只改了 /scroll.js 那条，/state.js 的 reload 字段仍 location.reload()；加上 500ms 令牌缓存，这条白屏旁路真实可达'
+
+Test-Case CON-013 '契约' '巡检结果落进桌面控制台（<<< 机器消息）' medium {
+    # 用户要求：每天巡跑完，结果要出现在桌面 DSH 面板的会话里。
+    # 走 dsh-run.log 的机器消息行：[HH:mm:ss] <<< 文本（>>> 是用户指令，不许混用）。
+    $root = Get-DshRoot
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    $pl = [regex]::Match($js, 'function parseLog\(text\)\s*\{(?<b>[\s\S]*?)\r?\n  \}')
+    if (-not $pl.Success) { throw '找不到 parseLog 函数体（会话解析结构变了）' }
+    $body = $pl.Groups['b'].Value
+    if ($body -notmatch '<<<') { throw 'parseLog 不认识 <<< 机器消息 —— 巡检结果会被粘到上一条回复里' }
+    if ($body -notmatch "role: 'dsh', time: n\[1\]") { throw '<<< 没有生成带自己时间的 DSH 气泡（会继承上一条用户指令的时间）' }
+
+    $night = Read-Raw (Join-Path $root 'tests\Nightly-Check.ps1')
+    if ($night -notmatch 'function Send-ConsoleNote') { throw 'Nightly-Check.ps1 没有 Send-ConsoleNote（巡检结果不会进面板）' }
+    $fn = [regex]::Match($night, 'function Send-ConsoleNote\s*\{(?<b>[\s\S]*?)\r?\n\}')
+    $fb = $fn.Groups['b'].Value
+    if ($fb -notmatch 'dsh-run\.log') { throw 'Send-ConsoleNote 不写 dsh-run.log —— 面板读不到' }
+    if ($fb -notmatch '<<<') { throw 'Send-ConsoleNote 没用 <<<，巡检结果会被当成用户自己发的指令' }
+    if ($night -notmatch 'Send-ConsoleNote -Text') { throw '巡检主流程没调用 Send-ConsoleNote' }
+    '<<< 机器消息 + 巡检脚本写入 dsh-run.log 都接上了'
+} -Hint '2026-11-06 用户要求：每天脚本跑完在桌面控制台告诉我结果。若面板把巡检结果画成"你"的气泡，说明 <<< 被写成了 >>>'
+
+Test-Case CON-014 '契约' '巡检报告不乱码（git 输出按 UTF-8 解码）' medium {
+    # PowerShell 5.1 默认按控制台代码页（简中=GBK）解码原生命令输出，
+    # git 的 UTF-8 中文提交标题/路径会变成「琛ユ湰…」。必须在调 git 前把控制台输出编码切到 UTF-8。
+    $root = Get-DshRoot
+    $night = Read-Raw (Join-Path $root 'tests\Nightly-Check.ps1')
+    if ($night -notmatch '\[Console\]::OutputEncoding\s*=\s*New-Object System\.Text\.UTF8Encoding') {
+        throw 'Nightly-Check.ps1 没把 [Console]::OutputEncoding 切到 UTF-8 —— 报告里的中文提交标题会变乱码'
+    }
+    if ($night -notmatch 'core\.quotepath=false') {
+        throw 'git 调用没带 -c core.quotepath=false —— 中文路径会显示成 \346\226\207 八进制转义'
+    }
+    'git 输出按 UTF-8 解码、中文路径不转义'
+} -Hint '2026-11-06：报告里提交标题/路径乱码（琛ユ湰…），根因是 PS 5.1 拿 GBK 解 UTF-8 的 git stdout'
+Test-Case CON-015 '契约' '会话区支持按住拖动滚动（原生滚动条在壁纸里拖不动）' medium {
+    # 2026-11-06 用户反馈：滚轮好了，但鼠标拖动不生效。
+    # 壁纸页（Lively WebView2）里原生滚动条收不到 mousedown，只能自己实现抓拽滚动。
+    $root = Get-DshRoot
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    if ($js -notmatch "logEl\.addEventListener\('pointerdown'") { throw '会话区没有 pointerdown 抓拽入口 —— 鼠标还是拖不动' }
+    if ($js -notmatch 'dragScroll\s*=\s*\{\s*y:') { throw 'pointerdown 没建立拖动状态（dragScroll）' }
+    if ($js -notmatch 'Math\.abs\(dy\)\s*<\s*4') { throw '拖动没有启动阈值 —— 单击/点输入框会被误判成拖动' }
+    if ($js -notmatch "'dsh-dragging'") { throw '拖动时没有加 dsh-dragging 类（光标/禁选词不会生效）' }
+    if ($js -notmatch 'clampScroll\(dragScroll\.top - dy, logEl\)') { throw '拖动没有按位移改 scrollTop' }
+    if ($js -notmatch 'window\.__DSH_GEN !== GEN') { throw '拖动监听没有 GEN 守卫 —— 软重载几次后会叠出一串僵尸监听' }
+    # 滚轮通道必须还在（用户先确认的是滚轮）
+    if ($js -notmatch "addEventListener\('wheel'") { throw '滚轮监听被弄丢了' }
+
+    $css = Read-Raw (Join-Path $root 'wallpaper\todo.css')
+    if ($css -notmatch '#dshLog\.dsh-dragging') { throw 'CSS 缺 .dsh-dragging 状态（拖动时光标/选词）' }
+    if ($css -notmatch 'cursor:\s*grabbing') { throw '.dsh-dragging 没把光标切成 grabbing —— 用户看不出"抓着拖"' }
+    if ($css -notmatch 'user-select:\s*none') { throw '.dsh-dragging 没禁选词，拖一下会满屏蓝' }
+    $sb = [regex]::Match($css, '#dshPanel #dshLog::-webkit-scrollbar\s*\{(?<b>[^}]*)\}')
+    if (-not $sb.Success) { throw '找不到日志区滚动条样式' }
+    if ($sb.Groups['b'].Value -notmatch 'width:\s*1[2-9]px|width:\s*[2-9]\dpx') { throw '滚动条太窄（<12px），拖不准' }
+    '拖动滚动（pointerdown + 阈值 + GEN 守卫）与 12px 滚动条都在'
+} -Hint '2026-11-06：滚轮修好后用户报"不能用鼠标拖动"。壁纸 WebView2 里原生滚动条收不到 mousedown，必须自己实现抓拽 + 加宽滚动条'
