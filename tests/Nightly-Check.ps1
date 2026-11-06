@@ -77,6 +77,28 @@ function Invoke-Git {
     return [pscustomobject]@{ Code = $code; Text = $text }
 }
 
+function Invoke-GitPush {
+    param([string]$Remote, [string]$Branch)
+    # 仓库默认走本地代理（http.proxy=127.0.0.1:7897）。代理没开时 git 报
+    # "Failed to connect ... Could not connect"，这时用 -c http.proxy= 直连重试一次；
+    # 其它失败（凭据、rejected、超时之外的错）不重试，原样报给报告。
+    $push = Invoke-Git @('push', $Remote, "${Branch}:${Branch}") -AllowFail
+    if ($push.Code -eq 0) {
+        return [pscustomobject]@{ Ok = $true; Direct = $false; Text = $push.Text }
+    }
+    $proxyish = 'Failed to connect|Could not connect|unable to access|Connection refused|proxy|timed out'
+    if ($push.Text -notmatch $proxyish) {
+        return [pscustomobject]@{ Ok = $false; Direct = $false; Text = $push.Text }
+    }
+    Write-Log '推送经代理连不上（本地代理没开？），改直连重试一次' 'WARN'
+    $direct = Invoke-Git @('-c', 'http.proxy=', '-c', 'https.proxy=', 'push', $Remote, "${Branch}:${Branch}") -AllowFail
+    if ($direct.Code -eq 0) {
+        Write-Log '直连推送成功' 'WARN'
+        return [pscustomobject]@{ Ok = $true; Direct = $true; Text = "（经代理失败后直连）`n" + $direct.Text }
+    }
+    return [pscustomobject]@{ Ok = $false; Direct = $true; Text = "先经代理失败：$($push.Text)`n再直连仍失败：$($direct.Text)" }
+}
+
 function Get-TestStats {
     param([string]$Text)
     $stats = [pscustomobject]@{ Passed = -1; Failed = -1; High = -1; Mid = -1; Low = -1; Warn = -1; Skip = -1; Raw = $null }
@@ -418,15 +440,16 @@ try {
                 Write-Log "DryRun：本应推送 $aheadN 个提交"
             } else {
                 $env:GIT_TERMINAL_PROMPT = '0'
-                $push = Invoke-Git @('push',$Remote,"${Branch}:${Branch}") -AllowFail
-                if ($push.Code -eq 0) {
-                    $report.Pushed = "已推送 $aheadN 个提交 → $remoteRef"
+                $push = Invoke-GitPush -Remote $Remote -Branch $Branch
+                if ($push.Ok) {
+                    $via = if ($push.Direct) { '（直连）' } else { '' }
+                    $report.Pushed = "已推送 $aheadN 个提交 → $remoteRef$via"
                     $report.Summary = "测试全绿、无严重缺陷，已把昨晚的重构推到 dev（$aheadN 个提交）。**main 未动**。"
-                    Write-Log "推送成功：$remoteRef（$aheadN 个提交）"
+                    Write-Log "推送成功：$remoteRef（$aheadN 个提交）$via"
                 } else {
                     $report.Pushed = '推送失败'
                     $report.PushDetail = $push.Text
-                    $report.Summary = '测试全绿，但**推送失败**（凭据/网络），dev 本地已就绪，等人工重试。'
+                    $report.Summary = '测试全绿，但**推送失败**（代理与直连都试过，凭据/网络问题），dev 本地已就绪，等人工重试。'
                     Write-Log "推送失败：$($push.Text)" 'ERROR'
                 }
             }
