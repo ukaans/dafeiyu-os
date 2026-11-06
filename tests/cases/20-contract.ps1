@@ -370,3 +370,28 @@ Test-Case CON-015 '契约' '会话区支持按住拖动滚动（原生滚动条�
     if ($sb.Groups['b'].Value -notmatch 'width:\s*1[2-9]px|width:\s*[2-9]\dpx') { throw '滚动条太窄（<12px），拖不准' }
     '拖动滚动（pointerdown + 阈值 + GEN 守卫）与 12px 滚动条都在'
 } -Hint '2026-11-06：滚轮修好后用户报"不能用鼠标拖动"。壁纸 WebView2 里原生滚动条收不到 mousedown，必须自己实现抓拽 + 加宽滚动条'
+Test-Case CON-016 '契约' '巡检推送：代理连不上就直连重试一次' medium {
+    # 2026-11-06 用户要求：本地代理（127.0.0.1:7897）没开时，07:30 巡检的推送不要直接红。
+    # 只对"连接类失败"兜底，rejected / 凭据错照旧上报，不能盲目绕过代理。
+    $root = Get-DshRoot
+    $night = Read-Raw (Join-Path $root 'tests\Nightly-Check.ps1')
+    $fn = [regex]::Match($night, 'function Invoke-GitPush\s*\{(?<b>[\s\S]*?)\r?\n\}')
+    if (-not $fn.Success) { throw 'Nightly-Check.ps1 没有 Invoke-GitPush —— 推送还是会因为代理没开直接失败' }
+    $body = $fn.Groups['b'].Value
+    # 注释里也会写 http.proxy=（解释原因），顺序/存在性检查只看代码行
+    $code = (($body -split "\r?\n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    if ($code -notmatch "http\.proxy=" -or $code -notmatch "https\.proxy=") {
+        throw '直连重试没有清掉 http.proxy / https.proxy（git -c 两个都要清）'
+    }
+    if ($code -notmatch 'Failed to connect|Could not connect') {
+        throw '没有按"连接失败"字样判断是否该直连重试 —— 会把 rejected 之类也重试一遍'
+    }
+    $iGuard = $code.IndexOf('notmatch $proxyish')
+    $iDirect = $code.IndexOf('http.proxy=')
+    if ($iGuard -lt 0 -or $iDirect -lt 0 -or $iGuard -gt $iDirect) {
+        throw '直连重试不在"连接类失败"判断之后 —— 等于无条件绕过代理'
+    }
+    # Invoke-GitPush 内部当然会调 Invoke-Git @('push'…)；这里只查推送段本身走没走兜底函数
+    if ($night -notmatch 'Invoke-GitPush -Remote \$Remote -Branch \$Branch') { throw '推送段没有调用 Invoke-GitPush' }
+    '推送失败先按连接错误判断，再 -c http.proxy= 直连重试一次'
+} -Hint '2026-11-06 代理没开时巡检推送会红；只对 connect 类失败兜底，其它失败照旧报'
