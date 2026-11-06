@@ -1,4 +1,4 @@
-﻿# tests\ —— 漏洞与风险测试模块
+# tests\ —— 漏洞与风险测试模块
 
 一句话：**不改代码就能判断"这套系统现在还健康吗、哪里藏着雷"**，输出一份机器可读的报告给夜里自动跑的修复任务，也给人看。
 
@@ -80,14 +80,14 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-001 | 24 个核心文件在位 |
 | STA-002 | 编码契约：`.ps1` UTF-8 **带 BOM**、`.vbs` UTF-16LE、`.ahk` 无 BOM |
 | STA-003 | 壁纸 12 个 JS 过 `node --check` |
-| STA-004 | 22 个脚本过 `Parser::ParseFile` |
+| STA-004 | 26 个脚本过 `Parser::ParseFile` |
 | STA-005 | **源工程 ↔ `%LOCALAPPDATA%\DesktopPage` 逐字节一致**（不一致=改了半天跑的还是旧代码） |
 | STA-006 | 上游不可改文件（`app.js` / 两个 css / 两个 exe）未被改动 |
 | STA-007 | `app.js` 依赖的 6 个节点 id 仍在 `index.html` 里 |
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（16 条）
+### 20-contract · 契约一致性（17 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -106,6 +106,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-014 | **巡检报告不乱码**：`Nightly-Check.ps1` 调 git 前必须把 `[Console]::OutputEncoding` 切到 UTF-8，且 git 带 `-c core.quotepath=false`（PS 5.1 默认用 GBK 解 git 的 UTF-8 输出 → `琛ユ湰…`） |
 | CON-015 | **会话区支持按住拖动滚动**：`dsh.js` 的 `#dshLog` 必须有 `pointerdown` 抓拽（4px 阈值、`dsh-dragging` 类、GEN 守卫），`todo.css` 必须有 grabbing 光标 + 禁选词，且滚动条 ≥12px（壁纸 WebView2 里原生滚动条收不到 mousedown；2026-11-06 用户报"滚轮好了但拖不动"） |
 | CON-016 | **巡检推送有直连兜底**：`Nightly-Check.ps1` 必须有 `Invoke-GitPush`，先按仓库代理推，只有"连不上"类错误（`Failed to connect` 等）才用 `-c http.proxy= -c https.proxy=` 直连重试一次；rejected/凭据错照旧上报（2026-11-06 代理关着时巡检推送会红） |
+| CON-017 | **热重载令牌：两条路径同源判据 + 先清后发**：`Invoke-ScrollJs` 判「有没有令牌」必须走 `Get-ReloadToken > 0`（和 `/state.js` 同源），不许用 `Test-Path page-reload.txt`（空文件也算"有"）；且必须先清令牌、确认清掉再下发，清不掉这一轮不发（否则 40ms 一轮无限重插 `dsh.js`）；发完 `Cache-Drop` 掉 reload 缓存。活体验证：空令牌 0 次下发、真令牌只 1 次（2026-11-07 实测空文件也会触发软重载） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -161,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 63 条。
+合计 64 条。
 
 ---
 

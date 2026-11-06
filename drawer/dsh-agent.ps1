@@ -1351,6 +1351,9 @@ function Invoke-LaunchPath($ctx, $query) {
     }
 }
 
+# 令牌清不掉时的日志限流（这条路由 40ms 一轮，不限流会一秒刷 25 行）
+$script:reloadSkipAt = [long]0
+
 function Invoke-ScrollJs($ctx, $query) {
     $sd = Take-Scroll
     $js = 'window.__DSH_SCROLL=' + [int]$sd + ';'
@@ -1358,14 +1361,34 @@ function Invoke-ScrollJs($ctx, $query) {
     # 不走 location.reload()：Lively 的 WebView2 上导航会白屏（2026-11-06 两次实测，panel-rect 直接不再更新）。
     # 新页面暴露 window.__DSH_RELOAD_OK（清旧定时器 + 删旧面板 + 重插脚本）；老页面没这个钩子才退回 reload。
     # 注意：/state.js 的 reload 字段是**同一份令牌的第二个入口**（见 dsh.js 的 softReload），两条必须一致。
-    # 只发一次（发完清令牌）。
+    # 2026-11-07：判据从「文件在不在」改成「令牌是不是有效数字」（Get-ReloadToken -gt 0），和 /state.js 同源。
+    # 只看 Test-Path 有个致命分支：Remove-Item 被安全策略拦掉时下面会退化成「写空文件」，
+    # 文件名于是长期存在 → 每 40ms 又下发一次软重载，页面无限重插 dsh.js（面板一直重建、CPU 飙升），
+    # 而 /state.js 那条读到空值当 0、完全不报错，日志上也看不出异常（实测：空文件同样触发了软重载）。
+    # 另一个顺序要求：先清令牌再下发。清不掉就这一轮不发，下一轮再试 —— 绝不带着没清掉的令牌下发。
     try {
-        if (Test-Path $reloadFile) {
-            $js += 'if(window.__DSH_RELOAD_OK){window.__DSH_RELOAD_OK()}else{setTimeout(function(){location.reload()},60)}'
+        if ((Get-ReloadToken) -gt 0) {
+            $cleared = $false
             Remove-Item -LiteralPath $reloadFile -Force -ErrorAction SilentlyContinue
-            # 安全策略拦 Remove-Item 时退化成写空文件：Get-ReloadToken 读到空 → 0，不会重复触发
-            if (Test-Path $reloadFile) { [System.IO.File]::WriteAllText($reloadFile, '', (New-Object System.Text.UTF8Encoding($false))) }
-            Agent-Log 'scroll: page-reload emitted'
+            if (-not (Test-Path $reloadFile)) { $cleared = $true }
+            else {
+                # 安全策略拦 Remove-Item：退化成写空文件（Get-ReloadToken 读到空 → 0，等于已失效）
+                try { [System.IO.File]::WriteAllText($reloadFile, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+                if ((Get-ReloadToken) -eq 0) { $cleared = $true }
+            }
+            if ($cleared) {
+                $js += 'if(window.__DSH_RELOAD_OK){window.__DSH_RELOAD_OK()}else{setTimeout(function(){location.reload()},60)}'
+                # /state.js 的 reload 有 500ms 缓存：这里顺手清掉，免得它半秒内把同一个令牌再下发一次
+                Cache-Drop 'reload'
+                Agent-Log 'scroll: page-reload emitted'
+            }
+            else {
+                $n64 = [long]$script:clock.ElapsedMilliseconds
+                if (($n64 - $script:reloadSkipAt) -gt 60000) {
+                    $script:reloadSkipAt = $n64
+                    Agent-Log 'scroll: reload token not cleared, skipped this round'
+                }
+            }
         }
     } catch { }
     Write-Raw $ctx ([Text.Encoding]::UTF8.GetBytes($js)) 'application/javascript'

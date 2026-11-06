@@ -395,3 +395,55 @@ Test-Case CON-016 '契约' '巡检推送：代理连不上就直连重试一次'
     if ($night -notmatch 'Invoke-GitPush -Remote \$Remote -Branch \$Branch') { throw '推送段没有调用 Invoke-GitPush' }
     '推送失败先按连接错误判断，再 -c http.proxy= 直连重试一次'
 } -Hint '2026-11-06 代理没开时巡检推送会红；只对 connect 类失败兜底，其它失败照旧报'
+Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清后发' high {
+    # 2026-11-07 实测：page-reload.txt 存在但内容为空时，/scroll.js 照样下发软重载（实测 True,False,False）。
+    # 而 /state.js 那条（Get-ReloadToken）把空值当 0 —— 两条路径对「什么是有效令牌」各有各的判法。
+    # 后果：Remove-Item 被安全策略拦掉时，下面那段兜底会把文件变成「长期存在的空文件」，
+    # 于是 /scroll.js（40ms 一轮）每一轮都重插一次 dsh.js，面板无限重建、CPU 飙升，且没有任何报错。
+    # 判据必须同源（Get-ReloadToken -gt 0），且必须先清令牌、确认清掉了再下发。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $m = [regex]::Match($agent, 'function Invoke-ScrollJs\((?<b>[\s\S]*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 Invoke-ScrollJs 函数体' }
+    $body = $m.Groups['b'].Value
+    $code = (($body -split "\r?\n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+
+    if ($code -notmatch '\(Get-ReloadToken\)\s*-gt\s*0') {
+        throw '触发判据不是 Get-ReloadToken > 0 —— 又退回「文件存在就发」了（空文件会无限重插 dsh.js）'
+    }
+    if ($code -match 'if\s*\(\s*Test-Path\s+\$reloadFile\s*\)\s*\{') {
+        throw '还在用「Test-Path 文件存在」当触发判据（和 /state.js 的 Get-ReloadToken 不同源）'
+    }
+    $iClear = $code.IndexOf('Remove-Item -LiteralPath $reloadFile')
+    $iEmit = $code.IndexOf('__DSH_RELOAD_OK')
+    if ($iClear -lt 0) { throw 'Invoke-ScrollJs 不再清令牌 —— 会每 40ms 重复下发' }
+    if ($iEmit -lt 0) { throw 'Invoke-ScrollJs 不再调 window.__DSH_RELOAD_OK，软重载链路断了' }
+    if ($iClear -gt $iEmit) { throw '先下发后清令牌：清不掉就开始无限重插（顺序必须是先清后发）' }
+    if ($code -notmatch 'if\s*\(\s*\$cleared\s*\)') { throw '下发没有 $cleared 这道闸 —— 清不掉也照发' }
+    if ($code -notmatch "Cache-Drop\s+'reload'") { throw '没清 /state.js 的 reload 缓存，半秒内会把同一个令牌再下发一次' }
+
+    # 活体复现（只动令牌文件，不弹窗、不动桌面）：空文件必须一次软重载都不发
+    if (-not (Test-DshApiUp)) { return @{ Status = 'warn'; Detail = '静态契约通过；代理未在线，活体复现跳过' } }
+    $rf = Join-Path $env:LOCALAPPDATA 'DesktopPage\page-reload.txt'
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    try {
+        [System.IO.File]::WriteAllText($rf, '', $enc)
+        $hitEmpty = 0
+        for ($i = 0; $i -lt 2; $i++) {
+            $r = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+            if ($r.Ok -and $r.Body -match '__DSH_RELOAD_OK') { $hitEmpty++ }
+        }
+        if ($hitEmpty -gt 0) { throw "空令牌文件仍下发了软重载 $hitEmpty 次 —— 清不掉令牌的机器会无限重插 dsh.js" }
+        # 真令牌：必须发一次，发完立刻失效（第二次不能再发，否则页面被重插两份 dsh.js）
+        [System.IO.File]::WriteAllText($rf, [string][long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), $enc)
+        $r1 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+        $r2 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+        $emit1 = ($r1.Ok -and $r1.Body -match '__DSH_RELOAD_OK')
+        $emit2 = ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK')
+        if (-not $emit1) { throw '真令牌没有触发软重载（改坏了：改完壁纸就不会热重载了）' }
+        if ($emit2) { throw '同一个令牌下发了两次 —— 页面会被重插两份 dsh.js' }
+        '判据同源（Get-ReloadToken>0）+ 先清后发；空令牌 0 次下发，真令牌只下发 1 次'
+    } finally {
+        try { if (Test-Path $rf) { Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue } } catch { }
+    }
+} -Hint '2026-11-07：Test-Path 判空文件也会发软重载，而 /state.js 当 0 —— 清不掉令牌时 /scroll.js 40ms 一轮无限重插 dsh.js'
