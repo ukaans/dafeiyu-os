@@ -87,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（14 条）
+### 20-contract · 契约一致性（15 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -104,6 +104,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-012 | **热重载只走软重载**：`dsh.js` 里裸 `location.reload()` 只允许 `softReload()` 里那 1 处老页面兜底；`/state.js` 的 `st.reload` 分支必须调 `softReload()`（不许硬刷）、`softReload()` 必须先试 `__DSH_RELOAD_OK`；代理 `Invoke-ScrollJs` 仍须调该钩子（Lively WebView2 上硬刷会白屏） |
 | CON-013 | **巡检结果落进桌面控制台**：`parseLog` 必须认 `[HH:mm:ss] <<< 文本` 并生成带自己时间的 DSH 气泡；`Nightly-Check.ps1` 必须有 `Send-ConsoleNote`，把结果以 `<<<` 写进 `DesktopPage\dsh-run.log`（写成 `>>>` 就变成"用户说的话"了） |
 | CON-014 | **巡检报告不乱码**：`Nightly-Check.ps1` 调 git 前必须把 `[Console]::OutputEncoding` 切到 UTF-8，且 git 带 `-c core.quotepath=false`（PS 5.1 默认用 GBK 解 git 的 UTF-8 输出 → `琛ユ湰…`） |
+| CON-015 | **会话区支持按住拖动滚动**：`dsh.js` 的 `#dshLog` 必须有 `pointerdown` 抓拽（4px 阈值、`dsh-dragging` 类、GEN 守卫），`todo.css` 必须有 grabbing 光标 + 禁选词，且滚动条 ≥12px（壁纸 WebView2 里原生滚动条收不到 mousedown；2026-11-06 用户报"滚轮好了但拖不动"） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -159,7 +160,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 61 条。
+合计 62 条。
 
 ---
 

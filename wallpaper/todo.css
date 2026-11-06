@@ -277,6 +277,14 @@
   background: rgba(0, 0, 0, 0.25);
   border: 1px solid rgba(220, 229, 235, 0.16);
   padding: 5px 6px;
+  /* 抓拽滚动（dsh.js 的 pointerdown/pointermove 实现）：告诉用户这里能按住拖 */
+  cursor: grab;
+}
+/* 拖动进行中：横向禁止选词，光标变抓取态 */
+#dshPanel #dshLog.dsh-dragging {
+  cursor: grabbing;
+  -webkit-user-select: none;
+  user-select: none;
 }
 /* ===== 会话气泡（dsh.js 的 renderMessages 生成） ===== */
 #dshPanel .dsh-msg {
@@ -413,19 +421,21 @@
   box-shadow: 0 0 8px rgba(215, 180, 95, 0.9);
 }
 
-/* 日志区滚动条：加宽一点，便于拖动 */
+/* 日志区滚动条：加宽到 12px、拇指加亮，既是滚动进度提示，也更好瞄准 */
 #dshPanel #dshLog::-webkit-scrollbar {
-  width: 10px;
+  width: 12px;
 }
 #dshPanel #dshLog::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.28);
+  background: rgba(0, 0, 0, 0.32);
+  border-left: 1px solid rgba(220, 229, 235, 0.1);
 }
 #dshPanel #dshLog::-webkit-scrollbar-thumb {
-  background: rgba(220, 229, 235, 0.42);
-  border-radius: 5px;
+  background: rgba(220, 229, 235, 0.55);
+  border-radius: 6px;
+  min-height: 26px;
 }
 #dshPanel #dshLog::-webkit-scrollbar-thumb:hover {
-  background: rgba(220, 229, 235, 0.62);
+  background: rgba(220, 229, 235, 0.78);
 }
 /* 操作行在窄面板里不要换行：5 个按钮 + 余额必须在 209px 内排下 */
 #dshPanel .dsh-actions {

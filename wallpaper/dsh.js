@@ -545,6 +545,42 @@ function dshInit() {
     }, { passive: false });
   }
 
+  // 日志区：按住拖动也能滚（2026-11-06 用户反馈"滚轮好了，但鼠标拖不动"）。
+  // 壁纸页里的原生滚动条收不到 mousedown，所以自己实现抓拽滚动：
+  // 按住左键上下拉 >4px 就进入拖动（此前不拦事件，单击/选词照旧）。
+  var dragScroll = null;
+  function endDrag() {
+    if (window.__DSH_GEN !== GEN) return;   // 软重载后旧闭包失效，别去动新面板
+    if (dragScroll) {
+      logEl.classList.remove('dsh-dragging');
+      dragScroll = null;
+    }
+  }
+  if (logEl) {
+    logEl.addEventListener('pointerdown', function (e) {
+      if (window.__DSH_GEN !== GEN) return;
+      if (e.button !== 0) return;
+      if (e.target && e.target.closest && e.target.closest('a,button,input,textarea,select')) return;
+      dragScroll = { y: e.clientY, top: logEl.scrollTop, moved: false, id: e.pointerId };
+    });
+    window.addEventListener('pointermove', function (e) {
+      if (window.__DSH_GEN !== GEN) return;
+      if (!dragScroll || (dragScroll.id !== null && e.pointerId !== dragScroll.id)) return;
+      var dy = e.clientY - dragScroll.y;
+      if (!dragScroll.moved) {
+        if (Math.abs(dy) < 4) return;   // 阈值内当成单击，不打断输入框聚焦
+        dragScroll.moved = true;
+        logEl.classList.add('dsh-dragging');
+        try { logEl.setPointerCapture(dragScroll.id); } catch (err) { }
+      }
+      logEl.scrollTop = clampScroll(dragScroll.top - dy, logEl);
+      dbg('drag dy=' + dy + ' at=' + Math.round(logEl.scrollTop));
+      e.preventDefault();
+    }, { passive: false });
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+  }
+
   // 设置面板：滚轮直接滚内容，不往外传
   function wheelScroll(host) {
     return function (e) {

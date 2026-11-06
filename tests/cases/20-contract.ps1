@@ -347,3 +347,26 @@ Test-Case CON-014 '契约' '巡检报告不乱码（git 输出按 UTF-8 解码�
     }
     'git 输出按 UTF-8 解码、中文路径不转义'
 } -Hint '2026-11-06：报告里提交标题/路径乱码（琛ユ湰…），根因是 PS 5.1 拿 GBK 解 UTF-8 的 git stdout'
+Test-Case CON-015 '契约' '会话区支持按住拖动滚动（原生滚动条在壁纸里拖不动）' medium {
+    # 2026-11-06 用户反馈：滚轮好了，但鼠标拖动不生效。
+    # 壁纸页（Lively WebView2）里原生滚动条收不到 mousedown，只能自己实现抓拽滚动。
+    $root = Get-DshRoot
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    if ($js -notmatch "logEl\.addEventListener\('pointerdown'") { throw '会话区没有 pointerdown 抓拽入口 —— 鼠标还是拖不动' }
+    if ($js -notmatch 'dragScroll\s*=\s*\{\s*y:') { throw 'pointerdown 没建立拖动状态（dragScroll）' }
+    if ($js -notmatch 'Math\.abs\(dy\)\s*<\s*4') { throw '拖动没有启动阈值 —— 单击/点输入框会被误判成拖动' }
+    if ($js -notmatch "'dsh-dragging'") { throw '拖动时没有加 dsh-dragging 类（光标/禁选词不会生效）' }
+    if ($js -notmatch 'clampScroll\(dragScroll\.top - dy, logEl\)') { throw '拖动没有按位移改 scrollTop' }
+    if ($js -notmatch 'window\.__DSH_GEN !== GEN') { throw '拖动监听没有 GEN 守卫 —— 软重载几次后会叠出一串僵尸监听' }
+    # 滚轮通道必须还在（用户先确认的是滚轮）
+    if ($js -notmatch "addEventListener\('wheel'") { throw '滚轮监听被弄丢了' }
+
+    $css = Read-Raw (Join-Path $root 'wallpaper\todo.css')
+    if ($css -notmatch '#dshLog\.dsh-dragging') { throw 'CSS 缺 .dsh-dragging 状态（拖动时光标/选词）' }
+    if ($css -notmatch 'cursor:\s*grabbing') { throw '.dsh-dragging 没把光标切成 grabbing —— 用户看不出"抓着拖"' }
+    if ($css -notmatch 'user-select:\s*none') { throw '.dsh-dragging 没禁选词，拖一下会满屏蓝' }
+    $sb = [regex]::Match($css, '#dshPanel #dshLog::-webkit-scrollbar\s*\{(?<b>[^}]*)\}')
+    if (-not $sb.Success) { throw '找不到日志区滚动条样式' }
+    if ($sb.Groups['b'].Value -notmatch 'width:\s*1[2-9]px|width:\s*[2-9]\dpx') { throw '滚动条太窄（<12px），拖不准' }
+    '拖动滚动（pointerdown + 阈值 + GEN 守卫）与 12px 滚动条都在'
+} -Hint '2026-11-06：滚轮修好后用户报"不能用鼠标拖动"。壁纸 WebView2 里原生滚动条收不到 mousedown，必须自己实现抓拽 + 加宽滚动条'
