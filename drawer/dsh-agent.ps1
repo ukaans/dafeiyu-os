@@ -1453,7 +1453,19 @@ function Invoke-RectGif($ctx, $query) {
     if ($query.raw -match '[?&]w=(-?\d+)') { $rw = [int]$matches[1] }
     if ($query.raw -match '[?&]h=(-?\d+)') { $rh = [int]$matches[1] }
     if ($rw -gt 200) {
-        try { [System.IO.File]::WriteAllText($rectFile, "$rx $ry $rw $rh", (New-Object System.Text.UTF8Encoding($false))) } catch { }
+        # 原子写（tmp + Move-Item 覆盖）：抽屉每 400ms 就来读这个文件（AHK 的 PanelRect()），
+        # 直接 WriteAllText 是「先截断成 0 字节、再补齐」——撞上读取方就是「读到空/只有两个字段」，
+        # PanelRect 于是掉进兜底矩形，滚轮落点错一次（用户感觉是「面板里忽然滚不动」）。
+        # 改名替换不会出现「存在但为空」的中间态：读到的要么是旧值，要么是新值。
+        # 改不动就这一轮不写（页面 4 秒后会再报一次，内容通常没变），绝不退回直写。
+        $rt = $rectFile + '.tmp'
+        try {
+            [System.IO.File]::WriteAllText($rt, "$rx $ry $rw $rh", (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $rt -Destination $rectFile -Force
+        } catch {
+            try { [System.IO.File]::Delete($rt) } catch { }
+            Agent-Log ('rect: atomic write skipped ' + $_.Exception.Message)
+        }
     }
     Write-Raw $ctx $gif 'image/gif'
 }
@@ -1491,10 +1503,19 @@ function Invoke-SummonGif($ctx, $query) {
     # 文件召唤：写 summon.cmd，抽屉 400ms 内轮询到就开合（不依赖键鼠钩子）
     $sd = 'show'
     if ($query.raw -match '[?&]d=([^&]*)') { if ($matches[1] -eq '1' -or $matches[1] -eq 'hide') { $sd = 'hide' } }
+    # 原子写：SummonTick 是「读一次 → 无论读成什么都会删文件」的消费方（AHK 侧无法改动，
+    # 本机也没法自动校验）。所以「文件存在但内容为空」必须不存在 —— 只要出现一次，
+    # 那条命令就被静默吞掉（用户看到的是「点了没反应」，日志里什么也没有）。
+    # 改名替换保证读到的一定是完整的一行；万一被读方占着句柄，隔 15ms 再试一次。
+    $sf = Join-Path $appDir 'summon.cmd'
+    $st = $sf + '.tmp'
     try {
-        [System.IO.File]::WriteAllText((Join-Path $appDir 'summon.cmd'), $sd, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($st, $sd, (New-Object System.Text.UTF8Encoding($false)))
+        try { Move-Item -LiteralPath $st -Destination $sf -Force }
+        catch { Start-Sleep -Milliseconds 15; Move-Item -LiteralPath $st -Destination $sf -Force }
         Agent-Log ('summon: ' + $sd)
     } catch {
+        try { [System.IO.File]::Delete($st) } catch { }
         Agent-Log ('summon failed: ' + $_.Exception.Message)
     }
     Write-Raw $ctx $gif 'image/gif'
