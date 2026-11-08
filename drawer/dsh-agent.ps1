@@ -381,6 +381,9 @@ $script:balTrySec = 300
 foreach ($pv in @('HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy','ALL_PROXY','all_proxy')) { try { [Environment]::SetEnvironmentVariable($pv, $null, 'Process') } catch { } }
 $script:scrollAcc = 0
 
+# 滚轮意图「读到但清不掉」时的日志限流（这条路由 40ms 一轮，不限流会一秒刷 25 行）
+$script:scrollSkipAt = [long]0
+
 function Take-Scroll {
     $scrollDat = Join-Path $appDir 'scroll.dat'
     $sum = 0
@@ -390,7 +393,10 @@ function Take-Scroll {
             # 先丢掉再返回，不让一次 ReadAllText 卡住单线程主循环。正常路径永远走不到。
             $fi = Get-Item $scrollDat -ErrorAction SilentlyContinue
             if ($fi -and $fi.Length -gt 1MB) {
-                try { [System.IO.File]::WriteAllText($scrollDat, '') } catch { }
+                try { [System.IO.File]::Delete($scrollDat) } catch { }
+                if (Test-Path $scrollDat) {
+                    try { [System.IO.File]::WriteAllText($scrollDat, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+                }
                 return 0
             }
             $raw = [System.IO.File]::ReadAllText($scrollDat)
@@ -398,7 +404,27 @@ function Take-Scroll {
                 $v = 0
                 if ([int]::TryParse($ln.Trim(), [ref]$v)) { $sum += $v }
             }
+            # 「读到」不等于「取走」：原来读完就 FileDelete、删没删掉一律不管（失败被 catch 吞掉），
+            # 于是同一批意图 40ms 后又被读一遍 —— 滚一格跳两格，而且日志干干净净（2026-11-09）。
+            # 现在先清后发（和热重载令牌同一套姿势）：删掉并复核 → 删不掉退化成截空再复核 →
+            # 两者都不成就**这一轮不发**（返回 0，内容还在文件里，下一轮再取）。
+            # 无论如何不能带着「没清掉的意图」下发，否则就是重复消费。
+            $cleared = $false
             try { [System.IO.File]::Delete($scrollDat) } catch { }
+            if (-not (Test-Path $scrollDat)) { $cleared = $true }
+            else {
+                try { [System.IO.File]::WriteAllText($scrollDat, '', (New-Object System.Text.UTF8Encoding($false))) } catch { }
+                $fi2 = Get-Item $scrollDat -ErrorAction SilentlyContinue
+                if (-not $fi2 -or $fi2.Length -eq 0) { $cleared = $true }
+            }
+            if (-not $cleared) {
+                $n64 = [long]$script:clock.ElapsedMilliseconds
+                if (($n64 - $script:scrollSkipAt) -gt 60000) {
+                    $script:scrollSkipAt = $n64
+                    Agent-Log 'scroll: intent queue not cleared, skipped this round'
+                }
+                return 0
+            }
         }
     } catch { }
     return $sum

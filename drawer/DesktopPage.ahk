@@ -1927,6 +1927,12 @@ SummonTick() {
     ; 排查时看起来像"文件通道也是坏的"。这里显式把回车换行也当空白剪掉。
     try cmd := Trim(FileRead(SUMMON_FILE, "UTF-8"), " `t`r`n")
     try FileDelete(SUMMON_FILE)
+    ; 「读到」不等于「取走」（2026-11-09）：原来删不掉也照样派发，同一条命令每 400ms 重放一次 ——
+    ; show/hide 幂等所以看不出来，diag 会刷日志、foldertest= 会反复弹窗、log=N 会反复导出。
+    ; 现在删完复核：文件还在就这一轮不派发，等下一轮（400ms）再来。代价是「长期删不掉时命令
+    ; 一直积压而不是重复执行」，这对一次性命令是更安全的一侧。
+    if FileExist(SUMMON_FILE)
+        return
     if (cmd = "")
         return
     ; 1) 精确匹配（O(1)）

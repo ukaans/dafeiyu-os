@@ -402,3 +402,134 @@ Test-Case RES-012 '健壮' '信标落盘也原子替换（panel-rect / summon.cm
     if ($badReads -gt 0) { throw ('并发采样 ' + $samples + ' 次，有 ' + $badReads + ' 次读到空/不完整 —— 仍有非原子写路径') }
     ('两处都是 tmp + 原子覆盖；并发采样 ' + $samples + ' 次未读到空/不完整')
 } -Hint '改名替换（Move-Item -Force / FileMove）不会出现「存在但为空」；改不动就这一轮不写，别退回直写'
+
+Test-Case RES-013 '健壮' '滚轮意图：读到≠取走，清不掉不许重复消费' medium {
+    # scroll.dat 是「抽屉写一行（/scroll.gif 或 AHK AgentScroll）、壁纸每 40ms 取走」的意图队列。
+    # 原来的 Take-Scroll 是「读 → File::Delete → 不管删没删掉都返回读数」：
+    # 删除失败时（写方还持有句柄 / 杀软扫描 / 安全策略）同一批意图 40ms 后又被读一遍，
+    # 用户感觉「滚一格跳两格」，而日志干干净净 —— 删除失败的异常被 catch 吞掉了。
+    # 判据：先清后发 —— 清不掉这一轮返回 0（内容还在文件里，下一轮再取），绝不重复下发。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $body = {
+        param($code, $fn)
+        $i = $code.IndexOf('function ' + $fn)
+        if ($i -lt 0) { return '' }
+        $j = $code.IndexOf("`nfunction ", $i + 1)
+        if ($j -lt 0) { $j = $code.Length }
+        return $code.Substring($i, $j - $i)
+    }
+    $take = & $body $agent 'Take-Scroll'
+    if (-not $take) { throw '找不到 Take-Scroll' }
+
+    $bad = @()
+    if ($take -notmatch '\[System\.IO\.File\]::Delete\(\$scrollDat\)') { $bad += 'Take-Scroll 不正视删除（仍指望一次读走就完事）' }
+    if ($take -notmatch 'Test-Path\s+\$scrollDat') { $bad += 'Take-Scroll 删完不复核（删没删掉都不知道 → 会重复消费）' }
+    if ($take -notmatch '\$cleared') { $bad += 'Take-Scroll 没有 $cleared 清空闸' }
+    if ($take -notmatch 'if\s*\(\s*-not\s+\$cleared\s*\)[\s\S]*?return\s+0') { $bad += '$cleared 闸没挡住下发（清不掉时照样把读数返回）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体（函数级）：把 Take-Scroll 单独取出来，在临时目录里跑 ——
+    # 不碰真实 scroll.dat、不占端口、不影响正在跑的代理。
+    $tmp = Join-Path $env:TEMP ('dsh_scroll_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $probe = {
+            param($src, $dir)
+            $appDir = $dir
+            function Agent-Log([string]$m) { }
+            . ([scriptblock]::Create($src))
+            $f = Join-Path $dir 'scroll.dat'
+            # ① 正常路径：三条意图一次取走（+2+3-1=4），文件必须消失
+            [System.IO.File]::WriteAllText($f, "+2`r`n+3`r`n-1`r`n")
+            $a = Take-Scroll
+            $gone1 = -not (Test-Path -LiteralPath $f)
+            # ② 占住句柄：只允许别人读，不允许写/删（等价于「删除会失败」的那个时刻）
+            [System.IO.File]::WriteAllText($f, "+5`r`n")
+            $fs = [System.IO.File]::Open($f, 'Open', 'Read', 'Read')
+            try {
+                $b = Take-Scroll
+                $c = Take-Scroll
+                $still = Test-Path -LiteralPath $f
+            } finally { $fs.Dispose() }
+            # ③ 放开句柄：这 1 条意图只能被交付一次
+            $d = Take-Scroll
+            $gone2 = -not (Test-Path -LiteralPath $f)
+            return [pscustomobject]@{ A = $a; Gone1 = $gone1; B = $b; C = $c; Still = $still; D = $d; Gone2 = $gone2 }
+        }
+        $r = & $probe $take $tmp
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+
+    if ($r.A -ne 4) { throw ('正常路径没取到期望的增量（期望 4，实际 ' + $r.A + '）') }
+    if (-not $r.Gone1) { throw '正常路径取走后 scroll.dat 还在（等于没消费）' }
+    if ($r.B -ne 0 -or $r.C -ne 0) { throw ('文件清不掉时仍下发了意图（两次分别读 ' + $r.B + ' / ' + $r.C + '）—— 会被重复消费') }
+    if (-not $r.Still) { throw '测试前提不成立：占住句柄期间 scroll.dat 竟然被删掉了' }
+    if ($r.D -ne 5) { throw ('放开句柄后应恰好交付一次 5，实际 ' + $r.D) }
+    if (-not $r.Gone2) { throw '放开句柄后意图仍没被清掉' }
+    ('清不掉时 2 次轮询都返回 0、放开后恰好交付一次（' + $r.A + ' → 0/0 → ' + $r.D + '）')
+} -Hint '「读到」不等于「取走」：消费型文件必须「清掉才算取走」，清不掉这一轮不发（内容留在文件里，下一轮再取）'
+
+Test-Case RES-014 '健壮' '文件召唤：删掉才算消费（AHK SummonTick）' medium {
+    # 同 RES-013 的消费端，只是换到 AHK 侧：SummonTick 每 400ms 读 summon.cmd，
+    # 原来「读完 → FileDelete → 无论删没删掉都派发」。删失败时（/summon.gif 刚 Move 完、
+    # 杀软在扫、策略拦删）同一条命令每 400ms 重放一次 ——
+    # `show`/`hide` 幂等还看不出来，`diag` 会刷日志、`foldertest=` 会反复弹窗，
+    # 最坏的是 `log=N` 反复导出。所以要求「删完复核，删不掉这一轮不派发」。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $i = $ahk.IndexOf('SummonTick() {')
+    if ($i -lt 0) { throw '找不到 SummonTick' }
+    $j = $ahk.IndexOf("`n}", $i)
+    if ($j -lt 0) { $j = $ahk.Length }
+    $fn = $ahk.Substring($i, $j - $i)
+
+    $bad = @()
+    if ($fn -notmatch 'FileDelete\(SUMMON_FILE\)') { $bad += 'SummonTick 没有删除 summon.cmd' }
+    # 复核必须挡在派发之前：FileDelete 之后、真正调用命令（SUMMON_CMDS 查表/前缀匹配）之前要有一道
+    # 「文件还在就 return」。注意两个坑（本轮踩过）：
+    #   ①函数头就有 `if !FileExist(SUMMON_FILE) return`，拿它当判据会永远是绿的；
+    #   ②`if (cmd = "") return` 也在删除之后，同样会误判 —— 所以只认「FileExist 后面紧跟 return」。
+    $di = $fn.IndexOf('FileDelete(SUMMON_FILE)')
+    $ci = $fn.IndexOf('SUMMON_CMDS.Has')
+    if ($di -lt 0 -or $ci -lt 0 -or $ci -le $di) {
+        $bad += 'SummonTick 的删除不在派发之前'
+    } else {
+        $guard = $fn.Substring($di, $ci - $di)
+        if ($guard -notmatch 'FileExist\(SUMMON_FILE\)[\s\S]{0,80}?return') {
+            $bad += 'SummonTick 删不掉时没提前 return（照样派发 → 每 400ms 重放一次）'
+        }
+    }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体：走**文件通道**写一条 diag（和 RUN-011 同一条路）。
+    # 不要用 /summon.gif：那条路由只认 d=1|hide，其余一律写 show —— 深夜会把抽屉弹开。
+    $inst = Get-DshInstall
+    if (-not (Get-Process -Name 'AutoHotkey64' -ErrorAction SilentlyContinue)) {
+        return @{ Status = 'skip'; Detail = '抽屉没在跑（AutoHotkey64 不存在），活体部分跳过；静态判据已通过' }
+    }
+    $log = Join-Path $inst 'wheel.log'
+    $countDiag = {
+        param($p)
+        if (-not (Test-Path -LiteralPath $p)) { return 0 }
+        $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+        try { $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8); $all = $sr.ReadToEnd(); $sr.Dispose() } finally { $fs.Dispose() }
+        return @([regex]::Matches($all, 'diag:')).Count
+    }
+    $sf = Join-Path $inst 'summon.cmd'
+    $before = & $countDiag $log
+    [System.IO.File]::WriteAllText($sf, 'diag', (New-Object System.Text.UTF8Encoding($false)))
+    $after = $before
+    for ($k = 0; $k -lt 12; $k++) {
+        Start-Sleep -Milliseconds 250
+        $after = & $countDiag $log
+        if ($after -gt $before) { break }
+    }
+    if ($after -le $before) {
+        throw ('静态判据齐全，但活体 diag 没落地（diag 行 ' + $before + ' → ' + $after + '）—— 复核把正常命令也挡掉了')
+    }
+    if (Test-Path -LiteralPath $sf) { throw 'diag 落了日志，但 summon.cmd 没被消费掉（文件还在）' }
+    ('SummonTick 删完复核、删不掉不派发；活体 diag 落地并被消费（diag 行 ' + $before + ' → ' + $after + '）')
+} -Hint 'AHK 侧无法自动校验语法，这条只用静态文本 + 一条真实 diag 兜住「没把正常命令挡掉」'

@@ -135,10 +135,10 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-009 | `/dock.js` 项数 ≤6、`__DOCK_BUSY` 存在 |
 | RUN-010 | `OPTIONS` 回 204、`.js` 的 `Content-Type` 是 `application/javascript` |
 | RUN-011 | **抽屉文件通道可达**：写 `summon.cmd=diag`，验证 400ms 内被消费且 `wheel.log` 落了 `diag:` 快照（唯一能验到 AHK 主循环的手段） |
-| RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子；hwnd 文件比日志新且不到 30 秒时降级 `warn`（抽屉刚 announce、桥还没到下一个 5 秒 tick） |
+| RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子。**过渡窗口不算故障**：beat 是 60 秒一行、follow 是 5 秒一次 tick，抽屉刚重启时「最后一次 beat 之后已经有 `target: follow hwnd=<当前目标>` 行」直接判过（2026-11-09 修：旧判据只看 30 秒窗口，重启后 30~60 秒那段会直接抛红）；hwnd 文件比日志新且不到 30 秒时降级 `warn` |
 | RUN-013 | **`/log.js` 会话正文通道**：`window.__DSH_LOG="…"` 前缀、≤60000 字符（超了单线程代理会排队）、`Content-Type` 是 `application/javascript`；日志为空时 `sig` 尚未生成属正常 |
 
-### 50-resilience · 健壮性与容量（12 条）
+### 50-resilience · 健壮性与容量（14 条）
 | 编号 | 查什么 |
 |---|---|
 | RES-001 | `wheel.log` / `dsh-run.log` **有 256KB 轮转**（查写入方代码里的阈值 + `FileMove`/`Move-Item` 改名，不只看尺寸）+ 未超 1MB |
@@ -153,6 +153,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-010 | `scroll.dat` 有上限：写入方超 64KB 截断（`$script:SCROLL_MAX`）、读取方超 1MB 兜底；否则消费方一停就只增不减，而 `Take-Scroll` 是整份 `ReadAllText`，会拖死单线程代理 |
 | RES-011 | **启动队列「删掉才算消费」**：`agent-watch.ps1`（1s 一轮）与 `ensure-all.ps1`（2min 一轮）消费 `launch-queue.txt` 时不许再用 `Remove-Item -Force -ErrorAction SilentlyContinue`（两处的错误偏好都是静默，删失败不抛也不记 → 队列留着 → 下一次 tick 把同一批路径**再启动一遍**）；必须有 `File::Delete` + `Test-Path` 复核 + `$consumed` 闸，且启动循环在闸内（2026-11-08 修） |
 | RES-012 | **信标落盘也原子替换**：`Invoke-RectGif` / `Invoke-SummonGif` 必须 tmp + `Move-Item -Force` 覆盖 `panel-rect.txt` / `summon.cmd`。AHK 每 400ms 读这两个文件，而 `SummonTick` **读完无论读成什么都会删文件** —— 直写时「存在但为空」的那一瞬就等于命令被静默吞掉；另带一条活体并发探针（连打 `/rect.gif` 的幂等值 30 轮 × 每轮读 6 次，读到空/字段不足 4 个即失败） |
+| RES-013 | **滚轮意图「读到≠取走」**：`Take-Scroll` 不许「读完就 `File::Delete`、删没删掉不管」，必须有 `$cleared` 闸（删 → `Test-Path` 复核 → 截空复核 → 都不成就这一轮返回 0）。删除失败时（写方持有句柄 / 杀软）旧写法会把同一批意图 40ms 后再交付一次 = 滚一格跳两格。**活体是把 `Take-Scroll` 单独取出来在临时目录里跑**（不碰真实 `scroll.dat`、不占端口）：正常路径取走 4 → 占住句柄后两轮都必须是 0 → 放开后恰好交付一次 5 |
+| RES-014 | **文件召唤「删掉才算消费」**（AHK 侧）：`SummonTick` 必须在 `FileDelete(SUMMON_FILE)` 之后、派发之前有一道「文件还在就 `return`」。旧写法删失败也照样派发 → 同一条命令每 400ms 重放（`foldertest=` 反复弹窗、`log=N` 反复导出）。判据只认「FileDelete 之后紧跟 FileExist→return」——函数头的 `if !FileExist(SUMMON_FILE) return` 和 `if (cmd = "") return` 都会让弱判据永远为绿；活体走文件通道写一条 `diag` 证明没把正常命令挡掉 |
 
 ### 60-data · 数据完整性（7 条）
 | 编号 | 查什么 |
@@ -165,7 +167,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 66 条。
+合计 69 条。
 
 ---
 
@@ -209,5 +211,7 @@ Test-Case XXX-002 '分类' '需要人工判断的' low {
 - **SEC-003 会在 `audit.log` 留一行 `SELFTEST-INJECT`**：这是探针本身，`grep -v SELFTEST` 可以滤掉。
 - **RUN-011 会往 `wheel.log` 追加一行 `diag:`**，并临时创建/由抽屉删除 `summon.cmd`。`diag` 只写快照不弹窗，但确实会改一个运行时文件；不想要它就 `-Case` 排除。
 - **RES-012 会重写一次 `panel-rect.txt`**：它把文件里当前的四个数原样再打一遍 `/rect.gif`（幂等、不改实际矩形），只为制造写入压力看会不会读到半截。壁纸页每 4 秒也会重报同一个值，不想要它就 `-Case` 排除。
+- **RES-014 会往 `wheel.log` 追加一行 `diag:`**（与 RUN-011 同类，走文件通道写 `summon.cmd=diag`）。
+- **用例里绝对不要用 `/summon.gif` 造测试数据**：那条路由只认 `d=1|hide`，其余一切（包括 `d=diag`）都会写成 `show` —— 深夜跑测试会把抽屉弹到用户脸上（2026-11-09 踩过，改成直接写 `summon.cmd` 文件）。
 - **AHK 不能靠 `/validate` 证明没问题**：本机 `AutoHotkey64.exe /validate <script>` 返回 exit=0 且无任何输出（既不是 Syntax OK，也不是失败），所以别把它当验收。 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征；**改完仍要重启抽屉看 `wheel.log` / `audit.log` 里动作对不对**。`RUN-011` 只能证明"主循环还在转"。滚轮判定层可脚本化验证：`summon.cmd` 写 `classify=<hwnd>`，壁纸页 WebView2 的 RenderWidgetHost 应回 `desk=1`（root=Progman），Chrome 的应回 `desk=0`。
 - **`schtasks` 被拉黑**：所以测试不验证计划任务是否注册（那是 `verify.ps1` 用 `Get-ScheduledTask` 查的，走的是 COM 不是 exe）。
