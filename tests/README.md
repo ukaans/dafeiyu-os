@@ -107,6 +107,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-015 | **会话区支持按住拖动滚动**：`dsh.js` 的 `#dshLog` 必须有 `pointerdown` 抓拽（4px 阈值、`dsh-dragging` 类、GEN 守卫），`todo.css` 必须有 grabbing 光标 + 禁选词，且滚动条 ≥12px（壁纸 WebView2 里原生滚动条收不到 mousedown；2026-11-06 用户报"滚轮好了但拖不动"） |
 | CON-016 | **巡检推送有直连兜底**：`Nightly-Check.ps1` 必须有 `Invoke-GitPush`，先按仓库代理推，只有"连不上"类错误（`Failed to connect` 等）才用 `-c http.proxy= -c https.proxy=` 直连重试一次；rejected/凭据错照旧上报（2026-11-06 代理关着时巡检推送会红） |
 | CON-017 | **热重载令牌：两条路径同源判据 + 先清后发**：`Invoke-ScrollJs` 判「有没有令牌」必须走 `Get-ReloadToken > 0`（和 `/state.js` 同源），不许用 `Test-Path page-reload.txt`（空文件也算"有"）；且必须先清令牌、确认清掉再下发，清不掉这一轮不发（否则 40ms 一轮无限重插 `dsh.js`）；发完 `Cache-Drop` 掉 reload 缓存。活体验证：空令牌 0 次下发、真令牌只 1 次（2026-11-07 实测空文件也会触发软重载） |
+| CON-018 | **图标启动：带参快捷方式也必须走代理/队列**：`LaunchItem` 不许再按 `args = ""` 分流（带参 .lnk 会绕过代理直跑，AHK 祖先让鹰角启动器弹 `Load launcher failed, module init error`）；顺序必须是「代理 → 启动队列 → 直连兜底」（2026-11-08 明日方舟：终末地 `--game=Endfield --reason=4` 点一次弹一次） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |

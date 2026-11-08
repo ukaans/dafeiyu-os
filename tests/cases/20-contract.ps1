@@ -447,3 +447,35 @@ Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清�
         try { if (Test-Path $rf) { Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue } } catch { }
     }
 } -Hint '2026-11-07：Test-Path 判空文件也会发软重载，而 /state.js 当 0 —— 清不掉令牌时 /scroll.js 40ms 一轮无限重插 dsh.js'
+
+Test-Case CON-018 '契约' '图标启动：带参快捷方式也必须走代理/队列' high {
+    # 2026-11-08 复现：点「明日方舟：终末地」弹「Load launcher failed, module init error」。
+    # audit.log 是 via=run，代理侧连 /launchpath.gif 的请求都没有 —— LaunchItem 里
+    # `if (args = "")` 把带参快捷方式挡在代理之外，直接 AHK Run；鹰角启动器的保护模块
+    # 按进程祖先拒绝初始化。桌面还有明日方舟（--game=Arknights --reason=4）、
+    # 守望先锋（--productcode=pro）等带参快捷方式，都是同一个口子。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $m = [regex]::Match($ahk, '(?s)LaunchItem\(path\)\s*\{(.*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 LaunchItem 函数体（函数名或被拆了？）' }
+    $body = $m.Groups[1].Value
+    # 注释里会写旧写法（`if (args = "")`），判据只看代码行
+    $code = (($body -split "\r?\n") | Where-Object { $_ -notmatch '^\s*;' }) -join "`n"
+
+    if ($code -match 'if\s*\(\s*args\s*=\s*""\s*\)') {
+        throw 'LaunchItem 还按 args="" 决定走不走代理 —— 带参快捷方式会绕过代理，鹰角启动器必弹 module init error'
+    }
+    $iTitle = $code.IndexOf('launch: no running instance')
+    $iAgent = $code.LastIndexOf('AgentLaunch(path)')
+    $iQueue = $code.IndexOf('QueueLaunch(path)')
+    $iRun = $code.IndexOf('"ok=1 via=run path=" Aq(path) " pid="')
+    if ($iTitle -lt 0) { throw '找不到"无实例"分支 —— LaunchItem 结构被改了，测试要跟着改' }
+    if ($iAgent -lt 0 -or $iAgent -lt $iTitle) {
+        throw '代理调用不在"无实例"分支之后 —— 带参/无参没有统一走代理'
+    }
+    if ($iQueue -lt 0 -or $iQueue -lt $iTitle) { throw '启动队列兜底不见了（代理挂掉时会退回 AHK 直跑）' }
+    if ($iRun -lt 0) { throw '找不到最后的直连兜底 —— 测试要跟着改' }
+    if ($iQueue -gt $iRun) { throw '顺序错了：队列必须在直连兜底之前' }
+    if ($code -notmatch 'AgentLaunch\(path\)') { throw '代理调用消失' }
+    '带参快捷方式不再绕过代理：代理 → 队列 → 直连兜底，顺序正确'
+} -Hint '2026-11-08：明日方舟：终末地（--game=Endfield --reason=4）点一次弹一次 module init error；修好后带参 ≠ 直跑'
