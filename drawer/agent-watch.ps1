@@ -87,7 +87,23 @@ function Invoke-LaunchQueue {
     if (-not (Test-Path $queueFile)) { return }
     $qlines = @()
     try { $qlines = [System.IO.File]::ReadAllLines($queueFile) } catch { }
-    try { Remove-Item $queueFile -Force -ErrorAction SilentlyContinue } catch { }
+    # 「吃掉」队列必须能证明。原来用 Remove-Item -Force -ErrorAction SilentlyContinue，
+    # 而本脚本 $ErrorActionPreference='SilentlyContinue' —— 删失败（AHK 正开着句柄追加 /
+    # 安全策略拦截）连日志都没有，文件还在，下一秒就把同一批路径再启动一遍。
+    # 顺序：删 → 确认已消失 → 退化成截空 → 两者都不成就这一轮不启动（宁可晚一秒，不可重复启动）。
+    $consumed = $false
+    try { [System.IO.File]::Delete($queueFile) } catch { }
+    if (-not (Test-Path $queueFile)) {
+        $consumed = $true
+    } else {
+        try { [System.IO.File]::WriteAllText($queueFile, '') } catch { }
+        $left = Get-Item $queueFile -ErrorAction SilentlyContinue
+        if (-not $left -or $left.Length -le 0) { $consumed = $true }
+    }
+    if (-not $consumed) {
+        Watch-Log 'watch: launch queue busy (delete failed), retry next tick'
+        return
+    }
     foreach ($ln in $qlines) {
         $v = $ln.Trim()
         if ($v -eq '') { continue }

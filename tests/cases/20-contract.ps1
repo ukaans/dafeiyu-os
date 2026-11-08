@@ -395,3 +395,87 @@ Test-Case CON-016 '契约' '巡检推送：代理连不上就直连重试一次'
     if ($night -notmatch 'Invoke-GitPush -Remote \$Remote -Branch \$Branch') { throw '推送段没有调用 Invoke-GitPush' }
     '推送失败先按连接错误判断，再 -c http.proxy= 直连重试一次'
 } -Hint '2026-11-06 代理没开时巡检推送会红；只对 connect 类失败兜底，其它失败照旧报'
+Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清后发' high {
+    # 2026-11-07 实测：page-reload.txt 存在但内容为空时，/scroll.js 照样下发软重载（实测 True,False,False）。
+    # 而 /state.js 那条（Get-ReloadToken）把空值当 0 —— 两条路径对「什么是有效令牌」各有各的判法。
+    # 后果：Remove-Item 被安全策略拦掉时，下面那段兜底会把文件变成「长期存在的空文件」，
+    # 于是 /scroll.js（40ms 一轮）每一轮都重插一次 dsh.js，面板无限重建、CPU 飙升，且没有任何报错。
+    # 判据必须同源（Get-ReloadToken -gt 0），且必须先清令牌、确认清掉了再下发。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $m = [regex]::Match($agent, 'function Invoke-ScrollJs\((?<b>[\s\S]*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 Invoke-ScrollJs 函数体' }
+    $body = $m.Groups['b'].Value
+    $code = (($body -split "\r?\n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+
+    if ($code -notmatch '\(Get-ReloadToken\)\s*-gt\s*0') {
+        throw '触发判据不是 Get-ReloadToken > 0 —— 又退回「文件存在就发」了（空文件会无限重插 dsh.js）'
+    }
+    if ($code -match 'if\s*\(\s*Test-Path\s+\$reloadFile\s*\)\s*\{') {
+        throw '还在用「Test-Path 文件存在」当触发判据（和 /state.js 的 Get-ReloadToken 不同源）'
+    }
+    $iClear = $code.IndexOf('Remove-Item -LiteralPath $reloadFile')
+    $iEmit = $code.IndexOf('__DSH_RELOAD_OK')
+    if ($iClear -lt 0) { throw 'Invoke-ScrollJs 不再清令牌 —— 会每 40ms 重复下发' }
+    if ($iEmit -lt 0) { throw 'Invoke-ScrollJs 不再调 window.__DSH_RELOAD_OK，软重载链路断了' }
+    if ($iClear -gt $iEmit) { throw '先下发后清令牌：清不掉就开始无限重插（顺序必须是先清后发）' }
+    if ($code -notmatch 'if\s*\(\s*\$cleared\s*\)') { throw '下发没有 $cleared 这道闸 —— 清不掉也照发' }
+    if ($code -notmatch "Cache-Drop\s+'reload'") { throw '没清 /state.js 的 reload 缓存，半秒内会把同一个令牌再下发一次' }
+
+    # 活体复现（只动令牌文件，不弹窗、不动桌面）：空文件必须一次软重载都不发
+    if (-not (Test-DshApiUp)) { return @{ Status = 'warn'; Detail = '静态契约通过；代理未在线，活体复现跳过' } }
+    $rf = Join-Path $env:LOCALAPPDATA 'DesktopPage\page-reload.txt'
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    try {
+        [System.IO.File]::WriteAllText($rf, '', $enc)
+        $hitEmpty = 0
+        for ($i = 0; $i -lt 2; $i++) {
+            $r = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+            if ($r.Ok -and $r.Body -match '__DSH_RELOAD_OK') { $hitEmpty++ }
+        }
+        if ($hitEmpty -gt 0) { throw "空令牌文件仍下发了软重载 $hitEmpty 次 —— 清不掉令牌的机器会无限重插 dsh.js" }
+        # 真令牌：必须发一次，发完立刻失效（第二次不能再发，否则页面被重插两份 dsh.js）
+        [System.IO.File]::WriteAllText($rf, [string][long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), $enc)
+        $r1 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+        $r2 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+        $emit1 = ($r1.Ok -and $r1.Body -match '__DSH_RELOAD_OK')
+        $emit2 = ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK')
+        if (-not $emit1) { throw '真令牌没有触发软重载（改坏了：改完壁纸就不会热重载了）' }
+        if ($emit2) { throw '同一个令牌下发了两次 —— 页面会被重插两份 dsh.js' }
+        '判据同源（Get-ReloadToken>0）+ 先清后发；空令牌 0 次下发，真令牌只下发 1 次'
+    } finally {
+        try { if (Test-Path $rf) { Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue } } catch { }
+    }
+} -Hint '2026-11-07：Test-Path 判空文件也会发软重载，而 /state.js 当 0 —— 清不掉令牌时 /scroll.js 40ms 一轮无限重插 dsh.js'
+
+Test-Case CON-018 '契约' '图标启动：带参快捷方式也必须走代理/队列' high {
+    # 2026-11-08 复现：点「明日方舟：终末地」弹「Load launcher failed, module init error」。
+    # audit.log 是 via=run，代理侧连 /launchpath.gif 的请求都没有 —— LaunchItem 里
+    # `if (args = "")` 把带参快捷方式挡在代理之外，直接 AHK Run；鹰角启动器的保护模块
+    # 按进程祖先拒绝初始化。桌面还有明日方舟（--game=Arknights --reason=4）、
+    # 守望先锋（--productcode=pro）等带参快捷方式，都是同一个口子。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $m = [regex]::Match($ahk, '(?s)LaunchItem\(path\)\s*\{(.*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 LaunchItem 函数体（函数名或被拆了？）' }
+    $body = $m.Groups[1].Value
+    # 注释里会写旧写法（`if (args = "")`），判据只看代码行
+    $code = (($body -split "\r?\n") | Where-Object { $_ -notmatch '^\s*;' }) -join "`n"
+
+    if ($code -match 'if\s*\(\s*args\s*=\s*""\s*\)') {
+        throw 'LaunchItem 还按 args="" 决定走不走代理 —— 带参快捷方式会绕过代理，鹰角启动器必弹 module init error'
+    }
+    $iTitle = $code.IndexOf('launch: no running instance')
+    $iAgent = $code.LastIndexOf('AgentLaunch(path)')
+    $iQueue = $code.IndexOf('QueueLaunch(path)')
+    $iRun = $code.IndexOf('"ok=1 via=run path=" Aq(path) " pid="')
+    if ($iTitle -lt 0) { throw '找不到"无实例"分支 —— LaunchItem 结构被改了，测试要跟着改' }
+    if ($iAgent -lt 0 -or $iAgent -lt $iTitle) {
+        throw '代理调用不在"无实例"分支之后 —— 带参/无参没有统一走代理'
+    }
+    if ($iQueue -lt 0 -or $iQueue -lt $iTitle) { throw '启动队列兜底不见了（代理挂掉时会退回 AHK 直跑）' }
+    if ($iRun -lt 0) { throw '找不到最后的直连兜底 —— 测试要跟着改' }
+    if ($iQueue -gt $iRun) { throw '顺序错了：队列必须在直连兜底之前' }
+    if ($code -notmatch 'AgentLaunch\(path\)') { throw '代理调用消失' }
+    '带参快捷方式不再绕过代理：代理 → 队列 → 直连兜底，顺序正确'
+} -Hint '2026-11-08：明日方舟：终末地（--game=Endfield --reason=4）点一次弹一次 module init error；修好后带参 ≠ 直跑'

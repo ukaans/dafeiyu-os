@@ -282,7 +282,8 @@ ItemIndex(path) {
 ;  2) 同名进程已经有窗口 → 激活它，不再起第二个（单实例程序重复启动易踩关闭竞态）
 ;  3) 同名进程存在但还没窗口 → 等它要么出窗口、要么退干净，最多 5 秒
 ;  4) 全过程写日志，失败弹气泡，不再静默吞异常
-;  5) 参数为空时优先交给本地代理拉起：AHK 当祖先后，目标程序的保护模块会拒绝初始化
+;  5) 不论带不带参数，都优先交给本地代理拉起：AHK 当祖先后，目标程序的保护模块
+;     （鹰角启动器）会拒绝初始化；代理不在就写启动队列，最后才直连兜底
 ; ------------------------------------------------------------
 LaunchItem(path) {
     ; 目录走两级回退：
@@ -359,23 +360,26 @@ LaunchItem(path) {
     ; 实测从 AutoHotkey 进程起的鹰角启动器（连带 cmd/wscript 中转也一样）
     ; 必定弹「Load launcher failed, module init error」，而同一路径从
     ; powershell / 代理进程（无 AHK 祖先）起就正常 —— 是它的保护/反注入模块
-    ; 按进程祖先识别并拒绝初始化。代理没起时才退回直连启动。
-    if (args = "") {
-        if (AgentLaunch(path)) {
-            LogWrite("launch via agent: " path " -> " target)
-            AuditLog("launch.new", "ok=1 via=agent path=" Aq(path))
-            return
-        }
-        ; 代理没响应时不能退回 AHK 自己 Run：鹰角启动器的保护模块会按进程祖先
-        ; 拒绝初始化，弹出「Load launcher failed, module init error」。
-        ; 改写进启动队列，由 agent-watch.ps1 / ensure-all.ps1（都没有 AHK 祖先）拉起。
-        if (QueueLaunch(path)) {
-            LogWrite("launch queued (agent down): " path)
-            AuditLog("launch.new", "ok=1 via=queue path=" Aq(path))
-            LaunchToast(path, "本地代理未响应，已排入启动队列")
-            return
-        }
+    ; 按进程祖先识别并拒绝初始化。
+    ; 2026-11-08：这里原来套着 `if (args = "")`，带参快捷方式全部绕过代理直接 Run：
+    ; 明日方舟：终末地（--game=Endfield --reason=4）、明日方舟（--game=Arknights
+    ; --reason=4）、守望先锋（--productcode=pro）等都在桌面躺着，点一次弹一次。
+    ; 现在不按参数分流，所有类型一律先代理、再队列，最后才直连兜底。
+    if (AgentLaunch(path)) {
+        LogWrite("launch via agent: " path " -> " target " args=[" args "]")
+        AuditLog("launch.new", "ok=1 via=agent path=" Aq(path) " args=" Aq(args))
+        return
     }
+    ; 代理没响应时不能退回 AHK 自己 Run：鹰角启动器的保护模块会按进程祖先
+    ; 拒绝初始化，弹出「Load launcher failed, module init error」。
+    ; 改写进启动队列，由 agent-watch.ps1 / ensure-all.ps1（都没有 AHK 祖先）拉起。
+    if (QueueLaunch(path)) {
+        LogWrite("launch queued (agent down): " path " args=[" args "]")
+        AuditLog("launch.new", "ok=1 via=queue path=" Aq(path) " args=" Aq(args))
+        LaunchToast(path, "本地代理未响应，已排入启动队列")
+        return
+    }
+    ; 最后的直连兜底：代理和队列都写不进去才会到这里（会触发鹰角启动器的祖先检测）
     try {
         if (args != "")
             Run('"' target '" ' args, wd, , &pid)

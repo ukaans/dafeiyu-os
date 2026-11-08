@@ -1,4 +1,4 @@
-﻿# tests\ —— 漏洞与风险测试模块
+# tests\ —— 漏洞与风险测试模块
 
 一句话：**不改代码就能判断"这套系统现在还健康吗、哪里藏着雷"**，输出一份机器可读的报告给夜里自动跑的修复任务，也给人看。
 
@@ -80,14 +80,14 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-001 | 24 个核心文件在位 |
 | STA-002 | 编码契约：`.ps1` UTF-8 **带 BOM**、`.vbs` UTF-16LE、`.ahk` 无 BOM |
 | STA-003 | 壁纸 12 个 JS 过 `node --check` |
-| STA-004 | 22 个脚本过 `Parser::ParseFile` |
+| STA-004 | 26 个脚本过 `Parser::ParseFile` |
 | STA-005 | **源工程 ↔ `%LOCALAPPDATA%\DesktopPage` 逐字节一致**（不一致=改了半天跑的还是旧代码） |
 | STA-006 | 上游不可改文件（`app.js` / 两个 css / 两个 exe）未被改动 |
 | STA-007 | `app.js` 依赖的 6 个节点 id 仍在 `index.html` 里 |
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（16 条）
+### 20-contract · 契约一致性（17 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -106,6 +106,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-014 | **巡检报告不乱码**：`Nightly-Check.ps1` 调 git 前必须把 `[Console]::OutputEncoding` 切到 UTF-8，且 git 带 `-c core.quotepath=false`（PS 5.1 默认用 GBK 解 git 的 UTF-8 输出 → `琛ユ湰…`） |
 | CON-015 | **会话区支持按住拖动滚动**：`dsh.js` 的 `#dshLog` 必须有 `pointerdown` 抓拽（4px 阈值、`dsh-dragging` 类、GEN 守卫），`todo.css` 必须有 grabbing 光标 + 禁选词，且滚动条 ≥12px（壁纸 WebView2 里原生滚动条收不到 mousedown；2026-11-06 用户报"滚轮好了但拖不动"） |
 | CON-016 | **巡检推送有直连兜底**：`Nightly-Check.ps1` 必须有 `Invoke-GitPush`，先按仓库代理推，只有"连不上"类错误（`Failed to connect` 等）才用 `-c http.proxy= -c https.proxy=` 直连重试一次；rejected/凭据错照旧上报（2026-11-06 代理关着时巡检推送会红） |
+| CON-017 | **热重载令牌：两条路径同源判据 + 先清后发**：`Invoke-ScrollJs` 判「有没有令牌」必须走 `Get-ReloadToken > 0`（和 `/state.js` 同源），不许用 `Test-Path page-reload.txt`（空文件也算"有"）；且必须先清令牌、确认清掉再下发，清不掉这一轮不发（否则 40ms 一轮无限重插 `dsh.js`）；发完 `Cache-Drop` 掉 reload 缓存。活体验证：空令牌 0 次下发、真令牌只 1 次（2026-11-07 实测空文件也会触发软重载） |
+| CON-018 | **图标启动：带参快捷方式也必须走代理/队列**：`LaunchItem` 不许再按 `args = ""` 分流（带参 .lnk 会绕过代理直跑，AHK 祖先让鹰角启动器弹 `Load launcher failed, module init error`）；顺序必须是「代理 → 启动队列 → 直连兜底」（2026-11-08 明日方舟：终末地 `--game=Endfield --reason=4` 点一次弹一次） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -124,7 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 |---|---|
 | RUN-001 | 抽屉 / 代理 / 看门狗 / Lively 存活，且抽屉只有 1 个实例 |
 | RUN-002 | `drawer.pid` 等 pid 文件与实际进程一致 |
-| RUN-003 | 心跳 ≤45s **且空闲也前进**（历史事故：只在有请求时刷 → 被看门狗误杀） |
+| RUN-003 | 心跳 ≤45s **且空闲也前进**（历史事故：只在有请求时刷 → 被看门狗误杀）；采样最多 3 次 × 800ms，三次都不动才红（单次 1.3s 会因整机瞬时抢占假红，2026-11-07 实测一次） |
 | RUN-004 | 4 个数据接口 200 且 **<200ms**（单线程代理的连坐红线） |
 | RUN-005 | `/state.js` 10 个字段齐全（含 `sig/err/reload/dbg`） |
 | RUN-006 | `state.lines` 是可渲染字符串数组（防空 `System.Object[]`） |
@@ -136,19 +138,21 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子；hwnd 文件比日志新且不到 30 秒时降级 `warn`（抽屉刚 announce、桥还没到下一个 5 秒 tick） |
 | RUN-013 | **`/log.js` 会话正文通道**：`window.__DSH_LOG="…"` 前缀、≤60000 字符（超了单线程代理会排队）、`Content-Type` 是 `application/javascript`；日志为空时 `sig` 尚未生成属正常 |
 
-### 50-resilience · 健壮性与容量（10 条）
+### 50-resilience · 健壮性与容量（12 条）
 | 编号 | 查什么 |
 |---|---|
 | RES-001 | `wheel.log` / `dsh-run.log` **有 256KB 轮转**（查写入方代码里的阈值 + `FileMove`/`Move-Item` 改名，不只看尺寸）+ 未超 1MB |
 | RES-002 | 有上限的 4 份日志未超限 |
 | RES-003 | 安装目录 `.bak` 堆积情况（`layout.bak`/`hidden.bak` 是 `--selftest` 的功能文件，不算堆积） |
 | RES-004 | `launch-queue.txt` 无残留（有残留=点了图标没反应） |
-| RES-005 | 数据落盘用 tmp + 原子覆盖（hw / wx / layout 三处） |
+| RES-005 | 数据落盘用 tmp + 原子覆盖（hw / wx / 代理侧 todo、todo-data、dock 共六处） |
 | RES-006 | `panel-rect.txt` 是 4 个 0..10000 的整数 |
 | RES-007 | 看门狗没有"10 分钟内 ≥3 次"的重启风暴；**且最近一次重启在 60 分钟内才算"仍在风暴中"**（几小时前调试留下的旧风暴判为已恢复，数字仍写进 detail） |
 | RES-008 | `start-all.log` **最近一轮**走到 `done`、无 `STILL DOWN`。按 `start: appDir=` 切轮次，不拿末尾 N 行一刀切（一轮只写 4~6 行，40 行窗口里能躺 8 轮，一次失败会连着红七八轮）；最新一轮若还在跑（无 `done` 且 ≤120 秒）先跳过、判上一轮；**没 `done` 又超过 120 秒 = 卡住了**（2026-11-05 `start-all.vbs` 漏 `Dim`，wscript 弹不可见模态框，日志停在中途、计划任务一直 `Running`，旧判据只会报 `STILL DOWN` 或干脆看不出来） |
 | RES-009 | `hw-data.js` ≤15s、`wx-data.js` ≤330s 在更新 |
 | RES-010 | `scroll.dat` 有上限：写入方超 64KB 截断（`$script:SCROLL_MAX`）、读取方超 1MB 兜底；否则消费方一停就只增不减，而 `Take-Scroll` 是整份 `ReadAllText`，会拖死单线程代理 |
+| RES-011 | **启动队列「删掉才算消费」**：`agent-watch.ps1`（1s 一轮）与 `ensure-all.ps1`（2min 一轮）消费 `launch-queue.txt` 时不许再用 `Remove-Item -Force -ErrorAction SilentlyContinue`（两处的错误偏好都是静默，删失败不抛也不记 → 队列留着 → 下一次 tick 把同一批路径**再启动一遍**）；必须有 `File::Delete` + `Test-Path` 复核 + `$consumed` 闸，且启动循环在闸内（2026-11-08 修） |
+| RES-012 | **信标落盘也原子替换**：`Invoke-RectGif` / `Invoke-SummonGif` 必须 tmp + `Move-Item -Force` 覆盖 `panel-rect.txt` / `summon.cmd`。AHK 每 400ms 读这两个文件，而 `SummonTick` **读完无论读成什么都会删文件** —— 直写时「存在但为空」的那一瞬就等于命令被静默吞掉；另带一条活体并发探针（连打 `/rect.gif` 的幂等值 30 轮 × 每轮读 6 次，读到空/字段不足 4 个即失败） |
 
 ### 60-data · 数据完整性（7 条）
 | 编号 | 查什么 |
@@ -161,7 +165,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 
-合计 63 条。
+合计 66 条。
 
 ---
 
@@ -204,5 +208,6 @@ Test-Case XXX-002 '分类' '需要人工判断的' low {
 - **STA-005 / STA-009 在"故意只改源工程、还没部署"时会红**：这是设计意图，不是误报 —— 那正是最容易骗人的状态。
 - **SEC-003 会在 `audit.log` 留一行 `SELFTEST-INJECT`**：这是探针本身，`grep -v SELFTEST` 可以滤掉。
 - **RUN-011 会往 `wheel.log` 追加一行 `diag:`**，并临时创建/由抽屉删除 `summon.cmd`。`diag` 只写快照不弹窗，但确实会改一个运行时文件；不想要它就 `-Case` 排除。
+- **RES-012 会重写一次 `panel-rect.txt`**：它把文件里当前的四个数原样再打一遍 `/rect.gif`（幂等、不改实际矩形），只为制造写入压力看会不会读到半截。壁纸页每 4 秒也会重报同一个值，不想要它就 `-Case` 排除。
 - **AHK 不能靠 `/validate` 证明没问题**：本机 `AutoHotkey64.exe /validate <script>` 返回 exit=0 且无任何输出（既不是 Syntax OK，也不是失败），所以别把它当验收。 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征；**改完仍要重启抽屉看 `wheel.log` / `audit.log` 里动作对不对**。`RUN-011` 只能证明"主循环还在转"。滚轮判定层可脚本化验证：`summon.cmd` 写 `classify=<hwnd>`，壁纸页 WebView2 的 RenderWidgetHost 应回 `desk=1`（root=Progman），Chrome 的应回 `desk=0`。
 - **`schtasks` 被拉黑**：所以测试不验证计划任务是否注册（那是 `verify.ps1` 用 `Get-ScheduledTask` 查的，走的是 COM 不是 exe）。

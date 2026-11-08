@@ -76,14 +76,26 @@ Test-Case RUN-003 '运行时' '代理心跳新鲜且空闲也刷新' high {
 
     # 空闲刷新是历史事故点：早期实现只在"有请求"时刷心跳，代理一空闲就被看门狗判死，
     # 每 50 秒被杀一次，用户看到的是"点应用卡住、提示等待队列"。
+    # 采样窗口：单次 1.3 秒太紧 —— 整机被别的用例拉隔离实例（PowerShell 启动 + 绑端口）抢一下 CPU，
+    # 单线程代理的 250ms 循环就可能错过一个整秒，于是这条高危用例偶发假红（2026-11-07 02:19 实测一次，
+    # 同一分钟连跑 5 次全绿）。真故障（心跳只在有请求时才刷）三次都会红，所以最多试 3 次、每次 800ms，
+    # 任一次前进即算通过；三次都不动才报，并把三次采样值一起写进消息，便于分清"假红"和"真停"。
     $s1 = (Read-Raw $hb).Trim()
-    Start-Sleep -Milliseconds 1300
-    $s2 = (Read-Raw $hb).Trim()
-
-    if ($s1 -eq $s2) {
-        throw ('空闲 1.3 秒内心跳没有前进（' + $s1 + '）—— 说明心跳仍只在有请求时刷新，看门狗会误杀')
+    $seen = New-Object System.Collections.Generic.List[string]
+    $seen.Add($s1)
+    $moved = $false
+    $s2 = $s1
+    for ($i = 0; $i -lt 3; $i++) {
+        Start-Sleep -Milliseconds 800
+        $s2 = (Read-Raw $hb).Trim()
+        if ($s2 -ne $s1) { $moved = $true; break }
+        $seen.Add($s2)
     }
-    ('心跳 ' + [int]$age + ' 秒前；空闲 1.3s 内从 ' + $s1.Substring(11) + ' 前进到 ' + $s2.Substring(11))
+
+    if (-not $moved) {
+        throw ('空闲 2.4 秒内心跳一次都没前进（连续采样：' + ($seen -join ' / ') + '）—— 说明心跳仍只在有请求时刷新，看门狗会误杀')
+    }
+    ('心跳 ' + [int]$age + ' 秒前；空闲期间从 ' + $s1.Substring(11) + ' 前进到 ' + $s2.Substring(11))
 } -Hint '主循环必须用 GetContextAsync + 250ms 超时刷心跳，不能裸 GetContext()'
 
 Test-Case RUN-004 '运行时' '四个数据接口可达且不踩延迟红线' high {

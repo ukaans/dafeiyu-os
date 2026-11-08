@@ -306,3 +306,99 @@ Test-Case RES-010 '健壮' '滚轮意图队列有上限' medium {
     if ($sz -gt 1MB) { throw ('scroll.dat 已达 ' + (Res-KB $sz) + '，超过 1MB 兜底阈值') }
     ('写入方 64KB 截断 + 读取方 1MB 兜底都在；scroll.dat ' + $szTxt)
 } -Hint 'scroll.dat 是瞬时意图队列，旧意图无重放价值；超限直接丢弃，别为了几条过期滚动拖慢整条单线程'
+
+Test-Case RES-011 '健壮' '启动队列：删掉才算消费（否则会重复启动）' medium {
+    # launch-queue.txt 是「抽屉点图标 → 代理没在 → 写一行 → 看门狗/巡检代跑」的一次性队列。
+    # 原来的消费方都是 Remove-Item -Force -ErrorAction SilentlyContinue：
+    #   agent-watch.ps1 的 $ErrorActionPreference 是 SilentlyContinue、ensure-all.ps1 干脆没设（默认 Continue），
+    #   所以「删失败」既抛不出来也不记日志 —— 队列文件还在，下一次 tick 把同一批路径再启动一遍。
+    # 看门狗是 1 秒一轮：AHK 正开着句柄追加（FileAppend）的那一瞬就能让程序被连开好几次；
+    # 若被策略长期拦住，则是永远重复启动。所以判据是「先证明消费掉了，再启动」。
+    $root = Get-DshRoot
+    $bad = @()
+    foreach ($f in @('drawer\agent-watch.ps1', 'drawer\ensure-all.ps1')) {
+        $src = Read-Raw (Join-Path $root $f)
+        $name = Split-Path $f -Leaf
+        if ($src -match 'Remove-Item\s+\$queueFile') {
+            $bad += ($name + ' 仍在用 Remove-Item 消费队列（失败时静默，队列留着会被反复重放）')
+        }
+        if ($src -notmatch '\[System\.IO\.File\]::Delete\(\$queueFile\)') {
+            $bad += ($name + ' 没有主动删除队列')
+        }
+        if ($src -notmatch 'Test-Path\s+\$queueFile') {
+            $bad += ($name + ' 删完不复核（删没删掉都不知道）')
+        }
+        if ($src -notmatch '\$consumed') {
+            $bad += ($name + ' 没有 $consumed 消费闸')
+        }
+        if (($src -notmatch 'if\s*\(\s*-not\s+\$consumed\s*\)') -and ($src -notmatch '\$\(if\s*\(\s*\$consumed\s*\)')) {
+            $bad += ($name + ' 的启动循环没被消费闸挡住')
+        }
+    }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    $q = Join-Path (Get-DshInstall) 'launch-queue.txt'
+    if (Test-Path -LiteralPath $q) {
+        $sz = (Get-Item -LiteralPath $q).Length
+        return @{ Status = 'warn'; Detail = ('静态判据齐全，但队列当前有 ' + $sz + 'B 残留（RES-004 会单独判）') }
+    }
+    'watch / ensure 两处都是「删掉才算消费，消费不了这一轮不启动」；当前无残留'
+} -Hint '消费型文件（队列 / 触发文件）不能用「静默删除 + 照旧执行」：删除失败时动作会被反复重放'
+
+Test-Case RES-012 '健壮' '信标落盘也原子替换（panel-rect / summon.cmd）' medium {
+    # 这两个文件都是「代理写、另一进程每 400ms 读」的高频小文件：
+    #   panel-rect.txt → AHK PanelRect()（读到空/半个就掉进兜底矩形，滚轮落点错）
+    #   summon.cmd     → AHK SummonTick()（**读完无论读成什么都会删文件**，读到空 = 命令被静默吞掉）
+    # 直接 WriteAllText 是「先截断成 0 字节、再补齐」；改名替换没有这个中间态。
+    $root = Get-DshRoot
+    $inst = Get-DshInstall
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $body = {
+        param($code, $fn)
+        $i = $code.IndexOf('function ' + $fn)
+        if ($i -lt 0) { return '' }
+        $j = $code.IndexOf("`nfunction ", $i + 1)
+        if ($j -lt 0) { $j = $code.Length }
+        return $code.Substring($i, $j - $i)
+    }
+    $rect = & $body $agent 'Invoke-RectGif'
+    $sum = & $body $agent 'Invoke-SummonGif'
+    $bad = @()
+
+    if (-not $rect) { $bad += '找不到 Invoke-RectGif' }
+    else {
+        if ($rect -match 'WriteAllText\(\s*\$rectFile') { $bad += 'Invoke-RectGif 仍直写 panel-rect.txt' }
+        if ($rect -notmatch '\$rt\b') { $bad += 'Invoke-RectGif 没有 tmp 变量' }
+        if ($rect -notmatch 'Move-Item[^\r\n]*-Destination\s+\$rectFile[^\r\n]*-Force') { $bad += 'Invoke-RectGif 没有把 tmp 原子覆盖到 panel-rect.txt' }
+    }
+    if (-not $sum) { $bad += '找不到 Invoke-SummonGif' }
+    else {
+        if ($sum -match 'WriteAllText\(\(Join-Path \$appDir ''summon\.cmd''\)') { $bad += 'Invoke-SummonGif 仍直写 summon.cmd' }
+        if ($sum -notmatch '\$st\b') { $bad += 'Invoke-SummonGif 没有 tmp 变量' }
+        if ($sum -notmatch 'Move-Item[^\r\n]*-Destination\s+\$sf[^\r\n]*-Force') { $bad += 'Invoke-SummonGif 没有把 tmp 原子覆盖到 summon.cmd' }
+    }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体探针：一边连打 /rect.gif（内容取文件当前值，幂等、不改实际矩形），一边高频读文件；
+    # 读到「空 / 字段不足 4 个」就说明还有保留直写的路径。
+    $rp = Join-Path $inst 'panel-rect.txt'
+    $samples = 0
+    $badReads = 0
+    if (Test-Path -LiteralPath $rp) {
+        $parts = @(((Read-Raw $rp).Trim()) -split '\s+' | Where-Object { $_ -ne '' })
+        if ($parts.Count -eq 4) {
+            $qs = '/rect.gif?x=' + $parts[0] + '&y=' + $parts[1] + '&w=' + $parts[2] + '&h=' + $parts[3]
+            for ($i = 0; $i -lt 30; $i++) {
+                [void](Invoke-DshHttp -Path $qs -TimeoutMs 2000)
+                for ($k = 0; $k -lt 6; $k++) {
+                    $t = ''
+                    try { $t = [System.IO.File]::ReadAllText($rp) } catch { continue }
+                    $samples++
+                    $pp = @($t.Trim() -split '\s+' | Where-Object { $_ -ne '' })
+                    if ($pp.Count -ne 4) { $badReads++ }
+                }
+            }
+        }
+    }
+    if ($badReads -gt 0) { throw ('并发采样 ' + $samples + ' 次，有 ' + $badReads + ' 次读到空/不完整 —— 仍有非原子写路径') }
+    ('两处都是 tmp + 原子覆盖；并发采样 ' + $samples + ' 次未读到空/不完整')
+} -Hint '改名替换（Move-Item -Force / FileMove）不会出现「存在但为空」；改不动就这一轮不写，别退回直写'

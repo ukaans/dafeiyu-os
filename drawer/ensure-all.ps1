@@ -192,8 +192,20 @@ $queueFile = Join-Path $appDir 'launch-queue.txt'
 if (Test-Path $queueFile) {
     $qlines = @()
     try { $qlines = [System.IO.File]::ReadAllLines($queueFile) } catch { }
-    try { Remove-Item $queueFile -Force -ErrorAction SilentlyContinue } catch { }
-    foreach ($ln in $qlines) {
+    # 同 agent-watch.ps1：删掉才算消费。本脚本没有设 $ErrorActionPreference（默认 Continue），
+    # 所以 Remove-Item -ErrorAction SilentlyContinue 失败时既抛不出去也不记日志 ——
+    # 队列文件留着，下一轮（2 分钟后）把同一批路径再启动一遍。
+    $consumed = $false
+    try { [System.IO.File]::Delete($queueFile) } catch { }
+    if (-not (Test-Path $queueFile)) {
+        $consumed = $true
+    } else {
+        try { [System.IO.File]::WriteAllText($queueFile, '') } catch { }
+        $left = Get-Item $queueFile -ErrorAction SilentlyContinue
+        if (-not $left -or $left.Length -le 0) { $consumed = $true }
+    }
+    if (-not $consumed) { Log 'ensure: launch queue busy (delete failed), skipped this round' }
+    foreach ($ln in $(if ($consumed) { $qlines } else { @() })) {
         $v = $ln.Trim()
         if ($v -eq '') { continue }
         $ts = 0; $p = $v
