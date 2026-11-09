@@ -105,6 +105,7 @@ Agent-Log "agent: start pid=$PID port=$Port root=$root"
 $auditFile = Join-Path $appDir 'audit.log'
 $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
 $script:auditBytes = 0
+$script:auditWrites = 0                     # 写入计数：每 32 条与真实文件尺寸对齐一次（三端共写，本地累加值只会偏小）
 try { if (Test-Path $auditFile) { $script:auditBytes = (Get-Item $auditFile -ErrorAction SilentlyContinue).Length } } catch { }
 # 动作类路由白名单（哪些路由每请求写一行审计）现在挂在路由表里：
 # 见下方 $script:ROUTES 的 audit 字段。以前这里有一份 $script:auditRoutes 数组，
@@ -118,6 +119,18 @@ function Write-Audit([string]$action, [string]$detail = '', [string]$tag = 'API'
         $line += "`n"
         [System.IO.File]::AppendAllText($auditFile, $line, $script:auditEnc)
         $script:auditBytes += $script:auditEnc.GetByteCount($line)
+        $script:auditWrites++
+        # 三端（AHK / 本代理 / 壁纸页）共写同一个 audit.log，本地累加值永远只会**偏小**
+        # （别人写进去的字节它看不见）。AHK 侧每 32 条 FileGetSize 对齐一次（DesktopPage.ahk 的 AuditLog），
+        # 代理侧原来从启动起只累加自己的字节、从不复查 —— 判据于是与真实尺寸脱钩：
+        #   · 偏小时：自己这辈子都到不了 2MB，轮转形同虚设；
+        #   · 偏大时：别人刚轮转完（文件归 0）它还以为快满，于是「提前轮转」一个很小的文件，
+        #     把上一份真正的 2MB 历史（audit.log.1）覆盖掉。
+        # 这里补上与 AHK 同频的对齐（每 32 条一次真实尺寸，单次 FileInfo.Length ≈ 0.05ms，
+        # 且只落在动作型请求上，不在 /state.js 那种高频轮询里）。
+        if (($script:auditWrites % 32) -eq 0) {
+            try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { }
+        }
         if ($script:auditBytes -gt 2097152) {
             Move-Item -LiteralPath $auditFile -Destination ($auditFile + '.1') -Force -ErrorAction SilentlyContinue
             # 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）

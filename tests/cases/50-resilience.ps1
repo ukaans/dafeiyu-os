@@ -533,3 +533,62 @@ Test-Case RES-014 '健壮' '文件召唤：删掉才算消费（AHK SummonTick�
     if (Test-Path -LiteralPath $sf) { throw 'diag 落了日志，但 summon.cmd 没被消费掉（文件还在）' }
     ('SummonTick 删完复核、删不掉不派发；活体 diag 落地并被消费（diag 行 ' + $before + ' → ' + $after + '）')
 } -Hint 'AHK 侧无法自动校验语法，这条只用静态文本 + 一条真实 diag 兜住「没把正常命令挡掉」'
+
+Test-Case RES-015 '健壮' '审计轮转：三端共写，判据要对齐真实尺寸' medium {
+    # audit.log 是三端共写的（[AHK ] / [API ] / [WEB ]）。实测 2331 行里 1999 行来自抽屉 ≈ 90%，
+    # 代理只占 9%。轮转判据如果只累加「自己写进去的字节」，这个值就和真实尺寸脱钩：
+    #   · 偏小 → 代理这辈子都到不了 2MB，它那段轮转形同虚设；
+    #   · 偏大 → 别人（AHK 每 32 条会 FileGetSize 对齐）刚轮转完、文件归 0，它还以为快满，
+    #            于是「提前轮转」一个很小的文件，把上一份真正的 2MB 历史 audit.log.1 覆盖掉。
+    # AHK 侧一直有「每 32 条与真实尺寸对齐」；代理侧原来只有启动时取一次初值、此后只累加自己的字节。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $i = $agent.IndexOf('function Write-Audit')
+    if ($i -lt 0) { throw '找不到 Write-Audit' }
+    $j = $agent.IndexOf("`nfunction ", $i + 1)
+    if ($j -lt 0) { $j = $agent.Length }
+    $fn = $agent.Substring($i, $j - $i)
+
+    $bad = @()
+    if ($fn -notmatch '\$script:auditWrites') { $bad += 'Write-Audit 没有写入计数（无从判断何时该对齐）' }
+    if ($fn -notmatch '%\s*32') { $bad += 'Write-Audit 没有「每 32 条对齐一次」的节奏' }
+    if ($fn -notmatch '(FileInfo|Get-Item)[\s\S]{0,80}\.Length') { $bad += 'Write-Audit 从不读真实文件尺寸（只累加自己的字节 = 判据脱钩）' }
+
+    # 另一半：AHK 侧的对齐不能被悄悄删掉（否则这条不变式只剩一边，等于没有）
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $ai = $ahk.IndexOf('AuditLog(action, detail')
+    if ($ai -lt 0) { throw '找不到 AHK 的 AuditLog' }
+    $aj = $ahk.IndexOf("`n}", $ai)
+    if ($aj -lt 0) { $aj = $ahk.Length }
+    $afn = $ahk.Substring($ai, $aj - $ai)
+    if ($afn -notmatch 'Mod\(AUDIT_WRITES,\s*32\)') { $bad += 'AHK AuditLog 丢了「每 32 条对齐」' }
+    if ($afn -notmatch 'FileGetSize\(AUDIT_FILE\)') { $bad += 'AHK AuditLog 不再读真实尺寸（FileGetSize）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体（函数级）：把 Write-Audit 取出来在临时目录里跑 —— 不碰真实 audit.log、不占端口。
+    # 造一个「本地计数器远远落后于真实尺寸」的时刻（别人写了 2.2MB，代理以为自己才写了 1KB），
+    # 再补一条自己的写入：对齐过的实现必须当场轮转，没对齐的会让 2.2MB 那份继续躺着。
+    $tmp = Join-Path $env:TEMP ('dsh_audit_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $r = & {
+            param($src, $dir)
+            $auditFile = Join-Path $dir 'audit.log'
+            $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
+            $script:auditWrites = 31          # 下一条正好是第 32 条 → 触发对齐
+            $script:auditBytes = 1000         # 陈旧值：只算自己的字节
+            [System.IO.File]::WriteAllText($auditFile, ('x' * 2200000), (New-Object System.Text.UTF8Encoding($false)))
+            . ([scriptblock]::Create($src))
+            Write-Audit 'test' 'k=v'
+            return [pscustomobject]@{
+                Size   = (Get-Item -LiteralPath $auditFile).Length
+                Rotated = Test-Path -LiteralPath ($auditFile + '.1')
+            }
+        } $fn $tmp
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+    if (-not $r.Rotated) { throw ('真实尺寸 2.2MB 超过 2MB 上限却没轮转（audit.log 仍有 ' + $r.Size + ' 字节）—— 判据只认自己的累加值') }
+    if ($r.Size -ne 0) { throw ('轮转后 audit.log 应为空文件，实际 ' + $r.Size + ' 字节') }
+    '两端都按真实尺寸对齐（每 32 条）；活体：陈旧计数器遇上 2.2MB 文件仍当场轮转'
+} -Hint '三端共写的文件，任何一端的轮转判据都必须定期回到「真实文件尺寸」，只累加自己写的字节早晚会脱钩'
