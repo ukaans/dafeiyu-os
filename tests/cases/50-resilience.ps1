@@ -592,3 +592,90 @@ Test-Case RES-015 '健壮' '审计轮转：三端共写，判据要对齐真实�
     if ($r.Size -ne 0) { throw ('轮转后 audit.log 应为空文件，实际 ' + $r.Size + ' 字节') }
     '两端都按真实尺寸对齐（每 32 条）；活体：陈旧计数器遇上 2.2MB 文件仍当场轮转'
 } -Hint '三端共写的文件，任何一端的轮转判据都必须定期回到「真实文件尺寸」，只累加自己写的字节早晚会脱钩'
+
+Test-Case RES-016 '健壮' '日志轮转：改名失败不许截空（历史不能和它唯一的备份一起丢）' medium {
+    # 轮转是「改名 → 截空」两步，老写法两步之间没有依赖：
+    #   Move-Item … -ErrorAction SilentlyContinue    ← 失败不抛、不记、不管
+    #   WriteAllText($log, '')                       ← 照样执行
+    # 于是改名失败时（AHK 正持有句柄追加 audit.log / 有人把 audit.log.1 开着看 /
+    # 上一轮 dsh 还活着、cmd 的 >> 句柄占着 dsh-run.log / 杀软在扫）整份历史被抹成
+    # 0 字节，而 .1 里还是上一代的内容 —— 恰好在最需要这份日志的时刻丢证据，
+    # 而且 dsh-agent.log、audit.log、verify.ps1 三处都不会留下任何痕迹。
+    # 实测：audit.log 2680000 字节 → 0，.1 仍是 15 字节的上一代。
+    # 不变式：**改名成功才许截空**；没轮转成要把计数器拉回真实尺寸并留痕（下次再试）。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $bad = @()
+
+    # ---- 静态一：audit.log ----
+    $i = $agent.IndexOf('function Write-Audit')
+    if ($i -lt 0) { throw '找不到 Write-Audit' }
+    $j = $agent.IndexOf("`nfunction ", $i + 1); if ($j -lt 0) { $j = $agent.Length }
+    $fn = $agent.Substring($i, $j - $i)
+    $ri = $fn.IndexOf('if ($script:auditBytes -gt 2097152)')
+    if ($ri -lt 0) { throw 'Write-Audit 里找不到 2MB 轮转分支' }
+    # 只看代码：注释里会原样引用旧写法（"Move-Item … SilentlyContinue / WriteAllText(…)"），
+    # 不剥掉就会被自己的注释判成还没改（本轮踩过一次，RES-014 也踩过同型的坑）。
+    $rot = ((($fn.Substring($ri)) -split "`n") | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+    if ($rot -match 'Move-Item[^\r\n]*-ErrorAction\s+SilentlyContinue') { $bad += 'audit.log 轮转仍是「静默改名」（-ErrorAction SilentlyContinue），失败无从观察' }
+    $trunc = $rot.IndexOf('WriteAllText($auditFile')
+    $guard = $rot.IndexOf('if ($moved')
+    if ($trunc -lt 0) { $bad += 'Write-Audit 的轮转分支里找不到截空（WriteAllText($auditFile）' }
+    if ($guard -lt 0) { $bad += 'audit.log 轮转没有「改名成功」的闸（截空与改名之间无依赖）' }
+    elseif ($guard -gt $trunc) { $bad += 'audit.log 的截空写在闸之前（改名失败照样截空 = 历史归零）' }
+    if ($rot -notmatch 'Agent-Log') { $bad += 'audit.log 轮转失败不留痕（失败必须写一行 dsh-agent.log，否则又是静默失败）' }
+    if ($rot -notmatch '(FileInfo|Get-Item)[\s\S]{0,80}\.Length') { $bad += 'audit.log 轮转失败后没把计数器拉回真实尺寸（下次一写就判空）' }
+
+    # ---- 静态二：dsh-run.log / dsh-run.err.log ----
+    $si = $agent.IndexOf('function Start-Run')
+    if ($si -lt 0) { throw '找不到 Start-Run' }
+    $sj = $agent.IndexOf("`nfunction ", $si + 1); if ($sj -lt 0) { $sj = $agent.Length }
+    $srun = ((($agent.Substring($si, $sj - $si)) -split "`n") | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+    if ($srun -match 'Move-Item[^\r\n]*-ErrorAction\s+SilentlyContinue') { $bad += 'dsh-run.log 轮转仍是「静默改名」，上一轮 cmd 的 >> 句柄占着时失败照样截空' }
+    $st = $srun.IndexOf('WriteAllText($f')
+    $sg = $srun.IndexOf('if ($rotOk')
+    if ($st -ge 0 -and ($sg -lt 0 -or $sg -gt $st)) { $bad += 'dsh-run.log 的截空没有「改名成功」的闸（$rotOk）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # ---- 活体（函数级）：把 Write-Audit 取到临时目录里跑，不碰真实 audit.log、不占端口 ----
+    # A 段：有人正开着 .1（只读句柄）→ 改名必然失败 → audit.log 必须原样留着
+    # B 段：放开句柄再写一条 → 必须真的轮转（说明失败后还会重试）
+    $tmp = Join-Path $env:TEMP ('dsh_rot_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $r = & {
+            param($src, $dir)
+            $auditFile = Join-Path $dir 'audit.log'
+            $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
+            $script:auditWrites = 32          # 这一条正好触发「与真实尺寸对齐」
+            $script:auditBytes = 3000000      # 已超 2MB 上限
+            $script:auditRotSkipAt = [long]0
+            $enc = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($auditFile, ('y' * 2680000), $enc)
+            $bak = $auditFile + '.1'
+            [System.IO.File]::WriteAllText($bak, 'OLD-GENERATION', $enc)
+            $bakBefore = (Get-Item -LiteralPath $bak).Length
+            . ([scriptblock]::Create($src))
+            $lock = [System.IO.File]::Open($bak, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            try { Write-Audit 'probe' 'k=1' } catch { }
+            $kept = (Get-Item -LiteralPath $auditFile).Length
+            $bakKept = (Get-Item -LiteralPath $bak).Length
+            $lock.Dispose()
+            Write-Audit 'probe' 'k=2'
+            return [pscustomobject]@{
+                Kept      = $kept
+                BakKept   = $bakKept
+                BakBefore = $bakBefore
+                Size      = (Get-Item -LiteralPath $auditFile).Length
+                Bak       = (Get-Item -LiteralPath $bak).Length
+            }
+        } $fn $tmp
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+    if ($r.Kept -lt 2680000) { throw ('改名失败时 audit.log 被截空了（' + $r.Kept + ' 字节，2.68MB 历史归零）—— 轮转两步之间没有依赖') }
+    if ($r.BakKept -ne $r.BakBefore) { throw ('改名失败时 .1 也被动了（' + $r.BakKept + ' 字节，应为 ' + $r.BakBefore + '）') }
+    if ($r.Bak -lt 2600000) { throw ('放开句柄后再写一条仍没轮转（.1 = ' + $r.Bak + ' 字节）—— 失败后不会重试') }
+    if ($r.Size -ne 0) { throw ('轮转后 audit.log 应为空文件，实际 ' + $r.Size + ' 字节') }
+    '两端都是「改名成功才截空」；活体：.1 被占用时 2.68MB 历史原样留着，放开后重试当场轮转'
+} -Hint '轮转是「改名 + 截空」两步，第一步失败时第二步绝不能执行 —— 否则历史与它唯一的备份一起没了，而且哪儿都不报错'

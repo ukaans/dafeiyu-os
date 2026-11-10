@@ -138,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子。**过渡窗口不算故障**：beat 是 60 秒一行、follow 是 5 秒一次 tick，抽屉刚重启时「最后一次 beat 之后已经有 `target: follow hwnd=<当前目标>` 行」直接判过（2026-11-09 修：旧判据只看 30 秒窗口，重启后 30~60 秒那段会直接抛红）；hwnd 文件比日志新且不到 30 秒时降级 `warn` |
 | RUN-013 | **`/log.js` 会话正文通道**：`window.__DSH_LOG="…"` 前缀、≤60000 字符（超了单线程代理会排队）、`Content-Type` 是 `application/javascript`；日志为空时 `sig` 尚未生成属正常 |
 
-### 50-resilience · 健壮性与容量（15 条）
+### 50-resilience · 健壮性与容量（16 条）
 | 编号 | 查什么 |
 |---|---|
 | RES-001 | `wheel.log` / `dsh-run.log` **有 256KB 轮转**（查写入方代码里的阈值 + `FileMove`/`Move-Item` 改名，不只看尺寸）+ 未超 1MB |
@@ -156,6 +156,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-013 | **滚轮意图「读到≠取走」**：`Take-Scroll` 不许「读完就 `File::Delete`、删没删掉不管」，必须有 `$cleared` 闸（删 → `Test-Path` 复核 → 截空复核 → 都不成就这一轮返回 0）。删除失败时（写方持有句柄 / 杀软）旧写法会把同一批意图 40ms 后再交付一次 = 滚一格跳两格。**活体是把 `Take-Scroll` 单独取出来在临时目录里跑**（不碰真实 `scroll.dat`、不占端口）：正常路径取走 4 → 占住句柄后两轮都必须是 0 → 放开后恰好交付一次 5 |
 | RES-014 | **文件召唤「删掉才算消费」**（AHK 侧）：`SummonTick` 必须在 `FileDelete(SUMMON_FILE)` 之后、派发之前有一道「文件还在就 `return`」。旧写法删失败也照样派发 → 同一条命令每 400ms 重放（`foldertest=` 反复弹窗、`log=N` 反复导出）。判据只认「FileDelete 之后紧跟 FileExist→return」——函数头的 `if !FileExist(SUMMON_FILE) return` 和 `if (cmd = "") return` 都会让弱判据永远为绿；活体走文件通道写一条 `diag` 证明没把正常命令挡掉 |
 | RES-015 | **审计轮转判据要对齐真实尺寸**：`audit.log` 是 `[AHK ]`/`[API ]`/`[WEB ]` 三端共写（实测 2331 行里 1999 行来自抽屉 ≈ 90%），只累加「自己写进去的字节」会与真实尺寸脱钩 —— 偏小则代理那段轮转形同虚设，偏大则在别人刚轮转完时「提前轮转」一个小文件、把上一份真历史 `audit.log.1` 覆盖掉。要求代理侧 `Write-Audit` 每 32 条回到 `FileInfo.Length`，AHK 侧 `AuditLog` 的 `Mod(AUDIT_WRITES, 32)` + `FileGetSize` 不许被删；活体：把 `Write-Audit` 取到临时目录、造「计数器 1KB / 真实 2.2MB」，补一条写入必须当场轮转（2026-11-10 修） |
+| RES-016 | **轮转是两步，改名失败不许截空**：老写法 `Move-Item … -ErrorAction SilentlyContinue` 之后无条件 `WriteAllText($log,'')` —— 改名失败（AHK 正持有句柄追加 / 有人开着 `audit.log.1` / 上一轮 dsh 的 `>>` 占着 `dsh-run.log`）时整份历史被抹成 0 字节，而 `.1` 还是上一代内容，**历史与它唯一的备份一起没了**，且哪儿都不报错。要求 `audit.log` 与 `dsh-run.log` 两处都「改名成功才许截空」，失败要把计数器拉回真实尺寸并写一行 `dsh-agent.log`；静态只看代码（剥注释，注释里引用了旧写法）；活体：`.1` 被只读句柄占住时 2.68MB 原样留着，放开句柄再写一条必须当场轮转（2026-11-11 修） |
 
 ### 60-data · 数据完整性（8 条）
 | 编号 | 查什么 |
@@ -169,7 +170,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 
-合计 71 条。
+合计 72 条。
 
 ---
 
@@ -214,7 +215,7 @@ Test-Case XXX-002 '分类' '需要人工判断的' low {
 - **RUN-011 会往 `wheel.log` 追加一行 `diag:`**，并临时创建/由抽屉删除 `summon.cmd`。`diag` 只写快照不弹窗，但确实会改一个运行时文件；不想要它就 `-Case` 排除。
 - **RES-012 会重写一次 `panel-rect.txt`**：它把文件里当前的四个数原样再打一遍 `/rect.gif`（幂等、不改实际矩形），只为制造写入压力看会不会读到半截。壁纸页每 4 秒也会重报同一个值，不想要它就 `-Case` 排除。
 - **RES-014 会往 `wheel.log` 追加一行 `diag:`**（与 RUN-011 同类，走文件通道写 `summon.cmd=diag`）。
-- **RES-015 / DAT-008 各会写一份临时目录**（`%TEMP%\dsh_audit_*` / `dsh_todo_*`）：前者把 `Write-Audit` 取出来跑一次轮转，后者只读真实 `todo-data.js`；跑完自己删目录，**不碰真实 `audit.log`**。
+- **RES-015 / DAT-008 / RES-016 各会写一份临时目录**（`%TEMP%\dsh_audit_*` / `dsh_todo_*` / `dsh_rot_*`）：`RES-015` 把 `Write-Audit` 取出来跑一次轮转，`DAT-008` 只读真实 `todo-data.js`，`RES-016` 先把 `.1` 用只读句柄占住再造一次「改名失败」；跑完自己删目录，**不碰真实 `audit.log`**。
 - **用例里绝对不要用 `/summon.gif` 造测试数据**：那条路由只认 `d=1|hide`，其余一切（包括 `d=diag`）都会写成 `show` —— 深夜跑测试会把抽屉弹到用户脸上（2026-11-09 踩过，改成直接写 `summon.cmd` 文件）。
 - **AHK 不能靠 `/validate` 证明没问题**：本机 `AutoHotkey64.exe /validate <script>` 返回 exit=0 且无任何输出（既不是 Syntax OK，也不是失败），所以别把它当验收。 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征；**改完仍要重启抽屉看 `wheel.log` / `audit.log` 里动作对不对**。`RUN-011` 只能证明"主循环还在转"。滚轮判定层可脚本化验证：`summon.cmd` 写 `classify=<hwnd>`，壁纸页 WebView2 的 RenderWidgetHost 应回 `desk=1`（root=Progman），Chrome 的应回 `desk=0`。
 - **`schtasks` 被拉黑**：所以测试不验证计划任务是否注册（那是 `verify.ps1` 用 `Get-ScheduledTask` 查的，走的是 COM 不是 exe）。

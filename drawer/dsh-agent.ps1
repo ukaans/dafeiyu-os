@@ -102,10 +102,13 @@ Agent-Log "agent: start pid=$PID port=$Port root=$root"
 #   3) 高频只读接口（/state.js /scroll.js /dock.js /media.js /rect.gif）一律不写，
 #      否则 80ms~1.5s 一条会把 2MB 的审计文件撑爆并拖慢单线程；
 #   4) 轮转只保留一份历史：>2MB 用 Move-Item -Force 改名 audit.log.1（不用 Remove-Item）。
+#      轮转是「改名 + 截空」两步，**改名成功才许截空**：改名失败（AHK 正在追加、.1 被人
+#      打开着、杀软在扫）时截空等于把 2MB 历史和它唯一的备份一起抹掉，而日志上什么都没有。
 $auditFile = Join-Path $appDir 'audit.log'
 $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
 $script:auditBytes = 0
 $script:auditWrites = 0                     # 写入计数：每 32 条与真实文件尺寸对齐一次（三端共写，本地累加值只会偏小）
+$script:auditRotSkipAt = [long]0            # 轮转失败日志的限流时间戳（60 秒一条，别在动作型请求里刷屏）
 try { if (Test-Path $auditFile) { $script:auditBytes = (Get-Item $auditFile -ErrorAction SilentlyContinue).Length } } catch { }
 # 动作类路由白名单（哪些路由每请求写一行审计）现在挂在路由表里：
 # 见下方 $script:ROUTES 的 audit 字段。以前这里有一份 $script:auditRoutes 数组，
@@ -132,10 +135,35 @@ function Write-Audit([string]$action, [string]$detail = '', [string]$tag = 'API'
             try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { }
         }
         if ($script:auditBytes -gt 2097152) {
-            Move-Item -LiteralPath $auditFile -Destination ($auditFile + '.1') -Force -ErrorAction SilentlyContinue
-            # 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）
-            try { [System.IO.File]::WriteAllText($auditFile, '', $script:auditEnc) } catch { }
-            $script:auditBytes = 0
+            # 轮转是两步：①改名成 .1 ②建一个空文件。老写法是
+            #   Move-Item … -ErrorAction SilentlyContinue   ← 失败不抛、不记、不管
+            #   WriteAllText($auditFile, '')                ← 照样执行
+            # 于是第一步失败（AHK 正持有句柄追加 / 有人把 audit.log.1 开着看 / 杀软扫描）
+            # 时第二步把整份 2MB 历史当场抹成 0 字节，而 .1 里还是上一代的内容 ——
+            # 恰好在"刚出过事、最需要这份日志"的时刻丢证据，且三处日志（dsh-agent.log /
+            # audit.log / verify）都不会记录这次失败。改成「改名成功才许截空」：
+            # 没轮转成就原样留着，把计数器拉回真实尺寸，下一次写入再试（失败日志 60 秒限流）。
+            $rotBak = $auditFile + '.1'
+            $moved = $false
+            try {
+                Move-Item -LiteralPath $auditFile -Destination $rotBak -Force -ErrorAction Stop
+                $moved = -not (Test-Path -LiteralPath $auditFile)
+            } catch { $moved = $false }
+            if ($moved) {
+                # 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）
+                try { [System.IO.File]::WriteAllText($auditFile, '', $script:auditEnc) } catch { }
+                $script:auditBytes = 0
+            } else {
+                try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { $script:auditBytes = 0 }
+                try {
+                    $n64 = [long]$script:clock.ElapsedMilliseconds
+                    # 0 = 还没记过（第一轮必须留下证据，否则又变回"静默失败"）；之后 60 秒一条
+                    if (($script:auditRotSkipAt -eq 0) -or (($n64 - $script:auditRotSkipAt) -gt 60000)) {
+                        $script:auditRotSkipAt = $n64
+                        Agent-Log ('audit: rotate skipped (rename failed), size=' + $script:auditBytes)
+                    }
+                } catch { }
+            }
         }
     } catch { }
 }
@@ -583,8 +611,18 @@ function Start-Run([string]$text) {
     try {
         foreach ($f in @($logFile, $errFile)) {
             if ((Test-Path $f) -and ((Get-Item $f -ErrorAction SilentlyContinue).Length -gt 262144)) {
-                Move-Item -LiteralPath $f -Destination ($f + '.1') -Force -ErrorAction SilentlyContinue
-                [System.IO.File]::WriteAllText($f, '', (New-Object System.Text.UTF8Encoding($false)))
+                # 同样「改名成功才许截空」：上一轮 dsh 还活着时它的 >> 句柄占着这个文件，
+                # 改名会失败 —— 老写法接着截空，等于把上一整轮会话正文抹掉（面板上"历史突然没了"）。
+                $rotOk = $false
+                try {
+                    Move-Item -LiteralPath $f -Destination ($f + '.1') -Force -ErrorAction Stop
+                    $rotOk = -not (Test-Path -LiteralPath $f)
+                } catch { $rotOk = $false }
+                if ($rotOk) {
+                    [System.IO.File]::WriteAllText($f, '', (New-Object System.Text.UTF8Encoding($false)))
+                } else {
+                    Agent-Log ('run: rotate skipped (rename failed) ' + [System.IO.Path]::GetFileName($f))
+                }
             }
         }
         # 新一轮开始先清掉上一轮的错误：否则面板会一直挂着旧报错
