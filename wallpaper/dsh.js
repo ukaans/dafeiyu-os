@@ -155,6 +155,11 @@ function dshInit() {
       if (settingsOpen()) {
         // 设置面板铺满整屏：告诉抽屉程序「这块归控制台」，滚轮就不会弹出图标抽屉
         q = 'x=0&y=0&w=10000&h=10000';
+      } else if (!consoleOn()) {
+        // 控制台被设置项隐藏时，display:none 的 #dshPanel 量出来是 0×0，和「没上报」在
+        // 抽屉那边无法区分。这里显式发零矩形，表示「右侧栏没有控制台」，让滚轮去弹抽屉。
+        // 不要再退回 aside：aside 是右侧导航栏，隐藏控制台后它仍在，会把滚轮继续吞掉。
+        q = 'x=0&y=0&w=0&h=0';
       } else {
         var r = box.getBoundingClientRect();
         if (!r || r.width < 40) r = aside.getBoundingClientRect();
@@ -716,6 +721,7 @@ function dshInit() {
     if (!box) return;
     box.style.display = consoleOn() ? '' : 'none';
     syncNavBtns();   // 隐藏时 scrollHeight 被算成 0，重新显示后要把 ▲▼ 的状态纠正回来
+    reportRect();     // 开关一变就把矩形报出去（lastRect 去重，没变不发请求），别等 4 秒轮询
   }
   syncConsole();
   every(1000, syncConsole);

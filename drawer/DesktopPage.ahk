@@ -489,6 +489,12 @@ AgentLaunch(path) {
         ; Windows 会把钩子静默摘掉，AHK 自己不知道，于是滚轮和 ^!Space 一起失灵。
         req.SetTimeouts(300, 300, 900, 900)
         req.Open("GET", AGENT_BASE "/launchpath.gif?t=" UrlEncodePath(path), false)
+        ; 代理只认两种来源：带本次启动生成的 X-DSH-Token（抽屉），或路径命中
+        ; items.tsv/dock.txt 白名单（壁纸侧 dock 信标）。抽屉能打开文件夹弹窗里的任意文件，
+        ; 单靠白名单会把这些点击挡掉，所以抽屉必须带 token。
+        tk := AgentToken()
+        if (tk != "")
+            req.SetRequestHeader("X-DSH-Token", tk)
         req.Send()
         elapsed := A_TickCount - t0
         LogWrite("launch agent: status=" req.Status " " elapsed "ms " path)
@@ -497,6 +503,17 @@ AgentLaunch(path) {
         LogWrite("launch agent unavailable: " e.Message)
         return false
     }
+}
+
+; 读代理每次启动生成的调用凭证（UTF-8 无 BOM）。读不到就返回空串：
+; 带白名单的 items/dock 路径仍能通过，只有文件夹弹窗里的任意文件会被挡 —— 宁可少开，
+; 也不能让页面凭空拉起任意 exe。
+AgentToken() {
+    global APP_DIR
+    try
+        return Trim(FileRead(APP_DIR . "\agent-token.txt", "UTF-8"))
+    catch
+        return ""
 }
 
 ; UTF-8 百分号编码（代理侧用 Uri::UnescapeDataString 解码，中文路径必须这样传）
@@ -1656,6 +1673,14 @@ PanelRect() {
         parts := StrSplit(line, " ")
         if (parts.Length < 4)
             return [GUI_W - 430, 0, 430, 640]
+        ; w=0 是「控制台已隐藏」的显式信号（壁纸页在面板关掉时上报），不是坏数据。
+        ; 以前零矩形被当成无效值回退到右侧 430px，抽屉就始终认为那块还是控制台，
+        ; 滚轮走 act=console，而页面里已经没有可滚的东西 —— 用户感觉「滚轮没反应」。
+        if (Integer(parts[3]) <= 0) {
+            RECT_CACHE := [0, 0, 0, 0]
+            RECT_STAMP := ts
+            return RECT_CACHE
+        }
         ; 页面用万分比上报（兼容 WebView2 的 CSS 视口缩放）
         RECT_CACHE := [Round(Integer(parts[1]) * GUI_W / 10000)
             , Round(Integer(parts[2]) * GUI_H / 10000)
@@ -1671,6 +1696,9 @@ ConsoleUnderCursor() {
     CoordMode "Mouse", "Screen"
     MouseGetPos(&mx, &my)
     r := PanelRect()
+    ; 零矩形 = 控制台隐藏：右侧栏不归控制台，滚轮照常弹抽屉
+    if (r[3] <= 0 || r[4] <= 0)
+        return false
     ; 上下各放宽 12px，方便贴着边滚
     return (mx >= r[1] - 12 && mx <= r[1] + r[3] + 12 && my >= r[2] - 12 && my <= r[2] + r[4] + 12)
 }

@@ -87,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
 
-### 20-contract · 契约一致性（17 条）
+### 20-contract · 契约一致性（19 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | 代理端口在 9 个文件里一致 |
@@ -108,6 +108,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-016 | **巡检推送有直连兜底**：`Nightly-Check.ps1` 必须有 `Invoke-GitPush`，先按仓库代理推，只有"连不上"类错误（`Failed to connect` 等）才用 `-c http.proxy= -c https.proxy=` 直连重试一次；rejected/凭据错照旧上报（2026-11-06 代理关着时巡检推送会红） |
 | CON-017 | **热重载令牌：两条路径同源判据 + 先清后发**：`Invoke-ScrollJs` 判「有没有令牌」必须走 `Get-ReloadToken > 0`（和 `/state.js` 同源），不许用 `Test-Path page-reload.txt`（空文件也算"有"）；且必须先清令牌、确认清掉再下发，清不掉这一轮不发（否则 40ms 一轮无限重插 `dsh.js`）；发完 `Cache-Drop` 掉 reload 缓存。活体验证：空令牌 0 次下发、真令牌只 1 次（2026-11-07 实测空文件也会触发软重载） |
 | CON-018 | **图标启动：带参快捷方式也必须走代理/队列**：`LaunchItem` 不许再按 `args = ""` 分流（带参 .lnk 会绕过代理直跑，AHK 祖先让鹰角启动器弹 `Load launcher failed, module init error`）；顺序必须是「代理 → 启动队列 → 直连兜底」（2026-11-08 明日方舟：终末地 `--game=Endfield --reason=4` 点一次弹一次） |
+| CON-019 | **rect 零矩形三端约定**：控制台隐藏时 `dsh.js` 必须显式上报 `x=0&y=0&w=0&h=0`（不能再退回 `aside` 兜底 —— `display:none` 的 `getBoundingClientRect()` 也是 0×0，与「没上报」无法区分）；代理 `Invoke-RectGif` 必须接受 `w=0` 并原子写 `0 0 0 0`；AHK `PanelRect` 读到 `w<=0` 必须返回零矩形且 `ConsoleUnderCursor` 判「不在控制台」（否则面板关掉后右侧栏继续吃滚轮，2026-11-11 修） |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -170,7 +171,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 
-合计 72 条。
+合计 73 条。
 
 ---
 

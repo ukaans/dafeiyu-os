@@ -479,3 +479,34 @@ Test-Case CON-018 '契约' '图标启动：带参快捷方式也必须走代理/
     if ($code -notmatch 'AgentLaunch\(path\)') { throw '代理调用消失' }
     '带参快捷方式不再绕过代理：代理 → 队列 → 直连兜底，顺序正确'
 } -Hint '2026-11-08：明日方舟：终末地（--game=Endfield --reason=4）点一次弹一次 module init error；修好后带参 ≠ 直跑'
+
+Test-Case CON-019 '契约' 'rect 零矩形三端约定：隐藏控制台 = 0 0 0 0' high {
+    # 连续三轮的「右侧栏滚轮没反应」：控制台隐藏后页面不再上报（display:none 量出 0×0），
+    # 代理又把 w=0 当坏数据丢掉，AHK 于是永远拿着上一次的矩形，滚轮继续走 act=console。
+    # 约定：页面显式发 0 0 0 0；代理接受并原子落盘；AHK 读到零矩形就判定「不在控制台上」。
+    $root = Get-DshRoot
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    $ps = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $bad = @()
+
+    if ($js -notmatch "'x=0&y=0&w=0&h=0'") { $bad += 'dsh.js 没有「控制台隐藏 → 零矩形」上报分支' }
+    $iOff = $js.IndexOf('else if (!consoleOn())')
+    if ($iOff -ge 0) {
+        $iElse = $js.IndexOf('} else {', $iOff)
+        if ($iElse -gt $iOff) {
+            $seg = $js.Substring($iOff, $iElse - $iOff)
+            if ($seg -match 'aside\.getBoundingClientRect') { $bad += 'dsh.js 的隐藏分支仍退回 aside（右侧导航栏会把滚轮继续吞掉）' }
+        }
+    }
+    if ($js -notmatch 'syncConsole[\s\S]{0,400}reportRect\(\)') { $bad += 'syncConsole 没有在开关变化后立即上报矩形' }
+
+    if ($ps -notmatch '\$rw -le 0') { $bad += '代理没有把负数/零宽归一成零矩形' }
+    if ($ps -notmatch '\$rw -eq 0 -or \$rw -gt 200') { $bad += '代理仍用 w>200 当有效性闸 —— w=0 会被丢掉' }
+
+    if ($ahk -notmatch 'if \(Integer\(parts\[3\]\) <= 0\)') { $bad += 'AHK PanelRect 仍把零矩形当坏数据回退 430px' }
+    if ($ahk -notmatch 'if \(r\[3\] <= 0 \|\| r\[4\] <= 0\)') { $bad += 'AHK ConsoleUnderCursor 没有对零矩形早退' }
+
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    '三端同约定：页面发 0 0 0 0、代理接受、AHK 判「不在控制台」'
+} -Hint '2026-11-11：w=0 连续第三轮挂账；只改一端仍会回退到旧矩形，三端必须同时认这个约定'

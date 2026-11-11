@@ -93,6 +93,21 @@ function Agent-Log([string]$msg) {
 trap { Agent-Log ('FATAL: ' + $_.Exception.Message + ' @line ' + $_.InvocationInfo.ScriptLineNumber); exit 1 }
 Agent-Log "agent: start pid=$PID port=$Port root=$root"
 
+# ===== 本机调用凭证 =====
+# /launchpath.gif 能拉起任意 exe。以前不校验来源：本机任意页面放一个 <img> 就能点火。
+# 现在每次启动生成一个 32 位 hex token，写进 agent-token.txt（UTF-8 无 BOM）：
+#   · 抽屉（AHK）每次启动前读文件、放进 X-DSH-Token 头 —— 它能打开文件夹弹窗里的任意文件，
+#     不能只靠 items/dock 白名单；
+#   · 壁纸侧的 dock 信标（dsh.js）不带 token，靠「路径命中 items.tsv / dock.txt」白名单放行；
+#   · 两者都不中：只回 gif，不启动，并写一行 rejected 审计。
+# 威胁模型是本机页面/进程，不是同权限的恶意程序（同权限进程本来就能读这个文件）。
+$script:launchToken = [Guid]::NewGuid().ToString('N')
+try {
+    [System.IO.File]::WriteAllText((Join-Path $appDir 'agent-token.txt'), $script:launchToken, (New-Object System.Text.UTF8Encoding($false)))
+} catch {
+    Agent-Log ('token: write failed ' + $_.Exception.Message)
+}
+
 # ===== 统一审计日志 =====
 # 三端（AHK / 本代理 / 壁纸页）写同一份 %LOCALAPPDATA%\DesktopPage\audit.log，
 # 靠行内标签 [API ] / [AHK ] / [WEB ] 区分。旁路：任何失败都不影响请求处理。
@@ -1349,8 +1364,43 @@ function Invoke-IconPath($ctx, $query) {
     } else { Write-Raw $ctx $gif 'image/gif' }
 }
 
+function Test-LaunchAllowed([string]$path, [string]$token) {
+    # token 命中 = 抽屉发起的（含文件夹弹窗里的任意文件）；否则只认白名单。
+    if ($token -and ($token -eq $script:launchToken)) { return $true }
+    if (-not $path) { return $false }
+    $full = ''
+    try { $full = [System.IO.Path]::GetFullPath($path) } catch { return $false }
+    foreach ($f in @((Join-Path $appDir 'items.tsv'), (Join-Path $appDir 'dock.txt'))) {
+        try { $lines = [System.IO.File]::ReadAllLines($f, [System.Text.Encoding]::UTF8) } catch { continue }
+        foreach ($line in $lines) {
+            if (-not $line) { continue }
+            $cand = ''
+            if ($f -like '*dock.txt') {
+                $cand = ($line -split '\|')[0]
+            } else {
+                $cols = $line -split "`t"
+                if ($cols.Length -ge 2) { $cand = $cols[1] }
+            }
+            if (-not $cand) { continue }
+            try {
+                if ([System.IO.Path]::GetFullPath($cand.Trim()) -eq $full) { return $true }
+            } catch { }
+        }
+    }
+    return $false
+}
+
 function Invoke-LaunchPath($ctx, $query) {
     $lp = Get-TextParam $query.req
+    $tk = ''
+    try { $tk = [string]$query.req.Headers['X-DSH-Token'] } catch { }
+    if (-not (Test-LaunchAllowed $lp $tk)) {
+        # 先回包，避免调用方（AHK 900ms 超时）误判代理假死；不启动、不写队列。
+        Write-Raw $ctx $gif 'image/gif'
+        Agent-Log ('launchpath rejected: ' + $lp)
+        Write-Audit 'launch' ('path={0} rejected=1 reason=not-allowed' -f (Quote-Audit $lp))
+        return
+    }
     # 先回包再启动：ShellExecute 拉 .vbs/.lnk 偶尔要 6 秒（实测一个 .vbs 6.28 秒），
     # 期间这个单线程请求循环整段停摆，抽屉端 0.9 秒超时后会误判失败并改走启动队列。
     Write-Raw $ctx $gif 'image/gif'
@@ -1529,7 +1579,11 @@ function Invoke-RectGif($ctx, $query) {
     if ($query.raw -match '[?&]y=(-?\d+)') { $ry = [int]$matches[1] }
     if ($query.raw -match '[?&]w=(-?\d+)') { $rw = [int]$matches[1] }
     if ($query.raw -match '[?&]h=(-?\d+)') { $rh = [int]$matches[1] }
-    if ($rw -gt 200) {
+    # w=0 是页面「控制台已隐藏」的显式信号，不是坏数据。以前用 w>200 当有效性闸，
+    # 零矩形被直接丢掉，AHK 一直拿着上一次的矩形，右侧栏的滚轮就继续被吞。
+    # 负数/零一律归一成零矩形，避免 -1 这类脏值被当成有效坐标。
+    if ($rw -le 0) { $rx = 0; $ry = 0; $rw = 0; $rh = 0 }
+    if ($rw -eq 0 -or $rw -gt 200) {
         # 原子写（tmp + Move-Item 覆盖）：抽屉每 400ms 就来读这个文件（AHK 的 PanelRect()），
         # 直接 WriteAllText 是「先截断成 0 字节、再补齐」——撞上读取方就是「读到空/只有两个字段」，
         # PanelRect 于是掉进兜底矩形，滚轮落点错一次（用户感觉是「面板里忽然滚不动」）。
