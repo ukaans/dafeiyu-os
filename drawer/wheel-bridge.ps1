@@ -92,7 +92,14 @@ public static class DshWheelBridge
         {
             if (File.Exists(_logPath) && new FileInfo(_logPath).Length > LOG_MAX)
             {
-                File.Copy(_logPath, _logPath + ".1", true);   // .NET 4.0 没有 File.Move(overwrite)
+                // 先「改名成 .1」再建空文件：改名成功才截空。
+                // 旧写法 File.Copy 后截空不是原子的 —— 两步之间崩掉会留下「.1 与主文件各一份」，
+                // 而主文件被截成空后，唯一完整的历史只剩 .1（下一次轮转再把它覆盖掉）。
+                // File.Replace 在目标存在时是单步替换；目标不存在就 Move。任何一步失败都直接抛到
+                // 外层 catch，主文件原样保留，下一次再试。
+                string bak = _logPath + ".1";
+                if (File.Exists(bak)) File.Replace(_logPath, bak, null);
+                else File.Move(_logPath, bak);
                 File.WriteAllText(_logPath, string.Empty);
             }
             File.AppendAllText(_logPath, DateTime.Now.ToString("MM-dd HH:mm:ss.fff") + " " + s + Environment.NewLine, new UTF8Encoding(false));

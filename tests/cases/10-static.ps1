@@ -36,7 +36,7 @@ function Static-ShaNoBom([string]$path) {
 # 源工程与运行时副本不一致 = 改了半天其实跑的还是旧代码，是这套系统最常见的"幽灵故障"。
 $script:StaticRuntimePairs = @(
     'DesktopPage.ahk', 'dsh-agent.ps1', 'agent-watch.ps1', 'ensure-all.ps1', 'ensure-all.vbs',
-    'start-all.vbs', 'hwmon.ps1', 'wxmon.ps1', 'Build-IconCache.ps1', 'DesktopIcons.ps1',
+    'agent-config.ps1', 'start-all.vbs', 'hwmon.ps1', 'wxmon.ps1', 'Build-IconCache.ps1', 'DesktopIcons.ps1',
     'DesktopPositions.ps1', 'dock-add-host.ps1', 'dock-add.ps1', 'npix.exe', 'AutoHotkey64.exe'
 )
 
@@ -44,7 +44,7 @@ Test-Case STA-001 '静态' '核心文件齐全' high {
     $root = Get-DshRoot
     $need = @(
         'drawer\DesktopPage.ahk', 'drawer\dsh-agent.ps1', 'drawer\agent-watch.ps1',
-        'drawer\ensure-all.ps1', 'drawer\ensure-all.vbs', 'drawer\start-all.vbs',
+        'drawer\agent-config.ps1', 'drawer\ensure-all.ps1', 'drawer\ensure-all.vbs', 'drawer\start-all.vbs',
         'drawer\hwmon.ps1', 'drawer\wxmon.ps1', 'drawer\DesktopIcons.ps1',
         'drawer\DesktopPositions.ps1', 'drawer\Build-IconCache.ps1', 'drawer\dock-add-host.ps1',
         'drawer\AutoHotkey64.exe',

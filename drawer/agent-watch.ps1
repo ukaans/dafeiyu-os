@@ -10,10 +10,17 @@ param(
     # 5 秒一轮：代理假死到重启的窗口越短，抽屉点图标越不容易撞上"等待队列"
     [int]$IntervalSec = 5,
     [int]$MaxHbAgeSec = 45,
-    [int]$Port = 17433
+    [int]$Port = 0
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+# 端口只在 agent-config.ps1 里定义；显式传 -Port 时以参数为准。
+if ($Port -le 0) {
+    $cfg = Join-Path $PSScriptRoot 'agent-config.ps1'
+    if (Test-Path $cfg) { . $cfg; if ($AgentPort) { $Port = [int]$AgentPort } }
+}
+if ($Port -le 0) { $Port = 17433 }
 
 $appDir = Join-Path $env:LOCALAPPDATA 'DesktopPage'
 $logFile = Join-Path $appDir 'agent-watch.log'
@@ -71,7 +78,7 @@ function Start-Agent {
     # Hidden 对 WT 宿主无效，每次重启代理都会闪出一个空的「管理员:」终端窗并堆 OpenConsole。
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
-    $psi.Arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $agentScript + '"')) -join ' ')
+    $psi.Arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $agentScript + '"'), '-Port', "$Port") -join ' ')
     $psi.WorkingDirectory = $appDir
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true

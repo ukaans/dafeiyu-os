@@ -679,3 +679,61 @@ Test-Case RES-016 '健壮' '日志轮转：改名失败不许截空（历史不�
     if ($r.Size -ne 0) { throw ('轮转后 audit.log 应为空文件，实际 ' + $r.Size + ' 字节') }
     '两端都是「改名成功才截空」；活体：.1 被占用时 2.68MB 历史原样留着，放开后重试当场轮转'
 } -Hint '轮转是「改名 + 截空」两步，第一步失败时第二步绝不能执行 —— 否则历史与它唯一的备份一起没了，而且哪儿都不报错'
+
+Test-Case RES-017 '健壮' '审计轮转互斥：两个写者不能同时把 .1 覆盖成小文件' medium {
+    # P2（2026-11-11）：audit.log 有两个轮转者（AHK AuditLog / 代理 Write-Audit）。
+    # 两端同时越过 2MB 时，后一个 FileMove 会把对方刚写好的 .1 覆盖成一个很小的新文件，
+    # 真正的 2MB 历史只剩内存里的旧计数 —— 静默丢证据。约定：共用命名互斥体，
+    # 抢到锁后必须复检真实尺寸（等锁期间对方可能已经轮转完）。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $bad = @()
+
+    if ($agent -notmatch 'Global\\DesktopPage_audit') { $bad += '代理没有用 Global\DesktopPage_audit 互斥体' }
+    $i = $agent.IndexOf('function Write-Audit')
+    if ($i -lt 0) { throw '找不到 Write-Audit' }
+    $j = $agent.IndexOf("`nfunction ", $i + 1); if ($j -lt 0) { $j = $agent.Length }
+    $wb = $agent.Substring($i, $j - $i)
+    if ($wb -notmatch 'auditMtx[\s\S]{0,160}WaitOne\(') { $bad += '代理轮转前没有在 auditMtx 上 WaitOne' }
+    if ($wb -notmatch 'ReleaseMutex') { $bad += '代理轮转后没有 ReleaseMutex（异常一次就永久占锁）' }
+    if ($wb -notmatch 'WaitOne\([\s\S]{0,500}FileInfo[\s\S]{0,100}\.Length') { $bad += '代理抢锁后没有复检真实尺寸' }
+
+    if ($ahk -notmatch 'Global\\DesktopPage_audit') { $bad += 'AHK 没有用同一个互斥体名' }
+    if ($ahk -notmatch 'CreateMutexW') { $bad += 'AHK 没有 CreateMutexW' }
+    if ($ahk -notmatch 'WaitForSingleObject') { $bad += 'AHK 轮转前没有 WaitForSingleObject' }
+    if ($ahk -notmatch 'ReleaseMutex') { $bad += 'AHK 轮转后没有 ReleaseMutex' }
+    if ($ahk -notmatch 'WaitForSingleObject[\s\S]{0,500}FileGetSize\(AUDIT_FILE\)') { $bad += 'AHK 抢锁后没有复检 FileGetSize' }
+    if ($ahk -notmatch 'FileMove\(AUDIT_FILE, AUDIT_FILE "\.1", 1\)') { $bad += 'AHK 的轮转改名不在锁内或写法变了' }
+
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    '两个轮转者共用 Global\DesktopPage_audit；抢锁后复检尺寸，不会再互覆盖 .1'
+} -Hint 'P2（2026-11-11）：AHK 与代理同时越过 2MB 时，后一个会把 .1 覆盖成刚建的小文件，前一个 2MB 历史丢失'
+
+Test-Case RES-018 '健壮' 'AHK 滚动写入有 64KB 上限；桥日志改名成功才截空' medium {
+    # P3：AgentScroll 只追加不设上限，代理假死时 scroll.dat 能涨到几百 MB，下一次读盘卡住。
+    # P2：wheel-bridge 的 C# 轮转原来是 File.Copy + 截空，两步之间崩掉会留下两份，
+    # 主文件被截空后唯一完整的历史只剩 .1。改成 File.Replace/Move 后再建空。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $i = $ahk.IndexOf('AgentScroll(delta)')
+    if ($i -lt 0) { throw '找不到 AgentScroll' }
+    $j = $ahk.IndexOf("`n}", $i); if ($j -lt 0) { $j = $ahk.Length }
+    $ab = $ahk.Substring($i, $j - $i)
+    if ($ab -notmatch 'FileGetSize\(SCROLL_FILE\)\s*>\s*65536') { throw 'AgentScroll 没有 64KB 上限检查' }
+    if ($ab -notmatch 'FileOpen\(SCROLL_FILE,\s*"w"') { throw 'AgentScroll 超限后没有截空' }
+
+    $bridge = Read-Raw (Join-Path $root 'drawer\wheel-bridge.ps1')
+    if ($bridge -match 'File\.Copy\(') { throw '桥日志轮转还是 File.Copy + 截空（非原子）' }
+    if ($bridge -notmatch 'File\.Replace\(_logPath') { throw '桥日志轮转没有 File.Replace' }
+    if ($bridge -notmatch 'File\.Move\(_logPath') { throw '桥日志轮转没有 File.Move 兜底' }
+    $li = $bridge.IndexOf('public static void Log(string s)')
+    if ($li -lt 0) { throw '找不到桥的 Log 函数' }
+    $lj = $bridge.IndexOf('static void ReadTarget', $li); if ($lj -lt 0) { $lj = $bridge.Length }
+    $lb = $bridge.Substring($li, $lj - $li)
+    $iMove = $lb.IndexOf('File.Move(_logPath')
+    $iTrunc = $lb.IndexOf('File.WriteAllText(_logPath, string.Empty)')
+    if ($iTrunc -lt 0) { throw '桥日志轮转没有建空文件' }
+    if ($iMove -ge 0 -and $iTrunc -lt $iMove) { throw '桥日志截空写在改名之前（改名失败就丢历史）' }
+    '滚动文件 64KB 闸 + 桥日志改名成功才截空'
+} -Hint 'P2/P3（2026-11-11）：scroll.dat 无上限会被假死代理撑爆；桥日志 File.Copy 非原子'

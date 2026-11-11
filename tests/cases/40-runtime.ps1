@@ -124,12 +124,12 @@ Test-Case RUN-005 '运行时' 'state.js 字段齐全' high {
     Assert-True $r.Ok ('请求失败：' + $r.Error)
     $b = [string]$r.Body
     Assert-Match $b 'window\.__DSH_STATE\s*=' 'JSONP 赋值前缀'
-    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines', 'sig', 'err', 'reload', 'dbg')
+    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines', 'sig', 'err', 'dbg')
     $miss = @()
     foreach ($k in $need) { if ($null -eq (Run-Prop $b $k)) { $miss += $k } }
     if ($miss.Count -gt 0) { throw ('缺字段：' + ($miss -join '、') + '（前端会显示 -- 或不更新）') }
     ('10 个字段齐全：web=' + (Run-Prop $b 'web') + ' busy=' + (Run-Prop $b 'busy') + ' bal=' + (Run-Prop $b 'bal') + ' drawer=' + (Run-Prop $b 'drawer') + ' sig=' + (Run-Prop $b 'sig'))
-} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1（sig/err/reload/dbg 是 2026-11-05 会话视图加的）'
+} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1（sig/err/dbg 是 2026-11-05 会话视图加的；reload 已于 2026-11-11 收敛到 /scroll.js 单入口）'
 
 Test-Case RUN-006 '运行时' 'state.lines 是可渲染字符串数组' medium {
     if (-not (Test-DshApiUp)) { return (Test-DshAbort) }

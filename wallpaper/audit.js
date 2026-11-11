@@ -1,6 +1,6 @@
 /* audit.js — 壁纸侧统一审计
  * 页面是 file://，CSP 里 connect-src 'none'，fetch/XHR 一律被拦；
- * 所以只能走 1x1 GIF 信标：<img src="http://127.0.0.1:17433/audit.gif?e=...&k=...">
+ * 所以只能走 1x1 GIF 信标：<img src="http://127.0.0.1:<agent-port>/audit.gif?e=...&k=...">
  * 代理收到后先回 GIF（信标铁律），再把 [WEB ] <e> <k> 追加进
  * %LOCALAPPDATA%\DesktopPage\audit.log —— 和抽屉 [AHK ]、代理 [API ] 写同一份。
  * 调用约定：window.__AUDIT('media.toggle', 'playing=1')，第二参可省。
@@ -10,7 +10,7 @@
   'use strict';
 
   // 通信层优先走 api.js 的 window.__API；本文件单独部署时回退到内置写法（下面 beacon 里）
-  var API = (window.__API || {}).url || 'http://127.0.0.1:17433';
+  var API = (window.__API || {}).url || ('http://127.0.0.1:' + window.__DSH_AGENT_PORT);
   var THROTTLE_MS = 500;
   var lastAt = new Map();      // e -> 上次发送的时间戳
 

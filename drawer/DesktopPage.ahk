@@ -127,8 +127,15 @@ global EDGE_HOLD_MS := 250               ; 要在边缘停留多久才触发
 global EDGE_LAST_TICK := 0               ; 光标开始停在边缘的时刻（0 = 当前不在边缘）
 global EDGE_ARMED := true                ; 触发一次后置 false，光标离开边缘 40px 以上才重新武装
 global EDGE_INIT_LOGGED := false         ; 首次运行时写一行 `edge: probe init ...`，用于自证定时器在跑
-; 本地代理（dsh-agent.ps1，端口写死在这张桌面系统的启动链里）
-global AGENT_BASE := "http://127.0.0.1:17433"
+; 本地代理端口：唯一来源是 drawer\agent-config.ps1（install.ps1 / 代理启动时
+; 生成 %LOCALAPPDATA%\DesktopPage\agent-port.txt）。这里只读文件，读不到才用默认值。
+global AGENT_PORT := 17433
+try {
+    _ap := Trim(FileRead(APP_DIR . "\agent-port.txt", "UTF-8"))
+    if (_ap ~= "^\d+$")
+        AGENT_PORT := Integer(_ap)
+}
+global AGENT_BASE := "http://127.0.0.1:" AGENT_PORT
 ; 文件召唤通道：任何进程往 <脚本目录>\summon.cmd 写一行 show/hide，抽屉 400ms 内开合。
 ; 键鼠钩子被系统摘掉、全局热键失效时，代理 /summon.gif 就靠它把抽屉叫出来。
 global SUMMON_FILE := A_ScriptDir "\summon.cmd"
@@ -514,6 +521,25 @@ AgentToken() {
         return Trim(FileRead(APP_DIR . "\agent-token.txt", "UTF-8"))
     catch
         return ""
+}
+
+; 快捷启动栏的加项也走代理：dock.txt 只有代理 Save-Dock 一个写者（tmp + 原子覆盖）。
+; AHK 直接 FileAppend 会和代理 /dock.gif?op=del 的「读旧→覆盖」抢文件：
+; 代理刚删完一项并覆盖，AHK 紧接着按旧内容追加，删除就被静默回滚。
+AgentDockAdd(path, name, iconName) {
+    global AGENT_BASE
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.SetTimeouts(300, 300, 900, 900)
+        url := AGENT_BASE "/dock.gif?op=add&t=" UrlEncodePath(path)
+            . "&n=" UrlEncodePath(name) "&i=" UrlEncodePath(iconName)
+        req.Open("GET", url, false)
+        req.Send()
+        return (req.Status = 200)
+    } catch as e {
+        LogWrite("dock add agent unavailable: " e.Message)
+        return false
+    }
 }
 
 ; UTF-8 百分号编码（代理侧用 Uri::UnescapeDataString 解码，中文路径必须这样传）
@@ -1722,11 +1748,18 @@ ScrollTest(*) {
 }
 
 AgentScroll(delta) {
-    ; 走文件通道：AHK 只往 scroll.dat 追加 +1/-1，代理轮询时读走并累加
+    ; 走文件通道：AHK 只往 scroll.dat 追加 +1/-1，代理轮询时读走并累加。
+    ; 写入方必须有上限：消费方（代理）停掉时这个文件会无限长；代理侧已有 64KB 截断，
+    ; 这里补同样的闸，避免「代理假死 → scroll.dat 涨到几百 MB → 下一次读盘卡住」。
     global SCROLL_FILE
-    try
+    try {
+        if (FileExist(SCROLL_FILE) && FileGetSize(SCROLL_FILE) > 65536) {
+            fz := FileOpen(SCROLL_FILE, "w", "UTF-8-RAW")
+            fz.Close()
+            LogWrite("agent scroll: truncate >64KB")
+        }
         FileAppend(delta "`n", SCROLL_FILE, "UTF-8-RAW")
-    catch as e
+    } catch as e
         LogWrite("agent scroll failed: " e.Message)
 }
 
@@ -3054,31 +3087,17 @@ DockFile() {
 }
 
 DockAdd(it) {
-    f := DockFile()
     name := it["name"]
     iconName := ""
     if (it.Has("icon") && it["icon"] != "") {
         SplitPath(it["icon"], &iconName)
     }
-    line := it["path"] "|" name "|" iconName
-    cur := ""
-    if FileExist(f) {
-        try cur := FileRead(f, "UTF-8")
-    }
-    ; 已存在就不重复加
-    if (cur != "" && InStr(cur, it["path"] "|"))
-        return
-    ; 最多 6 条
-    n := 0
-    if (cur != "") {
-        Loop Parse, cur, "`n", "`r" {
-            if (A_LoopField != "")
-                n += 1
-        }
-    }
-    if (n >= 6)
-        return
-    try FileAppend((cur != "" ? "`r`n" : "") line, f, "UTF-8")
+    ; 查重 / 6 项上限 / 落盘全部由代理 Invoke-DockGif 的 op=add 分支负责。
+    ; 这里只负责把三项参数原样送过去；代理不可用时宁可这次不加，也不退回直写。
+    if (AgentDockAdd(it["path"], name, iconName))
+        LogWrite("dock add: " it["path"])
+    else
+        LogWrite("dock add failed (agent unavailable): " it["path"])
 }
 
 ; ------------------------------------------------------------
@@ -3347,13 +3366,36 @@ AuditLog(action, detail := "") {
         if (Mod(AUDIT_WRITES, 32) = 0 && FileExist(AUDIT_FILE))
             AUDIT_BYTES := FileGetSize(AUDIT_FILE)
         if (AUDIT_BYTES > AUDIT_MAX) {
-            FileMove(AUDIT_FILE, AUDIT_FILE ".1", 1)
-            ; 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）
-            try {
-                fz := FileOpen(AUDIT_FILE, "w", "UTF-8-RAW")
-                fz.Close()
+            ; 三端共写，两个轮转者（AHK / 代理）必须互斥：没有锁时两端同时越过 2MB，
+            ; 后一个 FileMove 会把 .1 覆盖成一个很小的新文件，真正 2MB 的历史就没了。
+            ; 抢锁 250ms；抢不到这一轮不轮转，下一次写入再试（不阻塞用户动作）。
+            hM := 0
+            try hM := DllCall("CreateMutexW", "Ptr", 0, "Int", 0, "Str", "Global\DesktopPage_audit", "Ptr")
+            locked := false
+            if (hM) {
+                try locked := (DllCall("WaitForSingleObject", "Ptr", hM, "UInt", 250) = 0)
+            } else {
+                locked := true      ; 连锁对象都建不出来：退回无锁轮转，总比永远不轮转好
             }
-            AUDIT_BYTES := 0
+            try {
+                ; 抢到锁后必须复检真实尺寸：等锁期间另一端可能已经轮转完
+                if (locked && FileExist(AUDIT_FILE) && FileGetSize(AUDIT_FILE) > AUDIT_MAX) {
+                    FileMove(AUDIT_FILE, AUDIT_FILE ".1", 1)
+                    ; 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）
+                    try {
+                        fz := FileOpen(AUDIT_FILE, "w", "UTF-8-RAW")
+                        fz.Close()
+                    }
+                    AUDIT_BYTES := 0
+                } else if (FileExist(AUDIT_FILE)) {
+                    AUDIT_BYTES := FileGetSize(AUDIT_FILE)
+                }
+            } finally {
+                if (locked && hM)
+                    DllCall("ReleaseMutex", "Ptr", hM)
+                if (hM)
+                    DllCall("CloseHandle", "Ptr", hM)
+            }
         }
     }
 }

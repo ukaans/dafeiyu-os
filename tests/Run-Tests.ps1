@@ -74,10 +74,15 @@ Initialize-DshTest -Context @{ Root = $root; Install = $install; Wall = $wall; T
     Quiet     = [bool]$Quiet
 }
 
-# 端口从源码里读，避免测试自己也写死一份（否则改端口时测试和实现一起错）
+# 端口从唯一配置源读，避免测试自己也写死一份（否则改端口时测试和实现一起错）
 try {
-    $agentSrc = [System.IO.File]::ReadAllText((Join-Path $root 'drawer\dsh-agent.ps1'), [System.Text.Encoding]::UTF8)
-    if ($agentSrc -match '(?m)^\s*\[int\]\$Port\s*=\s*(\d+)') { Set-DshApiPort ([int]$matches[1]) }
+    $cfgSrc = [System.IO.File]::ReadAllText((Join-Path $root 'drawer\agent-config.ps1'), [System.Text.Encoding]::UTF8)
+    if ($cfgSrc -match '(?m)^\s*\$AgentPort\s*=\s*(\d+)') {
+        Set-DshApiPort ([int]$matches[1])
+    } else {
+        $liveP = Join-Path $install 'agent-port.txt'
+        if (Test-Path -LiteralPath $liveP) { Set-DshApiPort ([int]((Get-Content -LiteralPath $liveP -Raw).Trim())) }
+    }
 } catch { }
 
 if (-not $Quiet) {

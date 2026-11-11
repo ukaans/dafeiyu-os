@@ -24,7 +24,11 @@
   'use strict';
   if (window.__API) return;                 // 已有副本装好，不抢
 
-  var BASE = 'http://127.0.0.1:17433';
+  // 端口来自 port.js（install.ps1 从 drawer\agent-config.ps1 生成，先于本文件加载）。
+  // 独立部署、没有 port.js 时才用默认值；其余文件都只读 window.__DSH_AGENT_PORT。
+  var PORT = window.__DSH_AGENT_PORT || 17433;
+  window.__DSH_AGENT_PORT = PORT;
+  var BASE = 'http://127.0.0.1:' + PORT;
   var seq = 0;
 
   function append(el) {

@@ -1,7 +1,14 @@
 ﻿param(
-    [int]$Port = 17433
+    [int]$Port = 0
 )
 $ErrorActionPreference = 'SilentlyContinue'
+
+# 端口只在 drawer\agent-config.ps1 里定义。隔离实例（测试）显式传 -Port 时跳过读配置。
+if ($Port -le 0) {
+    $cfg = Join-Path $PSScriptRoot 'agent-config.ps1'
+    if (Test-Path $cfg) { . $cfg; if ($AgentPort) { $Port = [int]$AgentPort } }
+}
+if ($Port -le 0) { $Port = 17433 }
 
 # =============================================================================
 #  dsh-agent.ps1 — 桌面系统本地代理
@@ -78,6 +85,28 @@ $mtx = New-Object System.Threading.Mutex($false, 'Global\DesktopPage_dshagent')
 if (-not $mtx.WaitOne(0)) { exit 0 }
 try { [System.IO.File]::WriteAllText((Join-Path $appDir 'dsh-agent.pid'), "$PID") } catch { }
 
+# ===== 端口落盘（单一配置源的两个消费端）=====
+# 抽屉（AHK）读 agent-port.txt；壁纸页读 port.js（window.__DSH_AGENT_PORT，先于 api.js 加载）。
+# 两处都由这里和 install.ps1 从 $Port 生成；内容不变则不重写（避免无谓的 mtime 抖动）。
+try {
+    $pf = Join-Path $appDir 'agent-port.txt'
+    $pv = [string]$Port
+    if (-not (Test-Path $pf) -or ([System.IO.File]::ReadAllText($pf)).Trim() -ne $pv) {
+        [System.IO.File]::WriteAllText($pf, $pv, (New-Object System.Text.UTF8Encoding($false)))
+    }
+} catch { }
+if ($wallDir) {
+    try {
+        $pj = Join-Path $wallDir 'port.js'
+        $pjs = 'window.__DSH_AGENT_PORT=' + $Port + ';'
+        if (-not (Test-Path $pj) -or ([System.IO.File]::ReadAllText($pj)) -ne $pjs) {
+            $pt = $pj + '.tmp'
+            [System.IO.File]::WriteAllText($pt, $pjs, (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $pt -Destination $pj -Force
+        }
+    } catch { }
+}
+
 # ===== 日志 =====
 # 之前这个脚本失败是"静默退出"（catch { exit 1 }），控制台只显示"本地代理没有响应"，
 # 没有任何线索。现在所有关键节点都写 dsh-agent.log，超过 256KB 自动清空。
@@ -124,6 +153,10 @@ $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
 $script:auditBytes = 0
 $script:auditWrites = 0                     # 写入计数：每 32 条与真实文件尺寸对齐一次（三端共写，本地累加值只会偏小）
 $script:auditRotSkipAt = [long]0            # 轮转失败日志的限流时间戳（60 秒一条，别在动作型请求里刷屏）
+# 三端共写、两个轮转者（本代理 / AHK）—— 轮转必须互斥。AHK 侧用同名互斥体
+# Global\DesktopPage_audit；这里用 .NET Mutex 拿同一把锁。取不到锁对象时退回无锁轮转。
+$script:auditMtx = $null
+try { $script:auditMtx = New-Object System.Threading.Mutex($false, 'Global\DesktopPage_audit') } catch { }
 try { if (Test-Path $auditFile) { $script:auditBytes = (Get-Item $auditFile -ErrorAction SilentlyContinue).Length } } catch { }
 # 动作类路由白名单（哪些路由每请求写一行审计）现在挂在路由表里：
 # 见下方 $script:ROUTES 的 audit 字段。以前这里有一份 $script:auditRoutes 数组，
@@ -158,26 +191,45 @@ function Write-Audit([string]$action, [string]$detail = '', [string]$tag = 'API'
             # 恰好在"刚出过事、最需要这份日志"的时刻丢证据，且三处日志（dsh-agent.log /
             # audit.log / verify）都不会记录这次失败。改成「改名成功才许截空」：
             # 没轮转成就原样留着，把计数器拉回真实尺寸，下一次写入再试（失败日志 60 秒限流）。
-            $rotBak = $auditFile + '.1'
-            $moved = $false
+            # 2026-11-11：再加互斥（与 AHK 共用 Global\DesktopPage_audit）——否则两端同时
+            # 越过 2MB 时，后一个改名会把 .1 覆盖成很小的新文件，前一个 2MB 历史直接消失。
+            $held = $false
             try {
-                Move-Item -LiteralPath $auditFile -Destination $rotBak -Force -ErrorAction Stop
-                $moved = -not (Test-Path -LiteralPath $auditFile)
-            } catch { $moved = $false }
-            if ($moved) {
-                # 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）
-                try { [System.IO.File]::WriteAllText($auditFile, '', $script:auditEnc) } catch { }
-                $script:auditBytes = 0
-            } else {
-                try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { $script:auditBytes = 0 }
-                try {
-                    $n64 = [long]$script:clock.ElapsedMilliseconds
-                    # 0 = 还没记过（第一轮必须留下证据，否则又变回"静默失败"）；之后 60 秒一条
-                    if (($script:auditRotSkipAt -eq 0) -or (($n64 - $script:auditRotSkipAt) -gt 60000)) {
-                        $script:auditRotSkipAt = $n64
-                        Agent-Log ('audit: rotate skipped (rename failed), size=' + $script:auditBytes)
+                if ($script:auditMtx) { $held = $script:auditMtx.WaitOne(250) } else { $held = $true }
+            } catch { $held = $false }
+            try {
+                if ($held) {
+                    # 抢到锁后复检真实尺寸：等锁期间 AHK 可能已经轮转完
+                    try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { }
+                }
+                if ($held -and $script:auditBytes -gt 2097152) {
+                    $rotBak = $auditFile + '.1'
+                    $moved = $false
+                    try {
+                        Move-Item -LiteralPath $auditFile -Destination $rotBak -Force -ErrorAction Stop
+                        $moved = -not (Test-Path -LiteralPath $auditFile)
+                    } catch { $moved = $false }
+                    if ($moved) {
+                        # 立刻建一个空文件：「存在但为空」比「不存在」好判断（verify.ps1 / 人肉排查都靠它）
+                        try { [System.IO.File]::WriteAllText($auditFile, '', $script:auditEnc) } catch { }
+                        $script:auditBytes = 0
+                    } else {
+                        try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { $script:auditBytes = 0 }
+                        try {
+                            $n64 = [long]$script:clock.ElapsedMilliseconds
+                            # 0 = 还没记过（第一轮必须留下证据，否则又变回"静默失败"）；之后 60 秒一条
+                            if (($script:auditRotSkipAt -eq 0) -or (($n64 - $script:auditRotSkipAt) -gt 60000)) {
+                                $script:auditRotSkipAt = $n64
+                                Agent-Log ('audit: rotate skipped (rename failed), size=' + $script:auditBytes)
+                            }
+                        } catch { }
                     }
-                } catch { }
+                } elseif ($held) {
+                    # 别人刚轮转过：计数器对齐到真实尺寸，避免"提前轮转"一个很小的文件
+                    try { $script:auditBytes = (New-Object System.IO.FileInfo($auditFile)).Length } catch { }
+                }
+            } finally {
+                if ($held -and $script:auditMtx) { try { $script:auditMtx.ReleaseMutex() } catch { } }
             }
         }
     } catch { }
@@ -383,7 +435,7 @@ function Write-Raw($ctx, [byte[]]$bytes, [string]$type) {
     $res.OutputStream.Close()
 }
 
-function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err, $reload, $dbg) {
+function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err, $dbg) {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('window.__DSH_STATE = {web:')
     [void]$sb.Append($(if ($web) { 'true' } else { 'false' }))
@@ -395,10 +447,10 @@ function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err,
     # 2026-11-05 会话视图新增三个薄字段（都是小标量，别在这里塞正文）：
     #   sig    日志身份（长度-mtime），页面据此决定是否拉 /log.js
     #   err    上一轮失败原因（stderr 的 dsh: 行），面板顶部挂一行警告
-    #   reload 热重载令牌，/reload.gif 写入
+    #   （reload 热重载令牌已于 2026-11-11 从 /state.js 移除：只走 /scroll.js 40ms 通道）
     [void]$sb.Append(',sig:"').Append((Escape-Js $sig)).Append('"')
     [void]$sb.Append(',err:"').Append((Escape-Js $err)).Append('"')
-    [void]$sb.Append(',reload:').Append([string][long]$reload)
+    [void]$sb.Append(',dbg:')
     [void]$sb.Append(',dbg:')
     [void]$sb.Append($(if ($dbg) { 'true' } else { 'false' }))
     [void]$sb.Append(',lines:[')
@@ -422,6 +474,17 @@ function Get-TextParam($req) {
         $body = $reader.ReadToEnd()
         $reader.Close()
         return $body.Trim()
+    }
+    return ''
+}
+
+# 任意查询参数（DockAdd 要同时传 t/n/i 三个）。t 仍走 Get-TextParam，兼容 POST 正文。
+function Get-UrlParam($req, [string]$name) {
+    $q = [string]$req.Url.Query
+    if (-not $q) { return '' }
+    $pat = '[?&]' + [regex]::Escape($name) + '=([^&]*)'
+    if ($q -match $pat) {
+        return ([System.Uri]::UnescapeDataString(($matches[1] -replace '\+', ' ')))
     }
     return ''
 }
@@ -1293,7 +1356,7 @@ function New-QueryBag($req, [string]$path) {
     return @{ raw = $raw; req = $req; nvc = $nvc; path = $path }
 }
 
-# ---- GET /state.js | /state ← window.__DSH_STATE {web,scroll,busy,bal,drawer,sig,err,reload,dbg,lines[]} ----
+# ---- GET /state.js | /state ← window.__DSH_STATE {web,scroll,busy,bal,drawer,sig,err,dbg,lines[]} ----
 function Invoke-StateJs($ctx, $query) {
     # 分层 TTL：每次只重算过期项；每项各自 try/catch（见 Cache-Get），
     # 任何一项失败都不会把整条响应变成 500 或半个响应。
@@ -1305,10 +1368,9 @@ function Invoke-StateJs($ctx, $query) {
     # 会话视图的两个指针：sig 变了页面才去拉 /log.js（正文在那边，这里不塞）
     $sig = [string](Cache-Get 'sig' 500 { Get-LogSig })
     $err = [string](Cache-Get 'err' 500 { Get-ErrText })
-    $reload = [long](Cache-Get 'reload' 500 { Get-ReloadToken })
     # 调试旗标每次看盘（没有缓存）：改完不用重启代理就能开/关信标
     $dbg = Test-Path $dbgFlag
-    Write-Js $ctx $web $busy $lines $bal $drawer 0 $sig $err $reload $dbg
+    Write-Js $ctx $web $busy $lines $bal $drawer 0 $sig $err $dbg
     # cache=1 → 全部命中；cache=0:lines → 只重算了日志尾巴
     # 用 $script: 是因为 handler 是函数：局部变量传不回主循环的日志行
     $script:stateTag = if ($script:missKeys.Count -eq 0) { ' (cache=1)' } else { ' (cache=0:' + ($script:missKeys -join ',') + ')' }
@@ -1332,12 +1394,38 @@ function Invoke-DockJs($ctx, $query) {
 
 function Invoke-DockGif($ctx, $query) {
     $di = -1
-    if ($query.raw -match '[?&]i=(-?\d+)') { $di = [int]$matches[1] }
+    if ($query.raw -match 'op=del' -and $query.raw -match '[?&]i=(-?\d+)(?:&|$)') { $di = [int]$matches[1] }
     if ($query.raw -match 'op=del' -and $di -ge 0) {
         $items = @(Get-Dock)
         if ($di -lt $items.Count) {
             $keep = @(); for ($k = 0; $k -lt $items.Count; $k++) { if ($k -ne $di) { $keep += $items[$k] } }
             Save-Dock $keep
+        }
+    }
+    # 2026-11-11：addition 也走这里，让 dock.txt 只有 Save-Dock 一个写者。
+    # AHK 以前直接 FileAppend，会和下面这条 /dock.gif?op=del 的「读旧→覆盖」抢文件：
+    # 代理刚删完一项并原子覆盖，AHK 紧接着按旧内容追加，删除就被静默回滚了。
+    if ($query.raw -match 'op=add') {
+        try {
+            $ap = Get-TextParam $query.req
+            $an = Get-UrlParam $query.req 'n'
+            $ai = Get-UrlParam $query.req 'i'
+            if ($ap) {
+                $items = @(Get-Dock)
+                $dup = $false
+                foreach ($it in $items) { if ($it.p -eq $ap) { $dup = $true; break } }
+                if ($dup) {
+                    Write-Audit 'dock' ('add dup path={0}' -f (Quote-Audit $ap))
+                } elseif ($items.Count -ge 6) {
+                    Write-Audit 'dock' ('add full path={0}' -f (Quote-Audit $ap))
+                } else {
+                    $items += [pscustomobject]@{ p = $ap; n = $an; i = $ai }
+                    Save-Dock $items
+                    Write-Audit 'dock' ('add path={0}' -f (Quote-Audit $ap))
+                }
+            }
+        } catch {
+            Agent-Log ('dock add error: ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message)
         }
     }
     Write-Raw $ctx $gif 'image/gif'
@@ -1484,14 +1572,13 @@ $script:reloadSkipAt = [long]0
 function Invoke-ScrollJs($ctx, $query) {
     $sd = Take-Scroll
     $js = 'window.__DSH_SCROLL=' + [int]$sd + ';'
-    # 热重载搭这条 40ms 通道的便车：/reload.gif 写了令牌，就让页面重插一次 dsh.js（软重载）。
+    # 热重载只走这条 40ms 通道（2026-11-11 合并：/state.js 的 reload 字段已删除）。
     # 不走 location.reload()：Lively 的 WebView2 上导航会白屏（2026-11-06 两次实测，panel-rect 直接不再更新）。
     # 新页面暴露 window.__DSH_RELOAD_OK（清旧定时器 + 删旧面板 + 重插脚本）；老页面没这个钩子才退回 reload。
-    # 注意：/state.js 的 reload 字段是**同一份令牌的第二个入口**（见 dsh.js 的 softReload），两条必须一致。
-    # 2026-11-07：判据从「文件在不在」改成「令牌是不是有效数字」（Get-ReloadToken -gt 0），和 /state.js 同源。
+    # 2026-11-07：判据是「令牌是不是有效数字」（Get-ReloadToken -gt 0），不是「文件在不在」。
     # 只看 Test-Path 有个致命分支：Remove-Item 被安全策略拦掉时下面会退化成「写空文件」，
     # 文件名于是长期存在 → 每 40ms 又下发一次软重载，页面无限重插 dsh.js（面板一直重建、CPU 飙升），
-    # 而 /state.js 那条读到空值当 0、完全不报错，日志上也看不出异常（实测：空文件同样触发了软重载）。
+    # 而日志上也看不出异常（实测：空文件同样触发了软重载）。
     # 另一个顺序要求：先清令牌再下发。清不掉就这一轮不发，下一轮再试 —— 绝不带着没清掉的令牌下发。
     try {
         if ((Get-ReloadToken) -gt 0) {
@@ -1505,8 +1592,6 @@ function Invoke-ScrollJs($ctx, $query) {
             }
             if ($cleared) {
                 $js += 'if(window.__DSH_RELOAD_OK){window.__DSH_RELOAD_OK()}else{setTimeout(function(){location.reload()},60)}'
-                # /state.js 的 reload 有 500ms 缓存：这里顺手清掉，免得它半秒内把同一个令牌再下发一次
-                Cache-Drop 'reload'
                 Agent-Log 'scroll: page-reload emitted'
             }
             else {
@@ -1848,6 +1933,7 @@ while ($listener.IsListening) {
             Write-Raw $ctx ([System.Text.Encoding]::UTF8.GetBytes('{"ok":false}')) 'application/json'
         }
     } catch {
+        Agent-Log ('handler error: ' + $path + ' ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message)
         try { Write-Raw $ctx ([System.Text.Encoding]::UTF8.GetBytes('{"ok":false}')) 'application/json' } catch { }
     }
     $ms = [Environment]::TickCount - $t0

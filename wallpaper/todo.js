@@ -16,7 +16,7 @@
   if (!panel || !list || !empty || !count || !input) return;
 
   // 通信层优先走 api.js 的 window.__API；本文件单独部署时回退到内置写法（下面 beacon 里）
-  var API = (window.__API || {}).url || 'http://127.0.0.1:17433';
+  var API = (window.__API || {}).url || ('http://127.0.0.1:' + window.__DSH_AGENT_PORT);
   var items = [];
   var localTs = 0;
   var lastFileTs = 0;
