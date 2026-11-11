@@ -164,3 +164,49 @@ Test-Case DAT-007 '数据' '图标缓存没有大面积缺失' low {
     }
     ($ref.Count.ToString() + ' 个图标引用全部命中缓存文件')
 } -Hint 'Build-IconCache.ps1 全量模式会清空 icons\；-AddPath 是追加模式，只补不删'
+
+Test-Case DAT-008 '数据' '待办生成物整份替换（先删再写会把它写坏）' medium {
+    # todo-data.js 有两个写者：代理的 Save-TodoItems（tmp + Move-Item，原子）和抽屉的 SyncTodoFile。
+    # 后者原来是「FileDelete(TODO_JS) → FileAppend(js)」，两个洞：
+    #   ① 删成功、追加失败（被杀 / 磁盘满 / 杀软锁）→ 壁纸每 10 秒热加载正好读到「文件不存在」，
+    #      待办面板空一片；本地缓存比文件新时 todo.js 还会把本地那份当权威盖回来；
+    #   ② 删失败被 catch 吞掉 → 直接追加在旧内容后面 → 文件里出现两份 __TODO_TS / __TODO，
+    #      之后每次同步再叠一份，只增不减，而 node --check 照样通过（静默劣化）。
+    # 判据：整份替换（tmp + FileMove 覆盖），且不许在对目标文件的写入路径上出现 FileDelete。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $i = $ahk.IndexOf('SyncTodoFile() {')
+    if ($i -lt 0) { throw '找不到 SyncTodoFile' }
+    $j = $ahk.IndexOf("`n}", $i)
+    if ($j -lt 0) { $j = $ahk.Length }
+    $fn = $ahk.Substring($i, $j - $i)
+
+    $bad = @()
+    if ($fn -match 'FileDelete\(TODO_JS\)') { $bad += 'SyncTodoFile 还在先删目标文件（删成功后有「文件不存在」的空窗，删失败则会追加成两份）' }
+    if ($fn -notmatch 'WriteFileAtomic\(TODO_JS') { $bad += 'SyncTodoFile 没走原子写（WriteFileAtomic）' }
+    if ($fn -notmatch 'UTF-8-RAW') { $bad += 'SyncTodoFile 的编码和代理侧不一致（应为 UTF-8-RAW，别给生成物加 BOM）' }
+    # 共用的原子写助手本身也要成立，否则上面那条只是换了个名字
+    $hi = $ahk.IndexOf('WriteFileAtomic(path, text')
+    if ($hi -lt 0) { $bad += '找不到 WriteFileAtomic 助手' }
+    else {
+        $hj = $ahk.IndexOf("`n}", $hi)
+        if ($hj -lt 0) { $hj = $ahk.Length }
+        $helper = $ahk.Substring($hi, $hj - $hi)
+        if ($helper -notmatch 'path\s+"\.tmp"') { $bad += 'WriteFileAtomic 不写临时文件' }
+        if ($helper -notmatch 'FileMove\(tmp,\s*path,\s*1\)') { $bad += 'WriteFileAtomic 没用 FileMove(…, 1) 覆盖' }
+    }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体：看一眼真实生成物 —— 整份替换成立时，文件里只能有一份定义。
+    # 两份 = 曾经在「删不掉」的时刻追加过，且会随每次同步继续膨胀。
+    $wall = Get-DshWall
+    $tj = Join-Path $wall 'todo-data.js'
+    if (-not (Test-Path -LiteralPath $tj)) { return '静态判据通过；todo-data.js 还没生成（活体部分跳过）' }
+    $txt = Read-Raw $tj
+    $tsCnt = ([regex]::Matches($txt, 'window\.__TODO_TS')).Count
+    $arCnt = ([regex]::Matches($txt, 'window\.__TODO\s*=')).Count
+    if ($tsCnt -ne 1 -or $arCnt -ne 1) {
+        throw ('todo-data.js 里有 ' + $tsCnt + ' 份 __TODO_TS / ' + $arCnt + ' 份 __TODO —— 整份替换失效，每次同步都在往后追加')
+    }
+    ('整份替换（tmp+FileMove，UTF-8-RAW）；生成物 1 份定义，' + (Get-Item -LiteralPath $tj).Length + ' 字节')
+} -Hint '生成物一律「先写 .tmp 再 FileMove 覆盖」；不要先 Delete 再 Append —— 空窗期读者看到的是「文件不存在」'

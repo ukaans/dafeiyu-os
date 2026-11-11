@@ -11,6 +11,20 @@ param(
 # Invoke-WebRequest 默认会画进度条，把 [ OK ] / [FAIL] 一行行冲掉 —— 每次自检都
 # 读成一团乱麻（"正在读取 Web 响应" 混在结论里）。自检的输出是给人看的，关掉。
 $ProgressPreference = 'SilentlyContinue'
+# 端口从唯一配置源读（drawer\agent-config.ps1），不再在本脚本里写死一份。
+$AgentPort = 0
+try {
+    $cfg = Join-Path $PSScriptRoot 'drawer\agent-config.ps1'
+    if (Test-Path $cfg) {
+        $cfgText = [System.IO.File]::ReadAllText($cfg, [System.Text.Encoding]::UTF8)
+        if ($cfgText -match '(?m)^\s*\$AgentPort\s*=\s*(\d+)') { $AgentPort = [int]$matches[1] }
+    }
+    if ($AgentPort -le 0) {
+        $liveP = Join-Path $InstallDir 'agent-port.txt'
+        if (Test-Path $liveP) { [void][int]::TryParse(([System.IO.File]::ReadAllText($liveP)).Trim(), [ref]$AgentPort) }
+    }
+} catch { }
+if ($AgentPort -le 0) { $AgentPort = 17433 }
 $fail = 0
 function Ok([string]$m)   { Write-Host ("[ OK ] " + $m) -ForegroundColor Green }
 function Bad([string]$m)  { Write-Host ("[FAIL] " + $m) -ForegroundColor Red; $script:fail++ }
@@ -32,7 +46,7 @@ function Read-Pid([string]$file) {
 }
 
 Write-Host "== 文件"
-foreach ($f in @('AutoHotkey64.exe','DesktopPage.ahk','dsh-agent.ps1','agent-watch.ps1','ensure-all.ps1','ensure-all.vbs','start-all.vbs','hwmon.ps1','wxmon.ps1','items.tsv','layout.dat')) {
+foreach ($f in @('AutoHotkey64.exe','DesktopPage.ahk','dsh-agent.ps1','agent-watch.ps1','agent-config.ps1','ensure-all.ps1','ensure-all.vbs','start-all.vbs','hwmon.ps1','wxmon.ps1','items.tsv','layout.dat')) {
     if (Test-Path (Join-Path $InstallDir $f)) { Ok "$f 存在" } else { Bad "$f 缺失（$InstallDir）" }
 }
 
@@ -56,7 +70,7 @@ $agentPid = Read-Pid (Join-Path $InstallDir 'dsh-agent.pid')
 if ($agentPid -gt 0 -and (Get-Process -Id $agentPid -ErrorAction SilentlyContinue)) {
     Ok "桌面代理运行中 (dsh-agent.pid=$agentPid)"
 } else {
-    Bad "桌面代理未运行（dsh-agent.pid=$agentPid，127.0.0.1:17433 不会有响应）"
+    Bad "桌面代理未运行（dsh-agent.pid=$agentPid，127.0.0.1:$AgentPort 不会有响应）"
 }
 
 $watchPid = Read-Pid (Join-Path $InstallDir 'agent-watch.pid')
@@ -75,13 +89,13 @@ if (Test-Path $hb) {
 } else {
     Info "dsh-agent.hb 不存在（代理从没起来过）"
 }
-if (Test-Tcp 17433 600) { Ok "127.0.0.1:17433 可连接" } else { Bad "127.0.0.1:17433 连不上（代理没监听）" }
+if (Test-Tcp $AgentPort 600) { Ok "127.0.0.1:$AgentPort 可连接" } else { Bad "127.0.0.1:$AgentPort 连不上（代理没监听）" }
 
 Write-Host "== HTTP 接口"
 $state = ''
 foreach ($ep in @('/state.js','/log.js','/media.js','/scroll.js','/dock.js','/todo.gif','/rect.gif')) {
     try {
-        $r = Invoke-WebRequest -Uri ('http://127.0.0.1:17433' + $ep) -TimeoutSec 6 -UseBasicParsing
+        $r = Invoke-WebRequest -Uri ('http://127.0.0.1:' + $AgentPort + $ep) -TimeoutSec 6 -UseBasicParsing
         if ($r.StatusCode -ne 200) { Bad "GET $ep 状态码 $($r.StatusCode)" ; continue }
         $body = ''
         if ($r.Content -is [string]) { $body = $r.Content }

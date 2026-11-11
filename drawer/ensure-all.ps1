@@ -5,9 +5,13 @@
 # Load launcher failed；控制台面板报"本地代理没有响应"）。
 # 这个脚本不做任何等待，只补缺失的三件套，日志只记动作。
 #
-# 判定与 agent-watch.ps1 一致：pid 活着 + 心跳 ≤45s + 17433 能连上。
+# 判定与 agent-watch.ps1 一致：pid 活着 + 心跳 ≤45s + 代理端口能连上。
+# 端口只在 agent-config.ps1 里定义。
 
 $ErrorActionPreference = 'SilentlyContinue'
+$cfg = Join-Path $PSScriptRoot 'agent-config.ps1'
+$AgentPort = 17433
+if (Test-Path $cfg) { . $cfg }
 
 $appDir      = Join-Path $env:LOCALAPPDATA 'DesktopPage'
 $logFile     = Join-Path $appDir 'ensure-all.log'
@@ -78,7 +82,7 @@ function AgentHealthy {
     if (-not (Test-Path $agentHbF)) { return $false }
     $age = ((Get-Date) - (Get-Item $agentHbF).LastWriteTime).TotalSeconds
     if ($age -gt 45) { return $false }
-    return (TestPort 17433 400)
+    return (TestPort $AgentPort 400)
 }
 
 # ---- 抽屉存活判定 ----

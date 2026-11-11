@@ -32,6 +32,11 @@ $pkg = Split-Path -Parent $MyInvocation.MyCommand.Path
 $drawerSrc = Join-Path $pkg 'drawer'
 $wallSrc   = Join-Path $pkg 'wallpaper'
 
+# 端口唯一来源（drawer\agent-config.ps1）：生成 agent-port.txt（AHK 读）与 port.js（壁纸读）。
+$agentPort = 17433
+$agentCfg = Join-Path $drawerSrc 'agent-config.ps1'
+if (Test-Path $agentCfg) { . $agentCfg; if ($AgentPort) { $agentPort = [int]$AgentPort } }
+
 function Say([string]$m) { Write-Host $m }
 function Step([string]$m) { Write-Host ''; Write-Host "== $m" -ForegroundColor Cyan }
 function Warn([string]$m) { Write-Host "!! $m" -ForegroundColor Yellow }
@@ -71,7 +76,7 @@ $drawerFiles = @(
     'AutoHotkey64.exe','AutoHotkey64.exe.manifest','DesktopPage.ahk','dsh-agent.ps1',
     'npix.cs','npix.exe','npix.manifest','hwmon.ps1','wxmon.ps1','dock-add.ps1','dock-add-host.ps1',
     'DesktopIcons.ps1','DesktopPositions.ps1','Build-IconCache.ps1','recycle_tmp.ps1','start-all.vbs',
-    'agent-watch.ps1','ensure-all.ps1','ensure-all.vbs','wheel-bridge.ps1'
+    'agent-watch.ps1','ensure-all.ps1','ensure-all.vbs','wheel-bridge.ps1','agent-config.ps1'
 )
 if ($DryRun) {
     foreach ($f in $drawerFiles) { Say ("  [dry] copy " + $f) }
@@ -95,6 +100,7 @@ if ($DryRun) {
         $p = Join-Path $InstallDir $empty
         if (-not (Test-Path $p)) { New-Item -ItemType File -Path $p -Force | Out-Null }
     }
+    [System.IO.File]::WriteAllText((Join-Path $InstallDir 'agent-port.txt'), "$agentPort", (New-Object System.Text.UTF8Encoding($false)))
     Say "  抽屉文件已就位"
 }
 
@@ -106,6 +112,7 @@ if ($lib) {
     } else {
         New-Item -ItemType Directory -Path $wallDest -Force | Out-Null
         Copy-Item (Join-Path $wallSrc '*') $wallDest -Recurse -Force
+        [System.IO.File]::WriteAllText((Join-Path $wallDest 'port.js'), ('window.__DSH_AGENT_PORT=' + $agentPort + ';'), (New-Object System.Text.UTF8Encoding($false)))
         Say ("  壁纸文件已就位：" + $wallDest)
     }
 }

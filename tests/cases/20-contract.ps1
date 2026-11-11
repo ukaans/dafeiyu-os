@@ -40,40 +40,57 @@ function Contract-RouteTable {
     return $script:ContractCache
 }
 
-Test-Case CON-001 '契约' '代理端口各处一致' high {
+Test-Case CON-001 '契约' '代理端口单一配置源' high {
     $root = Get-DshRoot
-    # 只找 127.0.0.1:<port> 这个形态，不绑死 "API = '...'" 的写法：
-    # 2026-11-03 起壁纸侧抽出 api.js 统一管 URL，dsh.js 变成 (window.__API||{}).url || '...'，
-    # 绑死写法的正则会在重构后误报。
-    $map = [ordered]@{}
-    $files = @(
-        @{ File = 'drawer\dsh-agent.ps1'; Label = 'dsh-agent'; Pattern = '(?m)^\s*\[int\]\$Port\s*=\s*(\d+)' }
-        @{ File = 'drawer\agent-watch.ps1'; Label = 'agent-watch'; Pattern = '\[int\]\$Port\s*=\s*(\d+)' }
-        @{ File = 'drawer\ensure-all.ps1'; Label = 'ensure-all'; Pattern = 'TestPort\s+(\d+)' }
-        @{ File = 'drawer\DesktopPage.ahk'; Label = 'AHK' }
-        @{ File = 'wallpaper\api.js'; Label = 'api.js' }
-        @{ File = 'wallpaper\dsh.js'; Label = 'dsh.js' }
-        @{ File = 'wallpaper\media.js'; Label = 'media.js' }
-        @{ File = 'wallpaper\todo.js'; Label = 'todo.js' }
-        @{ File = 'wallpaper\audit.js'; Label = 'audit.js' }
-    )
-    foreach ($f in $files) {
-        $p = Join-Path $root $f.File
-        if (-not (Test-Path -LiteralPath $p)) { throw ('缺文件：' + $f.File) }
-        $t = Read-Raw $p
-        # 默认找 URL 形态；两个看门狗脚本只存端口号（不拼 URL），单独给正则
-        $pat = if ($f.ContainsKey('Pattern')) { $f.Pattern } else { '127\.0\.0\.1:(\d{4,5})' }
-        $set = @([regex]::Matches($t, $pat) | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
-        if ($set.Count -eq 0) { throw ($f.Label + '：在 ' + $f.File + ' 里找不到端口（正则 /' + $pat + '/）') }
-        $map[$f.Label] = ($set -join '/')
+    # P2（2026-11-11）：原来 9 处写死 17433。现在只有 drawer\agent-config.ps1 一处定义，
+    # 三个 PowerShell 脚本 dot-source 它；AHK 读 agent-port.txt、壁纸读 port.js，
+    # 两个生成物都由 install.ps1 与代理启动时从同一个 $AgentPort 写出。
+    $cfgP = Join-Path $root 'drawer\agent-config.ps1'
+    if (-not (Test-Path -LiteralPath $cfgP)) { throw '缺少 drawer\agent-config.ps1（端口唯一来源）' }
+    $m = [regex]::Match((Read-Raw $cfgP), '(?m)^\s*\$AgentPort\s*=\s*(\d+)\s*$')
+    if (-not $m.Success) { throw 'agent-config.ps1 里没有 $AgentPort = <port>' }
+    $port = $m.Groups[1].Value
+
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    if ($agent -notmatch 'agent-config\.ps1') { throw 'dsh-agent.ps1 没有 dot-source agent-config.ps1' }
+    if ($agent -match '(?m)^\s*\[int\]\$Port\s*=\s*[1-9]\d*') { throw 'dsh-agent.ps1 仍把端口写死在 param 默认值里' }
+    $watch = Read-Raw (Join-Path $root 'drawer\agent-watch.ps1')
+    if ($watch -notmatch 'agent-config\.ps1') { throw 'agent-watch.ps1 没有 dot-source agent-config.ps1' }
+    if ($watch -notmatch "'-Port'") { throw 'agent-watch.ps1 拉起代理时没有把 -Port 传下去' }
+    $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
+    if ($ens -notmatch 'TestPort\s+\$AgentPort') { throw 'ensure-all.ps1 没有用 $AgentPort 探活' }
+    if ($ens -match '(?m)^\s*return \(TestPort\s+\d+') { throw 'ensure-all.ps1 仍写死端口探活' }
+
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    if ($ahk -notmatch 'agent-port\.txt') { throw 'AHK 没有读 agent-port.txt' }
+    if ($ahk -match '127\.0\.0\.1:17433') { throw 'AHK 仍写死 127.0.0.1:17433' }
+
+    $api = Read-Raw (Join-Path $root 'wallpaper\api.js')
+    if ($api -notmatch '__DSH_AGENT_PORT') { throw 'api.js 没有读 window.__DSH_AGENT_PORT' }
+    $pj = Join-Path $root 'wallpaper\port.js'
+    if (-not (Test-Path -LiteralPath $pj)) { throw '缺少 wallpaper\port.js（端口生成物）' }
+    $pt = (Read-Raw $pj).Trim()
+    if ($pt -ne ('window.__DSH_AGENT_PORT=' + $port + ';')) { throw ('port.js 与 agent-config 不一致：' + $pt) }
+    $idx = Read-Raw (Join-Path $root 'wallpaper\index.html')
+    $ip = $idx.IndexOf('port.js'); $ia = $idx.IndexOf('src="api.js"')
+    if ($ip -lt 0 -or $ia -lt 0 -or $ip -gt $ia) { throw 'index.html 没有在 api.js 之前加载 port.js' }
+    foreach ($f in @('dsh.js','media.js','todo.js','audit.js')) {
+        $t = Read-Raw (Join-Path $root ('wallpaper\' + $f))
+        if ($t -notmatch '__DSH_AGENT_PORT') { throw ($f + ' 没有读 window.__DSH_AGENT_PORT') }
+        if ($t -match '127\.0\.0\.1:\d{4,5}') { throw ($f + ' 仍写死 127.0.0.1 端口') }
     }
-    $distinct = @($map.Values | ForEach-Object { $_ -split '/' } | Sort-Object -Unique)
-    if ($distinct.Count -gt 1) {
-        $desc = ($map.Keys | ForEach-Object { $_ + '=' + $map[$_] }) -join '，'
-        throw ('端口不一致（' + $distinct.Count + ' 种）：' + $desc)
+
+    $inst = Read-Raw (Join-Path $root 'install.ps1')
+    if ($inst -notmatch 'agent-config\.ps1') { throw 'install.ps1 没有安装 agent-config.ps1' }
+    if ($inst -notmatch 'agent-port\.txt' -or $inst -notmatch "'port\.js'") { throw 'install.ps1 没有生成 agent-port.txt / port.js' }
+
+    $live = Join-Path $env:LOCALAPPDATA 'DesktopPage\agent-port.txt'
+    if (Test-Path -LiteralPath $live) {
+        $lv = (Read-Raw $live).Trim()
+        if ($lv -ne $port) { throw ("运行态 agent-port.txt=$lv 与配置 $port 不一致") }
     }
-    ('九处端口统一为 ' + $distinct[0])
-} -Hint '端口没有统一配置项：改端口必须同时改这 9 处 + verify.ps1'
+    ('端口唯一来源 agent-config.ps1 = ' + $port)
+} -Hint 'P2：原 9 处写死 17433；现在配置一处，脚本 dot-source，AHK/壁纸读生成物'
 
 Test-Case CON-002 '契约' '路由表 handler 都有实现' high {
     $t = Contract-RouteTable
@@ -279,39 +296,33 @@ Test-Case CON-011 '契约' '桥通道不吞向上滚 + 滚动立即生效' high 
     '桥通道上下都接线；/scroll.js 40ms；scrollTop 立即落'
 } -Hint '2026-11-06 用户报「只能向下滚、延迟大、卡卡的」：根因是桥把 up 丢了（curPage=0 直接 return）+ 80ms 轮询 + 排一帧 setTimeout'
 
-Test-Case CON-012 '契约' '热重载只走软重载（不硬刷页面）' high {
+Test-Case CON-012 '契约' '热重载单入口：只走 /scroll.js，页面不裸重载' high {
     # 背景：Lively 的 WebView2 上 location.reload() 会白屏（panel-rect 不再更新 → 抽屉滚轮落点全错）。
-    # 令牌有两个入口：/scroll.js（40ms 搭便车）与 /state.js 的 reload 字段（1.2s，带 500ms 缓存）。
-    # 2026-11-06 只改了前者，后者仍硬刷 —— 且「/scroll.js 已消费、/state.js 缓存未过期」那半秒
-    # 里页面照样能收到同一个令牌，所以那条硬刷路径真实可达。
+    # 2026-11-11 合并前令牌有两条入口：/scroll.js（40ms）与 /state.js 的 reload 字段（1.2s + 500ms 缓存）。
+    # 后者在「/scroll.js 已消费、缓存未过期」的半秒里会重复下发同一个令牌，是白屏旁路的根。
+    # 现在只保留 /scroll.js 一条入口；页面侧没有任何 location.reload，老页面兜底只在代理注入段。
     $root = Get-DshRoot
     $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
-    # 只判代码行：注释里本来就会提到 location.reload（解释为什么不许用）
     $code = @(($js -split "\r?\n") | Where-Object { $_ -notmatch '^\s*(//|\*|/\*)' })
     $calls = @($code | Where-Object { $_ -match 'location\.reload\s*\(' })
-    if ($calls.Count -gt 1) {
-        throw ("dsh.js 里有 $($calls.Count) 处裸 location.reload()，只允许 softReload() 里那 1 处老页面兜底：`n" + ($calls -join "`n"))
+    if ($calls.Count -gt 0) {
+        throw ("dsh.js 里还有 $($calls.Count) 处裸 location.reload()；页面侧应零处：" + ($calls -join ' | '))
     }
-    # 先查真正的旁路（/state.js 那条），它才是历史上漏掉的那个入口
-    $st = [regex]::Match($js, 'if \(st\.reload && st\.reload !== lastReload\)\s*\{(?<b>[\s\S]*?)\r?\n      \}')
-    if (-not $st.Success) { throw '找不到 /state.js 的 reload 令牌分支（st.reload 判断）' }
-    $stBody = $st.Groups['b'].Value
-    if ($stBody -match 'location\.reload') { throw '/state.js 的令牌分支又直接 location.reload() 了 —— 这是条会白屏的旁路' }
-    if ($stBody -notmatch 'softReload\(') { throw '/state.js 的令牌分支没有调用 softReload()' }
-    $sr = [regex]::Match($js, 'function softReload\(tag\)\s*\{(?<b>[\s\S]*?)\r?\n  \}')
-    if (-not $sr.Success) { throw '找不到 softReload() 函数体 —— 热重载又被摊成两套写法了' }
-    $srBody = $sr.Groups['b'].Value
-    if ($srBody -notmatch '__DSH_RELOAD_OK') { throw 'softReload() 没有先试 __DSH_RELOAD_OK —— 有钩子的页面也会被硬刷成白屏' }
-    if ($calls.Count -eq 1 -and $srBody -notmatch 'location\.reload\s*\(') {
-        throw '那唯一一处 location.reload() 不在 softReload() 里'
-    }
-    # 代理侧：/scroll.js 必须优先调钩子，只给老页面留兜底
+    if ($js -match 'st\.reload') { throw '/state.js 的 reload 旁路又回来了（令牌应只走 /scroll.js）' }
+    if ($js -notmatch 'window\.__DSH_RELOAD_OK') { throw '页面没有暴露 __DSH_RELOAD_OK 钩子' }
+
     $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
     $m = [regex]::Match($agent, 'function Invoke-ScrollJs\((?<b>[\s\S]*?)\r?\n\}')
     if (-not $m.Success) { throw '找不到 Invoke-ScrollJs 函数体' }
     if ($m.Groups[1].Value -notmatch 'window\.__DSH_RELOAD_OK') { throw 'Invoke-ScrollJs 不再调 window.__DSH_RELOAD_OK，软重载链路断了' }
-    '两条令牌入口（/scroll.js、/state.js）都走 softReload；裸 location.reload 只剩 1 处老页面兜底'
-} -Hint '2026-11-06：热重载改软重载时只改了 /scroll.js 那条，/state.js 的 reload 字段仍 location.reload()；加上 500ms 令牌缓存，这条白屏旁路真实可达'
+    $st = [regex]::Match($agent, 'function Invoke-StateJs\((?<b>[\s\S]*?)\r?\n\}')
+    if (-not $st.Success) { throw '找不到 Invoke-StateJs 函数体' }
+    if ($st.Groups[1].Value -match 'Get-ReloadToken') { throw '/state.js 又读 reload 令牌了（第二个入口复活）' }
+    $wj = [regex]::Match($agent, 'function Write-Js\((?<b>[\s\S]*?)\r?\n\}')
+    if (-not $wj.Success) { throw '找不到 Write-Js 函数体' }
+    if ($wj.Groups[1].Value -match ',reload:') { throw 'Write-Js 仍在输出 reload 字段' }
+    '令牌只由 /scroll.js 下发；dsh.js 无 location.reload，/state.js 无 reload 字段'
+} -Hint 'P3（2026-11-11）：合并 /state.js 与 /scroll.js 两条热重载入口，消除 500ms 缓存重复下发与白屏旁路'
 
 Test-Case CON-013 '契约' '巡检结果落进桌面控制台（<<< 机器消息）' medium {
     # 用户要求：每天巡跑完，结果要出现在桌面 DSH 面板的会话里。
@@ -397,10 +408,7 @@ Test-Case CON-016 '契约' '巡检推送：代理连不上就直连重试一次'
 } -Hint '2026-11-06 代理没开时巡检推送会红；只对 connect 类失败兜底，其它失败照旧报'
 Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清后发' high {
     # 2026-11-07 实测：page-reload.txt 存在但内容为空时，/scroll.js 照样下发软重载（实测 True,False,False）。
-    # 而 /state.js 那条（Get-ReloadToken）把空值当 0 —— 两条路径对「什么是有效令牌」各有各的判法。
-    # 后果：Remove-Item 被安全策略拦掉时，下面那段兜底会把文件变成「长期存在的空文件」，
-    # 于是 /scroll.js（40ms 一轮）每一轮都重插一次 dsh.js，面板无限重建、CPU 飙升，且没有任何报错。
-    # 判据必须同源（Get-ReloadToken -gt 0），且必须先清令牌、确认清掉了再下发。
+    # 判据必须看有效数字（Get-ReloadToken -gt 0），不能看文件在不在；且必须先清令牌、确认清掉了再下发。
     $root = Get-DshRoot
     $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
     $m = [regex]::Match($agent, 'function Invoke-ScrollJs\((?<b>[\s\S]*?)\r?\n\}')
@@ -420,7 +428,6 @@ Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清�
     if ($iEmit -lt 0) { throw 'Invoke-ScrollJs 不再调 window.__DSH_RELOAD_OK，软重载链路断了' }
     if ($iClear -gt $iEmit) { throw '先下发后清令牌：清不掉就开始无限重插（顺序必须是先清后发）' }
     if ($code -notmatch 'if\s*\(\s*\$cleared\s*\)') { throw '下发没有 $cleared 这道闸 —— 清不掉也照发' }
-    if ($code -notmatch "Cache-Drop\s+'reload'") { throw '没清 /state.js 的 reload 缓存，半秒内会把同一个令牌再下发一次' }
 
     # 活体复现（只动令牌文件，不弹窗、不动桌面）：空文件必须一次软重载都不发
     if (-not (Test-DshApiUp)) { return @{ Status = 'warn'; Detail = '静态契约通过；代理未在线，活体复现跳过' } }
@@ -442,11 +449,11 @@ Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清�
         $emit2 = ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK')
         if (-not $emit1) { throw '真令牌没有触发软重载（改坏了：改完壁纸就不会热重载了）' }
         if ($emit2) { throw '同一个令牌下发了两次 —— 页面会被重插两份 dsh.js' }
-        '判据同源（Get-ReloadToken>0）+ 先清后发；空令牌 0 次下发，真令牌只下发 1 次'
+        '判据看有效数字 + 先清后发；空令牌 0 次下发，真令牌只下发 1 次'
     } finally {
         try { if (Test-Path $rf) { Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue } } catch { }
     }
-} -Hint '2026-11-07：Test-Path 判空文件也会发软重载，而 /state.js 当 0 —— 清不掉令牌时 /scroll.js 40ms 一轮无限重插 dsh.js'
+} -Hint '2026-11-07：Test-Path 判空文件也会发软重载；清不掉令牌时 /scroll.js 40ms 一轮无限重插 dsh.js'
 
 Test-Case CON-018 '契约' '图标启动：带参快捷方式也必须走代理/队列' high {
     # 2026-11-08 复现：点「明日方舟：终末地」弹「Load launcher failed, module init error」。
@@ -479,3 +486,62 @@ Test-Case CON-018 '契约' '图标启动：带参快捷方式也必须走代理/
     if ($code -notmatch 'AgentLaunch\(path\)') { throw '代理调用消失' }
     '带参快捷方式不再绕过代理：代理 → 队列 → 直连兜底，顺序正确'
 } -Hint '2026-11-08：明日方舟：终末地（--game=Endfield --reason=4）点一次弹一次 module init error；修好后带参 ≠ 直跑'
+
+Test-Case CON-019 '契约' 'rect 零矩形三端约定：隐藏控制台 = 0 0 0 0' high {
+    # 连续三轮的「右侧栏滚轮没反应」：控制台隐藏后页面不再上报（display:none 量出 0×0），
+    # 代理又把 w=0 当坏数据丢掉，AHK 于是永远拿着上一次的矩形，滚轮继续走 act=console。
+    # 约定：页面显式发 0 0 0 0；代理接受并原子落盘；AHK 读到零矩形就判定「不在控制台上」。
+    $root = Get-DshRoot
+    $js = Read-Raw (Join-Path $root 'wallpaper\dsh.js')
+    $ps = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $bad = @()
+
+    if ($js -notmatch "'x=0&y=0&w=0&h=0'") { $bad += 'dsh.js 没有「控制台隐藏 → 零矩形」上报分支' }
+    $iOff = $js.IndexOf('else if (!consoleOn())')
+    if ($iOff -ge 0) {
+        $iElse = $js.IndexOf('} else {', $iOff)
+        if ($iElse -gt $iOff) {
+            $seg = $js.Substring($iOff, $iElse - $iOff)
+            if ($seg -match 'aside\.getBoundingClientRect') { $bad += 'dsh.js 的隐藏分支仍退回 aside（右侧导航栏会把滚轮继续吞掉）' }
+        }
+    }
+    if ($js -notmatch 'syncConsole[\s\S]{0,400}reportRect\(\)') { $bad += 'syncConsole 没有在开关变化后立即上报矩形' }
+
+    if ($ps -notmatch '\$rw -le 0') { $bad += '代理没有把负数/零宽归一成零矩形' }
+    if ($ps -notmatch '\$rw -eq 0 -or \$rw -gt 200') { $bad += '代理仍用 w>200 当有效性闸 —— w=0 会被丢掉' }
+
+    if ($ahk -notmatch 'if \(Integer\(parts\[3\]\) <= 0\)') { $bad += 'AHK PanelRect 仍把零矩形当坏数据回退 430px' }
+    if ($ahk -notmatch 'if \(r\[3\] <= 0 \|\| r\[4\] <= 0\)') { $bad += 'AHK ConsoleUnderCursor 没有对零矩形早退' }
+
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    '三端同约定：页面发 0 0 0 0、代理接受、AHK 判「不在控制台」'
+} -Hint '2026-11-11：w=0 连续第三轮挂账；只改一端仍会回退到旧矩形，三端必须同时认这个约定'
+Test-Case CON-020 '契约' 'DockAdd 单写者：AHK 只发 op=add，不再直写 dock.txt' high {
+    # P2（2026-11-11）：dock.txt 原来有两个写者 —— 代理的 Save-Dock（读旧→tmp→覆盖）
+    # 与 AHK DockAdd 的 FileAppend。代理刚删完一项并覆盖，AHK 紧接着按旧内容追加，
+    # 删除就被静默回滚。现在 AHK 只发 /dock.gif?op=add，查重/限 6/落盘全在代理里。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $m = [regex]::Match($ahk, '(?ms)^DockAdd\(it\)\s*\{(?<b>.*?)^\}')
+    if (-not $m.Success) { throw '找不到 DockAdd 函数体' }
+    $b = $m.Groups['b'].Value
+    if ($b -match 'FileAppend') { throw 'DockAdd 还在直写 dock.txt（第二写者会和代理的原子覆盖抢文件）' }
+    if ($b -match 'DockFile\(\)') { throw 'DockAdd 还在自己拼 dock.txt 路径' }
+    if ($b -notmatch 'AgentDockAdd\(') { throw 'DockAdd 没有把添加动作交给代理' }
+    $d = [regex]::Match($ahk, '(?ms)^AgentDockAdd\(path, name, iconName\)\s*\{(?<b>.*?)^\}')
+    if (-not $d.Success) { throw '找不到 AgentDockAdd' }
+    $db = $d.Groups['b'].Value
+    if ($db -notmatch 'op=add') { throw 'AgentDockAdd 没带 op=add' }
+    if ($db -notmatch 'UrlEncodePath') { throw 'AgentDockAdd 没对中文路径做百分号编码' }
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $g = [regex]::Match($agent, 'function Invoke-DockGif\((?<b>[\s\S]*?)\r?\n\}')
+    if (-not $g.Success) { throw '找不到 Invoke-DockGif' }
+    $gb = $g.Groups['b'].Value
+    if ($gb -notmatch "op=add") { throw '代理 Invoke-DockGif 没有 op=add 分支' }
+    if ($gb -notmatch 'Save-Dock') { throw 'op=add 没有走原子 Save-Dock' }
+    if ($gb -notmatch 'Count -ge 6') { throw 'op=add 没有 6 项上限检查' }
+    if ($gb -notmatch 'Get-UrlParam') { throw 'op=add 没有解析 n/i 参数' }
+    if (-not $gb.Contains('i=(-?\d+)(?:&|$)')) { throw 'op=del 的整数 i 没有锚定行尾：图标名 i=9831016285b4.png 会被当 Int32 溢出，整条 add 返回 {"ok":false}' }
+    'DockAdd 单写者：AHK 发 op=add，代理查重 / 限 6 / 原子落盘'
+} -Hint 'P2（2026-11-11）：AHK FileAppend 与代理 tmp+Move 并发时，代理会把刚追加的那条覆盖掉'

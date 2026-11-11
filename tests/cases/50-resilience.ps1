@@ -402,3 +402,338 @@ Test-Case RES-012 '健壮' '信标落盘也原子替换（panel-rect / summon.cm
     if ($badReads -gt 0) { throw ('并发采样 ' + $samples + ' 次，有 ' + $badReads + ' 次读到空/不完整 —— 仍有非原子写路径') }
     ('两处都是 tmp + 原子覆盖；并发采样 ' + $samples + ' 次未读到空/不完整')
 } -Hint '改名替换（Move-Item -Force / FileMove）不会出现「存在但为空」；改不动就这一轮不写，别退回直写'
+
+Test-Case RES-013 '健壮' '滚轮意图：读到≠取走，清不掉不许重复消费' medium {
+    # scroll.dat 是「抽屉写一行（/scroll.gif 或 AHK AgentScroll）、壁纸每 40ms 取走」的意图队列。
+    # 原来的 Take-Scroll 是「读 → File::Delete → 不管删没删掉都返回读数」：
+    # 删除失败时（写方还持有句柄 / 杀软扫描 / 安全策略）同一批意图 40ms 后又被读一遍，
+    # 用户感觉「滚一格跳两格」，而日志干干净净 —— 删除失败的异常被 catch 吞掉了。
+    # 判据：先清后发 —— 清不掉这一轮返回 0（内容还在文件里，下一轮再取），绝不重复下发。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $body = {
+        param($code, $fn)
+        $i = $code.IndexOf('function ' + $fn)
+        if ($i -lt 0) { return '' }
+        $j = $code.IndexOf("`nfunction ", $i + 1)
+        if ($j -lt 0) { $j = $code.Length }
+        return $code.Substring($i, $j - $i)
+    }
+    $take = & $body $agent 'Take-Scroll'
+    if (-not $take) { throw '找不到 Take-Scroll' }
+
+    $bad = @()
+    if ($take -notmatch '\[System\.IO\.File\]::Delete\(\$scrollDat\)') { $bad += 'Take-Scroll 不正视删除（仍指望一次读走就完事）' }
+    if ($take -notmatch 'Test-Path\s+\$scrollDat') { $bad += 'Take-Scroll 删完不复核（删没删掉都不知道 → 会重复消费）' }
+    if ($take -notmatch '\$cleared') { $bad += 'Take-Scroll 没有 $cleared 清空闸' }
+    if ($take -notmatch 'if\s*\(\s*-not\s+\$cleared\s*\)[\s\S]*?return\s+0') { $bad += '$cleared 闸没挡住下发（清不掉时照样把读数返回）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体（函数级）：把 Take-Scroll 单独取出来，在临时目录里跑 ——
+    # 不碰真实 scroll.dat、不占端口、不影响正在跑的代理。
+    $tmp = Join-Path $env:TEMP ('dsh_scroll_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $probe = {
+            param($src, $dir)
+            $appDir = $dir
+            function Agent-Log([string]$m) { }
+            . ([scriptblock]::Create($src))
+            $f = Join-Path $dir 'scroll.dat'
+            # ① 正常路径：三条意图一次取走（+2+3-1=4），文件必须消失
+            [System.IO.File]::WriteAllText($f, "+2`r`n+3`r`n-1`r`n")
+            $a = Take-Scroll
+            $gone1 = -not (Test-Path -LiteralPath $f)
+            # ② 占住句柄：只允许别人读，不允许写/删（等价于「删除会失败」的那个时刻）
+            [System.IO.File]::WriteAllText($f, "+5`r`n")
+            $fs = [System.IO.File]::Open($f, 'Open', 'Read', 'Read')
+            try {
+                $b = Take-Scroll
+                $c = Take-Scroll
+                $still = Test-Path -LiteralPath $f
+            } finally { $fs.Dispose() }
+            # ③ 放开句柄：这 1 条意图只能被交付一次
+            $d = Take-Scroll
+            $gone2 = -not (Test-Path -LiteralPath $f)
+            return [pscustomobject]@{ A = $a; Gone1 = $gone1; B = $b; C = $c; Still = $still; D = $d; Gone2 = $gone2 }
+        }
+        $r = & $probe $take $tmp
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+
+    if ($r.A -ne 4) { throw ('正常路径没取到期望的增量（期望 4，实际 ' + $r.A + '）') }
+    if (-not $r.Gone1) { throw '正常路径取走后 scroll.dat 还在（等于没消费）' }
+    if ($r.B -ne 0 -or $r.C -ne 0) { throw ('文件清不掉时仍下发了意图（两次分别读 ' + $r.B + ' / ' + $r.C + '）—— 会被重复消费') }
+    if (-not $r.Still) { throw '测试前提不成立：占住句柄期间 scroll.dat 竟然被删掉了' }
+    if ($r.D -ne 5) { throw ('放开句柄后应恰好交付一次 5，实际 ' + $r.D) }
+    if (-not $r.Gone2) { throw '放开句柄后意图仍没被清掉' }
+    ('清不掉时 2 次轮询都返回 0、放开后恰好交付一次（' + $r.A + ' → 0/0 → ' + $r.D + '）')
+} -Hint '「读到」不等于「取走」：消费型文件必须「清掉才算取走」，清不掉这一轮不发（内容留在文件里，下一轮再取）'
+
+Test-Case RES-014 '健壮' '文件召唤：删掉才算消费（AHK SummonTick）' medium {
+    # 同 RES-013 的消费端，只是换到 AHK 侧：SummonTick 每 400ms 读 summon.cmd，
+    # 原来「读完 → FileDelete → 无论删没删掉都派发」。删失败时（/summon.gif 刚 Move 完、
+    # 杀软在扫、策略拦删）同一条命令每 400ms 重放一次 ——
+    # `show`/`hide` 幂等还看不出来，`diag` 会刷日志、`foldertest=` 会反复弹窗，
+    # 最坏的是 `log=N` 反复导出。所以要求「删完复核，删不掉这一轮不派发」。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $i = $ahk.IndexOf('SummonTick() {')
+    if ($i -lt 0) { throw '找不到 SummonTick' }
+    $j = $ahk.IndexOf("`n}", $i)
+    if ($j -lt 0) { $j = $ahk.Length }
+    $fn = $ahk.Substring($i, $j - $i)
+
+    $bad = @()
+    if ($fn -notmatch 'FileDelete\(SUMMON_FILE\)') { $bad += 'SummonTick 没有删除 summon.cmd' }
+    # 复核必须挡在派发之前：FileDelete 之后、真正调用命令（SUMMON_CMDS 查表/前缀匹配）之前要有一道
+    # 「文件还在就 return」。注意两个坑（本轮踩过）：
+    #   ①函数头就有 `if !FileExist(SUMMON_FILE) return`，拿它当判据会永远是绿的；
+    #   ②`if (cmd = "") return` 也在删除之后，同样会误判 —— 所以只认「FileExist 后面紧跟 return」。
+    $di = $fn.IndexOf('FileDelete(SUMMON_FILE)')
+    $ci = $fn.IndexOf('SUMMON_CMDS.Has')
+    if ($di -lt 0 -or $ci -lt 0 -or $ci -le $di) {
+        $bad += 'SummonTick 的删除不在派发之前'
+    } else {
+        $guard = $fn.Substring($di, $ci - $di)
+        if ($guard -notmatch 'FileExist\(SUMMON_FILE\)[\s\S]{0,80}?return') {
+            $bad += 'SummonTick 删不掉时没提前 return（照样派发 → 每 400ms 重放一次）'
+        }
+    }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体：走**文件通道**写一条 diag（和 RUN-011 同一条路）。
+    # 不要用 /summon.gif：那条路由只认 d=1|hide，其余一律写 show —— 深夜会把抽屉弹开。
+    $inst = Get-DshInstall
+    if (-not (Get-Process -Name 'AutoHotkey64' -ErrorAction SilentlyContinue)) {
+        return @{ Status = 'skip'; Detail = '抽屉没在跑（AutoHotkey64 不存在），活体部分跳过；静态判据已通过' }
+    }
+    $log = Join-Path $inst 'wheel.log'
+    $countDiag = {
+        param($p)
+        if (-not (Test-Path -LiteralPath $p)) { return 0 }
+        $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+        try { $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8); $all = $sr.ReadToEnd(); $sr.Dispose() } finally { $fs.Dispose() }
+        return @([regex]::Matches($all, 'diag:')).Count
+    }
+    $sf = Join-Path $inst 'summon.cmd'
+    $before = & $countDiag $log
+    [System.IO.File]::WriteAllText($sf, 'diag', (New-Object System.Text.UTF8Encoding($false)))
+    $after = $before
+    for ($k = 0; $k -lt 12; $k++) {
+        Start-Sleep -Milliseconds 250
+        $after = & $countDiag $log
+        if ($after -gt $before) { break }
+    }
+    if ($after -le $before) {
+        throw ('静态判据齐全，但活体 diag 没落地（diag 行 ' + $before + ' → ' + $after + '）—— 复核把正常命令也挡掉了')
+    }
+    if (Test-Path -LiteralPath $sf) { throw 'diag 落了日志，但 summon.cmd 没被消费掉（文件还在）' }
+    ('SummonTick 删完复核、删不掉不派发；活体 diag 落地并被消费（diag 行 ' + $before + ' → ' + $after + '）')
+} -Hint 'AHK 侧无法自动校验语法，这条只用静态文本 + 一条真实 diag 兜住「没把正常命令挡掉」'
+
+Test-Case RES-015 '健壮' '审计轮转：三端共写，判据要对齐真实尺寸' medium {
+    # audit.log 是三端共写的（[AHK ] / [API ] / [WEB ]）。实测 2331 行里 1999 行来自抽屉 ≈ 90%，
+    # 代理只占 9%。轮转判据如果只累加「自己写进去的字节」，这个值就和真实尺寸脱钩：
+    #   · 偏小 → 代理这辈子都到不了 2MB，它那段轮转形同虚设；
+    #   · 偏大 → 别人（AHK 每 32 条会 FileGetSize 对齐）刚轮转完、文件归 0，它还以为快满，
+    #            于是「提前轮转」一个很小的文件，把上一份真正的 2MB 历史 audit.log.1 覆盖掉。
+    # AHK 侧一直有「每 32 条与真实尺寸对齐」；代理侧原来只有启动时取一次初值、此后只累加自己的字节。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $i = $agent.IndexOf('function Write-Audit')
+    if ($i -lt 0) { throw '找不到 Write-Audit' }
+    $j = $agent.IndexOf("`nfunction ", $i + 1)
+    if ($j -lt 0) { $j = $agent.Length }
+    $fn = $agent.Substring($i, $j - $i)
+
+    $bad = @()
+    if ($fn -notmatch '\$script:auditWrites') { $bad += 'Write-Audit 没有写入计数（无从判断何时该对齐）' }
+    if ($fn -notmatch '%\s*32') { $bad += 'Write-Audit 没有「每 32 条对齐一次」的节奏' }
+    if ($fn -notmatch '(FileInfo|Get-Item)[\s\S]{0,80}\.Length') { $bad += 'Write-Audit 从不读真实文件尺寸（只累加自己的字节 = 判据脱钩）' }
+
+    # 另一半：AHK 侧的对齐不能被悄悄删掉（否则这条不变式只剩一边，等于没有）
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $ai = $ahk.IndexOf('AuditLog(action, detail')
+    if ($ai -lt 0) { throw '找不到 AHK 的 AuditLog' }
+    $aj = $ahk.IndexOf("`n}", $ai)
+    if ($aj -lt 0) { $aj = $ahk.Length }
+    $afn = $ahk.Substring($ai, $aj - $ai)
+    if ($afn -notmatch 'Mod\(AUDIT_WRITES,\s*32\)') { $bad += 'AHK AuditLog 丢了「每 32 条对齐」' }
+    if ($afn -notmatch 'FileGetSize\(AUDIT_FILE\)') { $bad += 'AHK AuditLog 不再读真实尺寸（FileGetSize）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # 活体（函数级）：把 Write-Audit 取出来在临时目录里跑 —— 不碰真实 audit.log、不占端口。
+    # 造一个「本地计数器远远落后于真实尺寸」的时刻（别人写了 2.2MB，代理以为自己才写了 1KB），
+    # 再补一条自己的写入：对齐过的实现必须当场轮转，没对齐的会让 2.2MB 那份继续躺着。
+    $tmp = Join-Path $env:TEMP ('dsh_audit_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $r = & {
+            param($src, $dir)
+            $auditFile = Join-Path $dir 'audit.log'
+            $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
+            $script:auditWrites = 31          # 下一条正好是第 32 条 → 触发对齐
+            $script:auditBytes = 1000         # 陈旧值：只算自己的字节
+            [System.IO.File]::WriteAllText($auditFile, ('x' * 2200000), (New-Object System.Text.UTF8Encoding($false)))
+            . ([scriptblock]::Create($src))
+            Write-Audit 'test' 'k=v'
+            return [pscustomobject]@{
+                Size   = (Get-Item -LiteralPath $auditFile).Length
+                Rotated = Test-Path -LiteralPath ($auditFile + '.1')
+            }
+        } $fn $tmp
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+    if (-not $r.Rotated) { throw ('真实尺寸 2.2MB 超过 2MB 上限却没轮转（audit.log 仍有 ' + $r.Size + ' 字节）—— 判据只认自己的累加值') }
+    if ($r.Size -ne 0) { throw ('轮转后 audit.log 应为空文件，实际 ' + $r.Size + ' 字节') }
+    '两端都按真实尺寸对齐（每 32 条）；活体：陈旧计数器遇上 2.2MB 文件仍当场轮转'
+} -Hint '三端共写的文件，任何一端的轮转判据都必须定期回到「真实文件尺寸」，只累加自己写的字节早晚会脱钩'
+
+Test-Case RES-016 '健壮' '日志轮转：改名失败不许截空（历史不能和它唯一的备份一起丢）' medium {
+    # 轮转是「改名 → 截空」两步，老写法两步之间没有依赖：
+    #   Move-Item … -ErrorAction SilentlyContinue    ← 失败不抛、不记、不管
+    #   WriteAllText($log, '')                       ← 照样执行
+    # 于是改名失败时（AHK 正持有句柄追加 audit.log / 有人把 audit.log.1 开着看 /
+    # 上一轮 dsh 还活着、cmd 的 >> 句柄占着 dsh-run.log / 杀软在扫）整份历史被抹成
+    # 0 字节，而 .1 里还是上一代的内容 —— 恰好在最需要这份日志的时刻丢证据，
+    # 而且 dsh-agent.log、audit.log、verify.ps1 三处都不会留下任何痕迹。
+    # 实测：audit.log 2680000 字节 → 0，.1 仍是 15 字节的上一代。
+    # 不变式：**改名成功才许截空**；没轮转成要把计数器拉回真实尺寸并留痕（下次再试）。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $bad = @()
+
+    # ---- 静态一：audit.log ----
+    $i = $agent.IndexOf('function Write-Audit')
+    if ($i -lt 0) { throw '找不到 Write-Audit' }
+    $j = $agent.IndexOf("`nfunction ", $i + 1); if ($j -lt 0) { $j = $agent.Length }
+    $fn = $agent.Substring($i, $j - $i)
+    $ri = $fn.IndexOf('if ($script:auditBytes -gt 2097152)')
+    if ($ri -lt 0) { throw 'Write-Audit 里找不到 2MB 轮转分支' }
+    # 只看代码：注释里会原样引用旧写法（"Move-Item … SilentlyContinue / WriteAllText(…)"），
+    # 不剥掉就会被自己的注释判成还没改（本轮踩过一次，RES-014 也踩过同型的坑）。
+    $rot = ((($fn.Substring($ri)) -split "`n") | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+    if ($rot -match 'Move-Item[^\r\n]*-ErrorAction\s+SilentlyContinue') { $bad += 'audit.log 轮转仍是「静默改名」（-ErrorAction SilentlyContinue），失败无从观察' }
+    $trunc = $rot.IndexOf('WriteAllText($auditFile')
+    $guard = $rot.IndexOf('if ($moved')
+    if ($trunc -lt 0) { $bad += 'Write-Audit 的轮转分支里找不到截空（WriteAllText($auditFile）' }
+    if ($guard -lt 0) { $bad += 'audit.log 轮转没有「改名成功」的闸（截空与改名之间无依赖）' }
+    elseif ($guard -gt $trunc) { $bad += 'audit.log 的截空写在闸之前（改名失败照样截空 = 历史归零）' }
+    if ($rot -notmatch 'Agent-Log') { $bad += 'audit.log 轮转失败不留痕（失败必须写一行 dsh-agent.log，否则又是静默失败）' }
+    if ($rot -notmatch '(FileInfo|Get-Item)[\s\S]{0,80}\.Length') { $bad += 'audit.log 轮转失败后没把计数器拉回真实尺寸（下次一写就判空）' }
+
+    # ---- 静态二：dsh-run.log / dsh-run.err.log ----
+    $si = $agent.IndexOf('function Start-Run')
+    if ($si -lt 0) { throw '找不到 Start-Run' }
+    $sj = $agent.IndexOf("`nfunction ", $si + 1); if ($sj -lt 0) { $sj = $agent.Length }
+    $srun = ((($agent.Substring($si, $sj - $si)) -split "`n") | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+    if ($srun -match 'Move-Item[^\r\n]*-ErrorAction\s+SilentlyContinue') { $bad += 'dsh-run.log 轮转仍是「静默改名」，上一轮 cmd 的 >> 句柄占着时失败照样截空' }
+    $st = $srun.IndexOf('WriteAllText($f')
+    $sg = $srun.IndexOf('if ($rotOk')
+    if ($st -ge 0 -and ($sg -lt 0 -or $sg -gt $st)) { $bad += 'dsh-run.log 的截空没有「改名成功」的闸（$rotOk）' }
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+
+    # ---- 活体（函数级）：把 Write-Audit 取到临时目录里跑，不碰真实 audit.log、不占端口 ----
+    # A 段：有人正开着 .1（只读句柄）→ 改名必然失败 → audit.log 必须原样留着
+    # B 段：放开句柄再写一条 → 必须真的轮转（说明失败后还会重试）
+    $tmp = Join-Path $env:TEMP ('dsh_rot_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $r = & {
+            param($src, $dir)
+            $auditFile = Join-Path $dir 'audit.log'
+            $script:auditEnc = New-Object System.Text.UTF8Encoding($false)
+            $script:auditWrites = 32          # 这一条正好触发「与真实尺寸对齐」
+            $script:auditBytes = 3000000      # 已超 2MB 上限
+            $script:auditRotSkipAt = [long]0
+            $enc = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($auditFile, ('y' * 2680000), $enc)
+            $bak = $auditFile + '.1'
+            [System.IO.File]::WriteAllText($bak, 'OLD-GENERATION', $enc)
+            $bakBefore = (Get-Item -LiteralPath $bak).Length
+            . ([scriptblock]::Create($src))
+            $lock = [System.IO.File]::Open($bak, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            try { Write-Audit 'probe' 'k=1' } catch { }
+            $kept = (Get-Item -LiteralPath $auditFile).Length
+            $bakKept = (Get-Item -LiteralPath $bak).Length
+            $lock.Dispose()
+            Write-Audit 'probe' 'k=2'
+            return [pscustomobject]@{
+                Kept      = $kept
+                BakKept   = $bakKept
+                BakBefore = $bakBefore
+                Size      = (Get-Item -LiteralPath $auditFile).Length
+                Bak       = (Get-Item -LiteralPath $bak).Length
+            }
+        } $fn $tmp
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+    if ($r.Kept -lt 2680000) { throw ('改名失败时 audit.log 被截空了（' + $r.Kept + ' 字节，2.68MB 历史归零）—— 轮转两步之间没有依赖') }
+    if ($r.BakKept -ne $r.BakBefore) { throw ('改名失败时 .1 也被动了（' + $r.BakKept + ' 字节，应为 ' + $r.BakBefore + '）') }
+    if ($r.Bak -lt 2600000) { throw ('放开句柄后再写一条仍没轮转（.1 = ' + $r.Bak + ' 字节）—— 失败后不会重试') }
+    if ($r.Size -ne 0) { throw ('轮转后 audit.log 应为空文件，实际 ' + $r.Size + ' 字节') }
+    '两端都是「改名成功才截空」；活体：.1 被占用时 2.68MB 历史原样留着，放开后重试当场轮转'
+} -Hint '轮转是「改名 + 截空」两步，第一步失败时第二步绝不能执行 —— 否则历史与它唯一的备份一起没了，而且哪儿都不报错'
+
+Test-Case RES-017 '健壮' '审计轮转互斥：两个写者不能同时把 .1 覆盖成小文件' medium {
+    # P2（2026-11-11）：audit.log 有两个轮转者（AHK AuditLog / 代理 Write-Audit）。
+    # 两端同时越过 2MB 时，后一个 FileMove 会把对方刚写好的 .1 覆盖成一个很小的新文件，
+    # 真正的 2MB 历史只剩内存里的旧计数 —— 静默丢证据。约定：共用命名互斥体，
+    # 抢到锁后必须复检真实尺寸（等锁期间对方可能已经轮转完）。
+    $root = Get-DshRoot
+    $agent = Read-Raw (Join-Path $root 'drawer\dsh-agent.ps1')
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $bad = @()
+
+    if ($agent -notmatch 'Global\\DesktopPage_audit') { $bad += '代理没有用 Global\DesktopPage_audit 互斥体' }
+    $i = $agent.IndexOf('function Write-Audit')
+    if ($i -lt 0) { throw '找不到 Write-Audit' }
+    $j = $agent.IndexOf("`nfunction ", $i + 1); if ($j -lt 0) { $j = $agent.Length }
+    $wb = $agent.Substring($i, $j - $i)
+    if ($wb -notmatch 'auditMtx[\s\S]{0,160}WaitOne\(') { $bad += '代理轮转前没有在 auditMtx 上 WaitOne' }
+    if ($wb -notmatch 'ReleaseMutex') { $bad += '代理轮转后没有 ReleaseMutex（异常一次就永久占锁）' }
+    if ($wb -notmatch 'WaitOne\([\s\S]{0,500}FileInfo[\s\S]{0,100}\.Length') { $bad += '代理抢锁后没有复检真实尺寸' }
+
+    if ($ahk -notmatch 'Global\\DesktopPage_audit') { $bad += 'AHK 没有用同一个互斥体名' }
+    if ($ahk -notmatch 'CreateMutexW') { $bad += 'AHK 没有 CreateMutexW' }
+    if ($ahk -notmatch 'WaitForSingleObject') { $bad += 'AHK 轮转前没有 WaitForSingleObject' }
+    if ($ahk -notmatch 'ReleaseMutex') { $bad += 'AHK 轮转后没有 ReleaseMutex' }
+    if ($ahk -notmatch 'WaitForSingleObject[\s\S]{0,500}FileGetSize\(AUDIT_FILE\)') { $bad += 'AHK 抢锁后没有复检 FileGetSize' }
+    if ($ahk -notmatch 'FileMove\(AUDIT_FILE, AUDIT_FILE "\.1", 1\)') { $bad += 'AHK 的轮转改名不在锁内或写法变了' }
+
+    if ($bad.Count -gt 0) { throw ($bad -join '；') }
+    '两个轮转者共用 Global\DesktopPage_audit；抢锁后复检尺寸，不会再互覆盖 .1'
+} -Hint 'P2（2026-11-11）：AHK 与代理同时越过 2MB 时，后一个会把 .1 覆盖成刚建的小文件，前一个 2MB 历史丢失'
+
+Test-Case RES-018 '健壮' 'AHK 滚动写入有 64KB 上限；桥日志改名成功才截空' medium {
+    # P3：AgentScroll 只追加不设上限，代理假死时 scroll.dat 能涨到几百 MB，下一次读盘卡住。
+    # P2：wheel-bridge 的 C# 轮转原来是 File.Copy + 截空，两步之间崩掉会留下两份，
+    # 主文件被截空后唯一完整的历史只剩 .1。改成 File.Replace/Move 后再建空。
+    $root = Get-DshRoot
+    $ahk = Read-Raw (Join-Path $root 'drawer\DesktopPage.ahk')
+    $i = $ahk.IndexOf('AgentScroll(delta)')
+    if ($i -lt 0) { throw '找不到 AgentScroll' }
+    $j = $ahk.IndexOf("`n}", $i); if ($j -lt 0) { $j = $ahk.Length }
+    $ab = $ahk.Substring($i, $j - $i)
+    if ($ab -notmatch 'FileGetSize\(SCROLL_FILE\)\s*>\s*65536') { throw 'AgentScroll 没有 64KB 上限检查' }
+    if ($ab -notmatch 'FileOpen\(SCROLL_FILE,\s*"w"') { throw 'AgentScroll 超限后没有截空' }
+
+    $bridge = Read-Raw (Join-Path $root 'drawer\wheel-bridge.ps1')
+    if ($bridge -match 'File\.Copy\(') { throw '桥日志轮转还是 File.Copy + 截空（非原子）' }
+    if ($bridge -notmatch 'File\.Replace\(_logPath') { throw '桥日志轮转没有 File.Replace' }
+    if ($bridge -notmatch 'File\.Move\(_logPath') { throw '桥日志轮转没有 File.Move 兜底' }
+    $li = $bridge.IndexOf('public static void Log(string s)')
+    if ($li -lt 0) { throw '找不到桥的 Log 函数' }
+    $lj = $bridge.IndexOf('static void ReadTarget', $li); if ($lj -lt 0) { $lj = $bridge.Length }
+    $lb = $bridge.Substring($li, $lj - $li)
+    $iMove = $lb.IndexOf('File.Move(_logPath')
+    $iTrunc = $lb.IndexOf('File.WriteAllText(_logPath, string.Empty)')
+    if ($iTrunc -lt 0) { throw '桥日志轮转没有建空文件' }
+    if ($iMove -ge 0 -and $iTrunc -lt $iMove) { throw '桥日志截空写在改名之前（改名失败就丢历史）' }
+    '滚动文件 64KB 闸 + 桥日志改名成功才截空'
+} -Hint 'P2/P3（2026-11-11）：scroll.dat 无上限会被假死代理撑爆；桥日志 File.Copy 非原子'

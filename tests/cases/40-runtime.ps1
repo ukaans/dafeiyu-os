@@ -124,12 +124,12 @@ Test-Case RUN-005 '运行时' 'state.js 字段齐全' high {
     Assert-True $r.Ok ('请求失败：' + $r.Error)
     $b = [string]$r.Body
     Assert-Match $b 'window\.__DSH_STATE\s*=' 'JSONP 赋值前缀'
-    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines', 'sig', 'err', 'reload', 'dbg')
+    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines', 'sig', 'err', 'dbg')
     $miss = @()
     foreach ($k in $need) { if ($null -eq (Run-Prop $b $k)) { $miss += $k } }
     if ($miss.Count -gt 0) { throw ('缺字段：' + ($miss -join '、') + '（前端会显示 -- 或不更新）') }
     ('10 个字段齐全：web=' + (Run-Prop $b 'web') + ' busy=' + (Run-Prop $b 'busy') + ' bal=' + (Run-Prop $b 'bal') + ' drawer=' + (Run-Prop $b 'drawer') + ' sig=' + (Run-Prop $b 'sig'))
-} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1（sig/err/reload/dbg 是 2026-11-05 会话视图加的）'
+} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1（sig/err/dbg 是 2026-11-05 会话视图加的；reload 已于 2026-11-11 收敛到 /scroll.js 单入口）'
 
 Test-Case RUN-006 '运行时' 'state.lines 是可渲染字符串数组' medium {
     if (-not (Test-DshApiUp)) { return (Test-DshAbort) }
@@ -280,13 +280,26 @@ Test-Case RUN-012 '运行时' '滚轮桥热跟随（桥没在旧 hwnd 上打转�
         return @{ Status = 'warn'; Detail = ('wheel-bridge.hwnd 空着或不是数字（抽屉还没 announce 成功）：beat=' + $last) }
     }
     if ($beatTarget -ne $fileHwnd) {
+        # beat 是 60 秒一行、follow 是 5 秒一次 tick：抽屉刚重启时「已经跟随、但还没到下一个 beat」是
+        # 合法窗口，不是故障（2026-11-09 实测误报：02:05:31 已写 `target: follow hwnd=1704044`，
+        # 02:06:01 的 beat 才带上新目标，中间那次判据直接抛红）。所以先看「最后一次 beat 之后有没有 follow」。
+        $all = @(Sec-ReadShared $log 400)
+        $lastBeatIdx = -1
+        for ($i = 0; $i -lt $all.Count; $i++) { if ($all[$i] -match 'beat ') { $lastBeatIdx = $i } }
+        $followed = $false
+        for ($i = $lastBeatIdx + 1; $i -lt $all.Count; $i++) {
+            if ($all[$i] -match ('target: follow hwnd=' + $fileHwnd + '(?!\d)')) { $followed = $true; break }
+        }
+        if ($followed) {
+            return ('桥已跟随到 ' + $fileHwnd + '（最后一次 beat 之后有 follow 行），下一个 beat 才会带上新目标；follows=' + $follows + ' alive=' + $alive)
+        }
         $fileAge = ((Get-Date) - (Get-Item -LiteralPath $hwndFile).LastWriteTime).TotalSeconds
         $logAge = ((Get-Date) - (Get-Item -LiteralPath $log).LastWriteTime).TotalSeconds
         if ($fileAge -lt 30 -and $fileAge -lt $logAge) {
             # 抽屉刚 announce、桥还没走到下一个 tick：不是故障，别误报
             return @{ Status = 'warn'; Detail = ('抽屉 ' + [int]$fileAge + ' 秒前才 announce，桥还没等到下一个 tick：beat target=' + $beatTarget + '，文件=' + $fileHwnd) }
         }
-        throw ('桥没跟随：beat target=' + $beatTarget + '，但 wheel-bridge.hwnd=' + $fileHwnd + '（同一次 tick 里目标该换成新 hwnd；差得久说明跟随逻辑失效）')
+        throw ('桥没跟随：beat target=' + $beatTarget + '，但 wheel-bridge.hwnd=' + $fileHwnd + '（最后一次 beat 之后也没有对应的 follow 行；跟随逻辑失效）')
     }
     ('桥热跟随正常：beat target = wheel-bridge.hwnd = ' + $fileHwnd + '，follows=' + $follows + ' alive=' + $alive)
 } -Hint '红了先看 wheel-bridge.log 末尾：target=0/alive=0 说明抽屉没 announce（回 wheel.log 搜 announce 落盘失败）；没有 follows= 字段说明桥还在跑旧脚本，kill 掉重启一次'
