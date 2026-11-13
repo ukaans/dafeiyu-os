@@ -210,3 +210,40 @@ Test-Case DAT-008 '数据' '待办生成物整份替换（先删再写会把它�
     }
     ('整份替换（tmp+FileMove，UTF-8-RAW）；生成物 1 份定义，' + (Get-Item -LiteralPath $tj).Length + ' 字节')
 } -Hint '生成物一律「先写 .tmp 再 FileMove 覆盖」；不要先 Delete 再 Append —— 空窗期读者看到的是「文件不存在」'
+
+Test-Case DAT-009 '数据' '图标重建失败时不毁旧图标' high {
+    # 00:25 事故的机制：全量模式先删 icons\ 再 Add-Type；抽屉是 Low IL，Add-Type（csc 写 %TEMP%）
+    # 抛「拒绝访问」→ 目录已空、脚本中断 → 所有格子建不出控件，热键/滚轮/按钮全废。
+    # 这里在临时副本上把 Add-Type 换成必抛异常，验证「失败 → 非 0 退出 + 旧图标原样保留」。
+    $src = Join-Path (Get-DshRoot) 'drawer\Build-IconCache.ps1'
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-iconcache-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    try { [void](New-Item -ItemType Directory -Path $tmpRoot -Force) } catch { }
+    $script = Read-Raw $src
+    $script = $script.Replace('Add-Type -AssemblyName System.Drawing', "throw 'simulated add-type failure'")
+    [System.IO.File]::WriteAllText((Join-Path $tmpRoot 'Build-IconCache.ps1'), $script, (New-Object System.Text.UTF8Encoding($true)))
+    $icons = Join-Path $tmpRoot 'icons'
+    [void](New-Item -ItemType Directory -Path $icons -Force)
+    $sentinel = Join-Path $icons 'keep-me.png'
+    [System.IO.File]::WriteAllBytes($sentinel, [byte[]](0x89, 0x50, 0x4E, 0x47))
+    [System.IO.File]::WriteAllText((Join-Path $tmpRoot 'items.tsv'), "keep`tC:\keep.png`ticons\keep-me.png`tfile`r`n", (New-Object System.Text.UTF8Encoding($false)))
+
+    # 注意：不能用 & powershell 2>&1 —— 测试库里 $ErrorActionPreference='Stop'，
+    # 子进程写到 stderr 的每一行都会变成终止性错误，脚本会直接在这里炸掉。
+    $so = Join-Path $tmpRoot 'run.out.txt'
+    $se = Join-Path $tmpRoot 'run.err.txt'
+    $proc = Start-Process -FilePath 'powershell.exe' -Wait -PassThru -WindowStyle Hidden `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $tmpRoot 'Build-IconCache.ps1')) `
+        -RedirectStandardOutput $so -RedirectStandardError $se
+    $rc = $proc.ExitCode
+    $errText = ''
+    try { $errText = Read-Raw $se } catch { }
+    $kept = Test-Path -LiteralPath $sentinel
+    $stageLeft = @(Get-ChildItem -LiteralPath $tmpRoot -Directory -Filter 'icons.new-*' -ErrorAction SilentlyContinue).Count
+    try { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+
+    if ($rc -eq 0) { throw 'Add-Type 失败时脚本仍然返回 0（调用方会以为重建成功）' }
+    if (-not $kept) { throw 'Add-Type 失败后旧图标被删掉了 —— 这正是 00:25 图标全空的成因' }
+    if ($stageLeft -gt 0) { throw ('失败后留下 ' + $stageLeft + ' 个 icons.new-* 暂存目录（应清理）') }
+    if ($errText -notmatch 'add-type failed') { throw ('stderr 里没有明确的 add-type failed 提示：' + $errText.Trim()) }
+    ('add-type 失败 → exit=' + $rc + '，旧图标保留，暂存目录已清理')
+} -Hint '重扫在 Low IL 抽屉里必失败；脚本必须失败得干净，绝不能先删后建'

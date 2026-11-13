@@ -124,12 +124,21 @@ Test-Case RUN-005 '运行时' 'state.js 字段齐全' high {
     Assert-True $r.Ok ('请求失败：' + $r.Error)
     $b = [string]$r.Body
     Assert-Match $b 'window\.__DSH_STATE\s*=' 'JSONP 赋值前缀'
-    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'lines', 'sig', 'err', 'dbg')
+    # 2026-11-14 事故：Write-Js 连写两行 ',dbg:'，响应变成 `dbg:,dbg:false` ——
+    # 键值齐全、正则全过，但整条赋值是 JS 语法错误，__DSH_STATE 未定义 → 控制台永久「离线」。
+    # 所以这里必须做结构检查，不能只看"键名存在"。
+    $keys = @([regex]::Matches($b, '(?<=[{,])\s*([A-Za-z_$][\w$]*)\s*:') | ForEach-Object { $_.Groups[1].Value })
+    $dup = @($keys | Group-Object | Where-Object { $_.Count -gt 1 })
+    if ($dup.Count -gt 0) {
+        throw ('重复键：' + (($dup | ForEach-Object { $_.Name + '×' + $_.Count }) -join '、') + '（整条赋值会语法错误）')
+    }
+    if ($b -match ':[,}]') { throw '有空值字段（冒号后面直接是 , 或 }），整条 JS 会语法错误' }
+    $need = @('web', 'scroll', 'busy', 'bal', 'drawer', 'drawerUp', 'lines', 'sig', 'err', 'dbg')
     $miss = @()
     foreach ($k in $need) { if ($null -eq (Run-Prop $b $k)) { $miss += $k } }
     if ($miss.Count -gt 0) { throw ('缺字段：' + ($miss -join '、') + '（前端会显示 -- 或不更新）') }
-    ('10 个字段齐全：web=' + (Run-Prop $b 'web') + ' busy=' + (Run-Prop $b 'busy') + ' bal=' + (Run-Prop $b 'bal') + ' drawer=' + (Run-Prop $b 'drawer') + ' sig=' + (Run-Prop $b 'sig'))
-} -Hint 'dsh.js 的 poll() 直接读这些键；删/改名要同步改 dsh.js 与文档 §3.1（sig/err/dbg 是 2026-11-05 会话视图加的；reload 已于 2026-11-11 收敛到 /scroll.js 单入口）'
+    ('11 个字段齐全且无重复键/空值：web=' + (Run-Prop $b 'web') + ' busy=' + (Run-Prop $b 'busy') + ' bal=' + (Run-Prop $b 'bal') + ' drawer=' + (Run-Prop $b 'drawer') + ' drawerUp=' + (Run-Prop $b 'drawerUp') + ' sig=' + (Run-Prop $b 'sig'))
+} -Hint 'dsh.js 的 poll() 直接读这些键；重复键/空值会让整条赋值语法错误，页面永久「离线」（2026-11-14 事故）'
 
 Test-Case RUN-006 '运行时' 'state.lines 是可渲染字符串数组' medium {
     if (-not (Test-DshApiUp)) { return (Test-DshAbort) }

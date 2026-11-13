@@ -65,6 +65,45 @@ global FORCE_DIRTY := true, SIG_KEY := ""
 global POS := Map()
 global FOLDERS := []
 global GROUP_OF := Map()
+global HB_FILE := APP_DIR "\drawer-hb.txt"
+; 内置系统项：不进 items.tsv（重扫桌面会整个重写它），每次 LoadItems 拼在列表最前面。
+; path 用 shell 命名空间 CLSID；LaunchItem 见到 :: 前缀就走 explorer.exe。
+global SYS_ITEMS := [
+    Map("name", "此电脑", "path", "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "icon", APP_DIR "\icons\sys-thispc.png", "kind", "sys"),
+    Map("name", "回收站", "path", "::{645FF040-5081-101B-9F08-00AA002F954E}", "icon", APP_DIR "\icons\sys-recycle.png", "kind", "sys")
+]
+
+; 2026-11-14：同日启动两份抽屉的竞态。#SingleInstance Force 在"同一秒两次启动"时会双双
+; 存活（00:21 实测：20952 与 29076 同时跑，桥在两个 hwnd 之间来回切，滚轮时灵时不灵）。
+; 显式再兜一层：启动最早期把同脚本的其它实例关掉，只留自己。
+EnsureSingleInstance() {
+    for attempt in [1, 2, 3] {
+        others := []
+        for hwnd in WinGetList("ahk_class AutoHotkey") {
+            if (hwnd = A_ScriptHwnd)
+                continue
+            try {
+                if !InStr(WinGetTitle(hwnd), A_ScriptFullPath)
+                    continue
+            } catch
+                continue
+            pid := WinGetPID(hwnd)
+            if (pid != DllCall("GetCurrentProcessId", "UInt"))
+                others.Push(pid)
+        }
+        if (others.Length = 0)
+            break
+        for pid in others
+            try PostMessage(0x0010, 0, 0, , "ahk_pid " pid)   ; WM_CLOSE → 对方 OnExit 正常收尾
+        Sleep 400
+        for pid in others {
+            if ProcessExist(pid)
+                try ProcessClose(pid)
+        }
+        Sleep 200
+    }
+}
+
 global DRAG := 0, gGhost := 0, gFolderGui := 0, gOverlay := 0
 ; 文件夹弹窗当前那个 Gui 对象：BindOpen/BindRemove 会直接 Destroy，靠它做存活判定
 global FOLDER_POPUP := 0
@@ -194,9 +233,16 @@ LoadFonts() {
 ;  图标清单
 ; ------------------------------------------------------------
 LoadItems() {
-    global ITEMS, HIDDEN, POS_DESK
+    global ITEMS, HIDDEN, POS_DESK, SYS_ITEMS
     ITEMS := []
     LoadHidden()
+    ; 内置「此电脑 / 回收站」放最前（用户要的是抽屉里能直接点）。被用户隐藏过就不再加。
+    for s in SYS_ITEMS {
+        if HIDDEN.Has(s["path"])
+            continue
+        it := Map("name", s["name"], "path", s["path"], "icon", s["icon"], "kind", s["kind"])
+        ITEMS.Push(it)
+    }
     p := APP_DIR "\items.tsv"
     if !FileExist(p)
         return
@@ -293,6 +339,20 @@ ItemIndex(path) {
 ;     （鹰角启动器）会拒绝初始化；代理不在就写启动队列，最后才直连兜底
 ; ------------------------------------------------------------
 LaunchItem(path) {
+    ; shell 命名空间项（此电脑/回收站等）：FileExist 不认，只能交给 explorer.exe。
+    ; explorer 对 ::{CLSID} 会打开对应文件夹窗口（实测「此电脑」「回收站」都能进）。
+    if (SubStr(path, 1, 2) = "::") {
+        try {
+            Run('explorer.exe "' path '"')
+            LogWrite("launch shell: " path)
+            AuditLog("launch.new", "ok=1 via=shell path=" Aq(path))
+            return
+        } catch as e {
+            LogWrite("launch shell failed: " path " err=" e.Message)
+            AuditLog("launch.new", "ok=0 via=shell path=" Aq(path))
+            return
+        }
+    }
     ; 目录走两级回退：
     ;   1) 本地代理 /launchpath.gif —— 交给 explorer.exe 中转（实测 45~63ms 返回，
     ;      而且目标进程的父进程是 explorer，不是 AHK，绕开"AHK 祖先"类保护）
@@ -542,6 +602,29 @@ AgentDockAdd(path, name, iconName) {
     }
 }
 
+; 图标缓存重建也必须走代理：本机 AutoHotkey64 是 Low IL（il=0x1000 实测），
+; 抽屉自己跑 Build-IconCache.ps1 会在 Add-Type（csc 写 %TEMP%）那步「拒绝访问」，
+; 而旧版脚本先删 icons\ —— 于是图标全空、所有格子建不出控件、热键全"失灵"。
+; 代理是 High，同一份脚本在它手里 2.6 秒跑完（实测 116 项）。
+AgentIconBuild() {
+    global AGENT_BASE
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.SetTimeouts(2000, 2000, 20000, 20000)
+        req.Open("GET", AGENT_BASE "/iconbuild.gif", false)
+        tk := AgentToken()
+        if (tk != "")
+            req.SetRequestHeader("X-DSH-Token", tk)
+        req.Send()
+        ok := InStr(req.ResponseText, '"ok":true') > 0
+        LogWrite("iconbuild agent: status=" req.Status " " req.ResponseText)
+        return ok
+    } catch as e {
+        LogWrite("iconbuild agent unavailable: " e.Message)
+        return false
+    }
+}
+
 ; UTF-8 百分号编码（代理侧用 Uri::UnescapeDataString 解码，中文路径必须这样传）
 UrlEncodePath(s) {
     buf := Buffer(StrPut(s, "UTF-8"))
@@ -663,9 +746,59 @@ FitLabel(s, maxPx, pt) {
     return s
 }
 
-; ------------------------------------------------------------
-;  抽屉窗口
-; ------------------------------------------------------------
+FitLabel2(s, maxPx, pt) {
+    ; 两行标签，模仿 Windows 桌面：CJK 可以逐字折，ASCII 只在空格处折；
+    ; 没有空格的整串（Wireshark / iDownForWPF.exe 这类）不硬折，退回单行省略号。
+    ; 返回的字符串里用 `r`n 显式换行（控件是 -Wrap，禁止它自己再折）。
+    Measure(str) {
+        pxC := pt * 1.12 * (A_ScreenDPI / 72)
+        pxA := pt * 0.55 * (A_ScreenDPI / 72)
+        w := 0.0
+        Loop Parse str
+            w += (Ord(A_LoopField) > 0x2E80) ? pxC : pxA
+        return w
+    }
+    if (Measure(s) <= maxPx)
+        return s
+    hasCjk := RegExMatch(s, "[\x{2E80}-\x{9FFF}]") > 0
+    if (!hasCjk && !InStr(s, " "))
+        return FitLabel(s, maxPx, pt)
+    cut := 0
+    i := 1
+    n := StrLen(s)
+    while (i <= n) {
+        if (Measure(SubStr(s, 1, i)) > maxPx) {
+            cut := i - 1
+            break
+        }
+        i += 1
+    }
+    if (cut < 1)
+        cut := 1
+    ; ASCII 串：回退到第一个能放下的空格；退太少就不退（宁可硬切）
+    sp := InStr(SubStr(s, 1, cut), " ", , -1)
+    if (sp > 0 && sp >= 3)
+        cut := sp - 1
+    line1 := RTrim(SubStr(s, 1, cut))
+    rest := LTrim(SubStr(s, cut + 1))
+    if (rest = "")
+        return line1
+    if (Measure(rest) <= maxPx)
+        return line1 "`r`n" rest
+    ell := pt * 0.9 * (A_ScreenDPI / 72)
+    j := 1
+    while (j <= StrLen(rest)) {
+        if (Measure(SubStr(rest, 1, j)) > maxPx - ell) {
+            break
+        }
+        j += 1
+    }
+    tail := SubStr(rest, 1, j - 1)
+    sp2 := InStr(tail, " ", , -1)
+    if (sp2 > 0 && sp2 >= 3)
+        tail := SubStr(tail, 1, sp2 - 1)
+    return line1 "`r`n" RTrim(tail) "…"
+}
 ; ------------------------------------------------------------
 ;  抽屉窗口（只建一次，之后只复用控件）
 ; ------------------------------------------------------------
@@ -728,10 +861,24 @@ SyncItems() {
         try {
             s := DefaultSlot(i)
             c := (i <= CTRL_POOL.Length) ? CTRL_POOL[i] : 0
+            ; 2026-11-14：图标文件可能不在（重扫失败/被杀软清掉）。以前 Picture 指向不存在的
+            ; 文件会抛 "Can't create control."，该条就再也没有 pic/hl → PlaceItem 抛
+            ; "Item has no value" → ShowDrawer 整段中断，热键/滚轮/按钮全"失灵"。
+            ; 现在缺图就换兜底图，条目照常渲染（至少看得见、点得动）。
+            iconPath := it["icon"]
+            if (iconPath = "" || !FileExist(iconPath)) {
+                fb := (it["kind"] = "folder") ? APP_DIR "\icons\sys-fallback-folder.png" : APP_DIR "\icons\sys-fallback-file.png"
+                if !FileExist(fb)
+                    fb := APP_DIR "\folder.png"
+                if FileExist(fb)
+                    iconPath := fb
+            }
             if !c {
                 hl := gDrawer.Add("Picture", "Hidden x0 y0 w" (CELL_W - 6) " h" (CELL_H - 4) " BackgroundTrans", APP_DIR "\hl.png")
-                pic := gDrawer.Add("Picture", "x0 y0 w" ICON_PX " h" ICON_PX " BackgroundTrans", it["icon"])
-                txt := gDrawer.Add("Text", "x0 y0 w" CELL_W " h" Round(18 * SCALE) " Center -Wrap BackgroundTrans cD6CBBB", "")
+                pic := gDrawer.Add("Picture", "x0 y0 w" ICON_PX " h" ICON_PX " BackgroundTrans", iconPath)
+                ; 2026-11-14：改成和 Windows 桌面一样的两行文件名（原来 -Wrap 单行截断，
+                ; 「此电脑」「回收站」之外的项大多显示成 "Wiresh…"，认不出是谁）。
+                txt := gDrawer.Add("Text", "x0 y0 w" (CELL_W - Round(16 * SCALE)) " h" Round(18 * SCALE) " Center -Wrap BackgroundTrans cFFFFFF", "")
                 txt.SetFont("s" Round(6.2 * SCALE), "Microsoft YaHei UI")
                 c := Map("hl", hl, "pic", pic, "txt", txt)
                 CTRL_POOL.Push(c)
@@ -739,11 +886,11 @@ SyncItems() {
             c["hl"].Move(s[1] + 3, s[2], CELL_W - 6, CELL_H - 4)
             c["hl"].Visible := false
             c["pic"].Move(s[1] + (CELL_W - ICON_PX) // 2, s[2] + Round(6 * SCALE), ICON_PX, ICON_PX)
-            if (c["pic"].Value != it["icon"])
-                c["pic"].Value := it["icon"]
+            if (c["pic"].Value != iconPath)
+                c["pic"].Value := iconPath
             ty := s[2] + Round(6 * SCALE) + ICON_PX + Round(2 * SCALE)
-            c["txt"].Move(s[1], ty, CELL_W, Max(Round(18 * SCALE), CELL_H - (ty - s[2]) - 2))
-            lbl := FitLabel(it["name"], CELL_W - Round(20 * SCALE), Round(6.2 * SCALE))
+            c["txt"].Move(s[1] + Round(8 * SCALE), ty, CELL_W - Round(16 * SCALE), Max(Round(18 * SCALE), CELL_H - (ty - s[2]) - 2))
+            lbl := FitLabel2(it["name"], CELL_W - Round(20 * SCALE), Round(6.2 * SCALE))
             if (c["txt"].Value != lbl)
                 c["txt"].Value := lbl
             it["x"] := s[1], it["y"] := s[2]
@@ -759,6 +906,7 @@ SyncItems() {
             try c["txt"].Visible := false
         }
     }
+    WriteDrawerHb()
 }
 
 BuildGui() {
@@ -822,7 +970,13 @@ ShowDrawer(instant := false) {
     if (curPage = 0)
         curPage := 1
     t0 := A_TickCount
-    UpdatePage()
+    ; 单条 item 的渲染问题绝不该让整个抽屉出不来（2026-11-14：缺图标 → PlaceItem 抛错 →
+    ; 热键/滚轮/顶栏按钮全"失灵"）。这里兜住，最多是那几个格子没画好。
+    try {
+        UpdatePage()
+    } catch as e {
+        LogWrite("ShowDrawer: UpdatePage failed: " e.Message)
+    }
     t1 := A_TickCount
     EnsureOverlay()
     t2 := A_TickCount
@@ -932,6 +1086,7 @@ UpdatePage() {
     SIG_KEY := curPage "|" ITEMS.Length "|" FOLDERS.Length "|" HIDDEN.Count
     FORCE_DIRTY := false
     LogWrite("updatepage: page=" curPage "/" n " vis=" vcount " ms=" (A_TickCount - t0))
+    WriteDrawerHb()
 }
 
 PageCount() {
@@ -1267,15 +1422,33 @@ ItemMenu(idx) {
     global ITEMS
     it := ITEMS[idx]
     LogWrite("item menu: " it["name"])
+    isSys := (it["kind"] = "sys")
     m := Menu()
     m.Add("打开", (*) => (HideDrawer(), LaunchItem(it["path"])))
-    m.Add("打开所在位置", (*) => (HideDrawer(), RevealItem(it["path"])))
-    m.Add()
-    m.Add("加入快捷启动栏（壁纸 6 格）", (*) => DockAdd(it))
-    m.Add()
-    m.Add("从抽屉中移除（保留文件）", (*) => RemoveItemFromDrawer(it["path"]))
-    m.Add("删除文件到回收站…", DeleteItemHandler.Bind(it["path"]))
+    ; 系统命名空间项（::{CLSID}）没有真实文件：RevealItem/移除/删除都无意义，
+    ; 强行调用只会报「文件不存在」。只保留「打开」和「隐藏」。
+    if (!isSys) {
+        m.Add("打开所在位置", (*) => (HideDrawer(), RevealItem(it["path"])))
+        m.Add()
+        m.Add("加入快捷启动栏（壁纸 6 格）", (*) => DockAdd(it))
+        m.Add()
+        m.Add("从抽屉中移除（保留文件）", (*) => RemoveItemFromDrawer(it["path"]))
+        m.Add("删除文件到回收站…", DeleteItemHandler.Bind(it["path"]))
+    } else {
+        m.Add()
+        m.Add("从抽屉中隐藏（可在「恢复被移除的图标」里找回）", (*) => HideSystemItem(it))
+    }
     m.Show()
+}
+
+; 只写 HIDDEN，不动 items.tsv —— 系统项不是文件，没有"保留文件"这回事。
+HideSystemItem(it) {
+    global HIDDEN
+    HIDDEN[it["path"]] := true
+    SaveHidden()
+    LogWrite("sys hide: " it["name"])
+    AuditLog("item.hide", "path=" Aq(it["path"]))
+    ReloadItems()
 }
 
 ; 空白处右键：不依赖托盘的主菜单入口
@@ -2226,6 +2399,8 @@ ExitCleanup(*) {
 OnExit(ExitCleanup)
 
 ; ---- 主流程 ----
+; 先清掉同脚本的其它实例（#SingleInstance Force 在同一秒两次启动时会双双存活）。
+EnsureSingleInstance()
 LoadFonts()
 LoadPositions()
 LoadItems()
@@ -2253,6 +2428,7 @@ WHEEL_HK_TICK := A_TickCount
 SetTimer(HoverProbe, 1000)      ; 光标分类变化时写一行 hover: 日志，滚轮排查用
 SetTimer(EdgeProbe, 120)        ; 屏幕边缘热区：滚轮通道整个废掉时的等价唤起入口（零配置默认开）
 SetTimer(SummonTick, 400)       ; 文件召唤通道（代理 /summon.gif / 手动写 summon.cmd 都能用）
+SetTimer(WriteDrawerHb, 20000)  ; 抽屉健康心跳（/state.js 的 drawer 字段就靠它）
 CurPageInit()
 RestoreIconState()
 StartupArgs()
@@ -2273,6 +2449,7 @@ LogWrite("screen: " A_ScreenWidth "x" A_ScreenHeight " dpi=" A_ScreenDPI " scale
 ; 只按进程名 AutoHotkey64 判断会把诊断脚本也算进去（实测 20:03 因此没重启真抽屉）。
 try FileDelete(APP_DIR "\drawer.pid")
 try FileAppend(DllCall("GetCurrentProcessId", "UInt") "`n", APP_DIR "\drawer.pid")
+WriteDrawerHb()        ; 启动完成立刻落一版心跳，别等下个 20 秒
 
 CurPageInit() {
     global curPage
@@ -2569,6 +2746,12 @@ ResolveOverlaps() {
 PlaceItem(idx, x, y) {
     global ITEMS, CELL_W, ICON_PX, SCALE
     it := ITEMS[idx]
+    ; 没建出控件（图标缺失/建控件失败）的条目：只记坐标，不碰控件。
+    ; 少了这个守卫，这里会抛 "Item has no value" 并让 UpdatePage → ShowDrawer 整段中断。
+    if !it.Has("pic") {
+        it["x"] := x, it["y"] := y
+        return
+    }
     if (it.Has("dx") && it["dx"] = x && it["dy"] = y && it["pic"].Visible) {
         it["x"] := x, it["y"] := y
         return
@@ -2603,6 +2786,25 @@ HideItem(idx) {
 Repaint() {
     global gDrawer
     try DllCall("RedrawWindow", "Ptr", gDrawer.Hwnd, "Ptr", 0, "Ptr", 0, "UInt", 0x0185)
+}
+
+; 抽屉心跳 → drawer-hb.txt，代理 /state.js 用它判断「抽屉到底能不能用」。
+; 只看进程在会骗人：控件建失败时进程照样活着，页面显示绿灯而热键毫无反应
+; （用户说的"显示对不上，能用但显示黄色/红色"就是两侧判据不一致）。
+WriteDrawerHb() {
+    global HB_FILE, ITEMS, curPage
+    try {
+        pics := 0
+        for it in ITEMS {
+            if it.Has("pic")
+                pics += 1
+        }
+        ts := DateDiff(A_NowUTC, "19700101000000", "Seconds") * 1000
+        txt := "ts=" ts " items=" ITEMS.Length " pics=" pics " page=" curPage " vis=" (DrawerVisible() ? 1 : 0) "`n"
+        WriteFileAtomic(HB_FILE, txt)
+    } catch as e {
+        try LogWrite("hb write failed: " e.Message)
+    }
 }
 
 MakeFolder(idxA, idxB) {
@@ -2772,13 +2974,13 @@ RenderFolders() {
             label .= " (" ord ")"
         ti += 1
         if (ti > POOL_TXT.Length) {
-            POOL_TXT.Push(gDrawer.Add("Text", "x" x " y" ly " w" CELL_W " h" (CELL_H - (ly - y) - 2) " Center -Wrap BackgroundTrans cF2E6D6", label))
+            POOL_TXT.Push(gDrawer.Add("Text", "x" (x + Round(8 * SCALE)) " y" ly " w" (CELL_W - Round(16 * SCALE)) " h" (CELL_H - (ly - y) - 2) " Center -Wrap BackgroundTrans cFFFFFF", FitLabel2(label, CELL_W - Round(20 * SCALE), Round(6.5 * SCALE))))
             tc := POOL_TXT[ti]
             tc.SetFont("s" Round(6.5 * SCALE), "Microsoft YaHei UI")
         } else {
             tc := POOL_TXT[ti]
-            tc.Value := label
-            tc.Move(x, ly, CELL_W, CELL_H - (ly - y) - 2)
+            tc.Value := FitLabel2(label, CELL_W - Round(20 * SCALE), Round(6.5 * SCALE))
+            tc.Move(x + Round(8 * SCALE), ly, CELL_W - Round(16 * SCALE), CELL_H - (ly - y) - 2)
         }
         tc.Visible := true
     }
@@ -3045,7 +3247,15 @@ RescanDesktop(*) {
     wasOpen := DrawerVisible()
     if wasOpen
         HideDrawer()
-    RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\Build-IconCache.ps1"', , "Hide")
+    ; 图标重建优先交代理（High）；代理不可用才本地兜底 —— 本地跑在 Low IL 下会失败，
+    ; 但新版 Build-IconCache 已经是"先编译、先暂存、成功才换"，失败不会再毁掉旧图标。
+    t1 := A_TickCount
+    if AgentIconBuild()
+        LogWrite("rescan: icon build via agent ok " (A_TickCount - t1) "ms")
+    else {
+        LogWrite("rescan: agent icon build failed, direct fallback")
+        RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\Build-IconCache.ps1"', , "Hide")
+    }
     RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\DesktopPositions.ps1"', , "Hide")
     LoadPositions()
     LoadItems()

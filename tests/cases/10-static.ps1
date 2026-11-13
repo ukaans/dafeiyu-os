@@ -219,6 +219,38 @@ Test-Case STA-008 '静态' '源码无个人绝对路径' low {
     ('扫描 ' + $files.Count + ' 个文件，未发现个人绝对路径')
 } -Hint '用 $env:LOCALAPPDATA / Resolve-WallpaperDir() 代替写死路径'
 
+Test-Case STA-010 '静态' 'Write-Js 只拼一次 dbg 键' high {
+    $p = Join-Path (Get-DshRoot) 'drawer\dsh-agent.ps1'
+    $t = Read-Raw $p
+    $n = ([regex]::Matches($t, [regex]::Escape("Append(',dbg:')"))).Count
+    # 2026-11-14 离线事故：18c57d5 把 reload 那行改成 ',dbg:'，而下一行本来就是 ',dbg:'，
+    # 输出 dbg:,dbg:false —— 整条赋值语法错误，__DSH_STATE 未定义，控制台永久「离线」。
+    if ($n -ne 1) { throw ("Append(',dbg:') 出现 " + $n + ' 次，必须恰好 1 次') }
+    # 顺带守住参数顺序：Write-Js 的形参个数与调用处实参个数必须一致
+    $sig = [regex]::Match($t, 'function Write-Js\(([^)]*)\)')
+    if (-not $sig.Success) { throw '找不到 Write-Js 定义' }
+    $argc = @($sig.Groups[1].Value.Split(',')).Count
+    $call = [regex]::Match($t, 'Write-Js\s+(\$ctx[^\r\n]*)')
+    if (-not $call.Success) { throw '找不到 Write-Js 调用点' }
+    $passed = @($call.Groups[1].Value.Trim().Split(' ')).Count
+    if ($argc -ne $passed) { throw ('Write-Js 形参 ' + $argc + ' 个，调用传了 ' + $passed + ' 个') }
+    ('dbg 键 1 处；Write-Js 形参/实参一致（' + $argc + ' 个）')
+} -Hint 'JSONP 响应里任何重复键/空值都会让整条赋值语法错误；改签名必须同步改调用点'
+
+Test-Case STA-011 '静态' '图标缓存先编译后落盘' high {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\Build-IconCache.ps1')
+    $addType = $t.IndexOf('Add-Type -ReferencedAssemblies')
+    $firstDel = $t.IndexOf('Remove-Item $iconDir')
+    $stage = $t.IndexOf('icons.new-')
+    # 00:25 事故：脚本先 Remove-Item icons\ 再 Add-Type；Low IL 下 Add-Type 失败 → 图标永久空。
+    # 契约：编译必须在任何删除之前；全量模式必须走暂存目录 + 原子换入。
+    if ($addType -lt 0) { throw '找不到 Add-Type' }
+    if ($firstDel -ge 0 -and $firstDel -lt $addType) { throw 'Add-Type 之前就删了 icons\（失败即永久空目录）' }
+    if ($stage -lt 0) { throw '全量模式没有暂存目录（icons.new-<pid>）' }
+    if ($t -notmatch 'Move-Item -LiteralPath \$iconDir -Destination \$bak') { throw '没有「旧 icons 改名备份」这一步，换入失败无法回滚' }
+    '编译先行 + 暂存换入 + 失败回滚 三步齐全'
+} -Hint '重扫在 Low IL 抽屉里必失败；脚本必须幂等失败，绝不能毁掉现有图标'
+
 Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     $root = Get-DshRoot
     $wall = Get-DshWall
