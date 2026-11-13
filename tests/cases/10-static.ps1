@@ -37,7 +37,7 @@ function Static-ShaNoBom([string]$path) {
 $script:StaticRuntimePairs = @(
     'DesktopPage.ahk', 'dsh-agent.ps1', 'agent-watch.ps1', 'ensure-all.ps1', 'ensure-all.vbs',
     'agent-config.ps1', 'start-all.vbs', 'hwmon.ps1', 'wxmon.ps1', 'Build-IconCache.ps1', 'DesktopIcons.ps1',
-    'DesktopPositions.ps1', 'dock-add-host.ps1', 'dock-add.ps1', 'npix.exe', 'AutoHotkey64.exe'
+    'DesktopPositions.ps1', 'dock-add-host.ps1', 'dock-add.ps1', 'wheel-bridge.ps1', 'npix.exe', 'AutoHotkey64.exe'
 )
 
 Test-Case STA-001 '静态' '核心文件齐全' high {
