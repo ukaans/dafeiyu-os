@@ -236,13 +236,10 @@ LoadItems() {
     global ITEMS, HIDDEN, POS_DESK, SYS_ITEMS
     ITEMS := []
     LoadHidden()
-    ; 内置「此电脑 / 回收站」放最前（用户要的是抽屉里能直接点）。被用户隐藏过就不再加。
-    for s in SYS_ITEMS {
-        if HIDDEN.Has(s["path"])
-            continue
-        it := Map("name", s["name"], "path", s["path"], "icon", s["icon"], "kind", s["kind"])
-        ITEMS.Push(it)
-    }
+    ; 2026-11-14：内置「此电脑 / 回收站」改放**最后**。放最前会把 items.tsv 每一条的下标
+    ; 整体 +2，网格位（DefaultSlot 按下标算）跟着挪，而带 dpos 的条目还钉在原坐标上 →
+    ; 用户看到的「顺序被打乱 + 重叠」。追加在尾部，原有条目下标一个都不变。
+    ; 隐藏过的系统项不再加（右键「从抽屉中隐藏」）。
     p := APP_DIR "\items.tsv"
     if !FileExist(p)
         return
@@ -262,6 +259,12 @@ LoadItems() {
                 it["dpos"] := POS_DESK[path]
         }
         ITEMS.Push(it)
+    }
+    ; 系统项追加在最后：不动任何既有下标（见上方注释）。
+    for s in SYS_ITEMS {
+        if HIDDEN.Has(s["path"])
+            continue
+        ITEMS.Push(Map("name", s["name"], "path", s["path"], "icon", s["icon"], "kind", s["kind"]))
     }
 }
 
@@ -342,10 +345,19 @@ LaunchItem(path) {
     ; shell 命名空间项（此电脑/回收站等）：FileExist 不认，只能交给 explorer.exe。
     ; explorer 对 ::{CLSID} 会打开对应文件夹窗口（实测「此电脑」「回收站」都能进）。
     if (SubStr(path, 1, 2) = "::") {
+        ; 2026-11-14 实测：抽屉进程是 Low 完整性，`Run('explorer.exe "::{CLSID}"')` 会**静默失败**
+        ; （Run 不抛异常、explorer 也没有新窗口；探针 E:\DSHWORK\shelltest.log 复现:
+        ; cabinet before=3 → after=3）。所以先交给高完整性的本地代理去起，代理不在才退回本地 Run。
+        t0 := A_TickCount
+        if (AgentLaunch(path)) {
+            LogWrite("launch shell via agent: " path " (" (A_TickCount - t0) "ms)")
+            AuditLog("launch.new", "ok=1 via=agent path=" Aq(path) " ms=" (A_TickCount - t0))
+            return
+        }
         try {
             Run('explorer.exe "' path '"')
-            LogWrite("launch shell: " path)
-            AuditLog("launch.new", "ok=1 via=shell path=" Aq(path))
+            LogWrite("launch shell via run: " path " (" (A_TickCount - t0) "ms)")
+            AuditLog("launch.new", "ok=1 via=run path=" Aq(path))
             return
         } catch as e {
             LogWrite("launch shell failed: " path " err=" e.Message)
@@ -400,7 +412,10 @@ LaunchItem(path) {
         SplitPath(target, , &wd)
     name := ExeNameOf(target)
     if (name != "" && ProcessExist(name)) {
-        loop 25 {
+        ; 2026-11-14：原来等 25×200ms=5s。像微信/QQ 这种常驻后台（进程在、窗口不可见）
+        ; 的用户点击要干等 5 秒才进入启动分支，表现就是「点图标半天没反应」。
+        ; 实测把等待压到 6×150ms=0.9s 足够覆盖旧实例退出/新实例露窗的竞态。
+        loop 6 {
             if WinExist("ahk_exe " name) {
                 WinActivate("ahk_exe " name)
                 LogWrite("launch activate: " path " -> " name)
@@ -409,7 +424,7 @@ LaunchItem(path) {
             }
             if !ProcessExist(name)
                 break
-            Sleep 200       ; 旧实例正在退出，等它走干净再起新的
+            Sleep 150       ; 旧实例正在退出，等它走干净再起新的（总等待已压到 0.9s）
         }
     } else if (isLink && ActivateByTitleContains(ShortcutBaseName(path))) {
         ; 引导器型程序（鹰角启动器的 Launcher.exe 起完就退，真界面是 1.6.0\Games.exe）：
@@ -2699,48 +2714,72 @@ NormalizePositions() {
     return changed
 }
 ; 两个图标被摆到同一格（拖拽/旧坐标吸附后常见）会视觉重叠：把后来的那个顺移到最近的空格。
+; 2026-11-14「防折叠」：任何两个条目的格子都不许重叠。
+; 以前用「(x-GRID_X)/CELL_W 取整」当键，只认网格坐标；带 dpos 的条目坐标不在网格上，
+; 两个不同键但像素上叠在一起时完全查不出来（用户看到的就是图标糊成一坨）。
+; 现在按像素矩形判交、并给后来者找**离原位置最近**的空网格位。
 ResolveOverlaps() {
-    global ITEMS, HIDDEN, GROUP_OF, CELL_W, CELL_H, GRID_X, GRID_Y, GUI_W, GUI_H, POS
-    taken := Map()
+    global ITEMS, CELL_W, CELL_H, GRID_X, GRID_Y, GUI_W, GUI_H, POS, GROUP_OF, HIDDEN
+    placed := []
     changed := false
     for i, it in ITEMS {
         if !it.Has("pic") || !it["pic"].Visible
             continue
-        k := Round((it["x"] - GRID_X) / CELL_W) "_" Round((it["y"] - GRID_Y) / CELL_H)
-        if !taken.Has(k) {
-            taken[k] := i
-            continue
-        }
-        ; 找最近的空格（逐行扫描）
-        found := false
-        row := 0
-        while (row < 40 && !found) {
-            col := 0
-            while (col < 40 && !found) {
-                x := GRID_X + col * CELL_W
-                y := GRID_Y + row * CELL_H
-                if (x + CELL_W > GUI_W || y + CELL_H > GUI_H) {
-                    col := 40
-                    continue
-                }
-                kk := col "_" row
-                if !taken.Has(kk) {
-                    taken[kk] := i
+        x := it["x"], y := it["y"]
+        ; 越界（例如 DefaultSlot 把第 115 条排到屏幕右侧外）也要重排，否则图标看不见、只剩半截
+        outOfBounds := (x < GRID_X - 4) || (y < GRID_Y - 4) || (x + CELL_W > GUI_W + 2) || (y + CELL_H > GUI_H + 2)
+        if (outOfBounds || OverlapsAny(x, y, placed)) {
+            slot := FindFreeSlot(x, y, placed)
+            if (slot.Length) {
+                x := slot[1], y := slot[2]
+                PlaceItem(i, x, y)
+                ; 只在用户显式挪过的条目上更新 layout，避免把 dpos 固定布局写坏
+                if (POS.Has(it["path"]))
                     POS[it["path"]] := [x, y]
-                    PlaceItem(i, x, y)
-                    changed := true
-                    found := true
-                }
-                col += 1
+                changed := true
             }
-            row += 1
         }
+        placed.Push([x, y])
     }
     if changed {
         SaveLayout()
         LogWrite("overlaps resolved")
     }
     return changed
+}
+
+OverlapsAny(x, y, placed) {
+    global CELL_W, CELL_H
+    for p in placed {
+        ; 同格判定：左上角落在同一格内就算折叠（留 4px 容差，避免贴边误判）
+        if (Abs(x - p[1]) < CELL_W - 4 && Abs(y - p[2]) < CELL_H - 4)
+            return true
+    }
+    return false
+}
+
+FindFreeSlot(x, y, placed) {
+    global CELL_W, CELL_H, GRID_X, GRID_Y, GUI_W, GUI_H
+    best := []
+    bestD := 1.0e18
+    row := 0
+    while (GRID_Y + row * CELL_H + CELL_H <= GUI_H + 2) {
+        col := 0
+        while (GRID_X + col * CELL_W + CELL_W <= GUI_W + 2) {
+            sx := GRID_X + col * CELL_W
+            sy := GRID_Y + row * CELL_H
+            if !OverlapsAny(sx, sy, placed) {
+                d := Abs(sx - x) + Abs(sy - y)
+                if (d < bestD) {
+                    bestD := d
+                    best := [sx, sy]
+                }
+            }
+            col += 1
+        }
+        row += 1
+    }
+    return best
 }
 
 PlaceItem(idx, x, y) {

@@ -1523,6 +1523,19 @@ function Invoke-LaunchPath($ctx, $query) {
     # 快捷方式（.lnk）单独处理：走 ShellExecute 会弹「打开文件 - 安全警告」（实测 E:\ 下的
     # .lnk 必弹；弹窗挂着时 Start-Process 一直不返回，用户看到的就是"弹了个框、文件没打开"）。
     # 能解析出 exe 就直接起目标 exe，绕过快捷方式本身的风险检查；其余类型仍走 explorer 中转。
+    # shell 命名空间（此电脑 / 回收站）：抽屉是 Low 完整性，它自己 Run explorer 起不来；由代理（High）代跑。
+    if ($lp -and $lp.StartsWith('::')) {
+        $st0 = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $lp + '"') | Out-Null
+            Agent-Log ('launchpath shell: ' + $lp + ' (' + $st0.ElapsedMilliseconds + 'ms)')
+            Write-Audit 'launch' ('path={0} via=shell ok=1 ms={1}' -f (Quote-Audit $lp), $st0.ElapsedMilliseconds)
+        } catch {
+            Agent-Log ('launchpath shell failed: ' + $lp + ' err=' + $_.Exception.Message)
+            Write-Audit 'launch' ('path={0} via=shell ok=0 ms={1}' -f (Quote-Audit $lp), $st0.ElapsedMilliseconds)
+        }
+        return
+    }
     $lnkDone = $false
     if ($lp -and ($lp -like '*.lnk') -and (Test-Path -LiteralPath $lp)) {
         $sc = $null

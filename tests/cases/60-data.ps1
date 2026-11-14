@@ -9,13 +9,15 @@
 function Data-Lines([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return @() }
     $t = Read-Raw $path
+    # 调用点一律 @(Data-Lines <file>) 包一层：只有一行时 PowerShell 会把单元素数组拆成字符串，
+    # 后面 $lines[0].Trim() 就会变成对 [char] 调用 Trim 而报错（DAT-001 假失败）。
     return @($t -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
 }
 
 Test-Case DAT-001 '数据' 'layout.dat 格式合法' medium {
     $p = Join-Path (Get-DshInstall) 'layout.dat'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'layout.dat 不存在（还没拖过图标）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { throw 'layout.dat 是空的（抽屉会重扫桌面，用户自定义布局丢失）' }
     if ($lines[0].Trim() -ne 'V2') { throw ('首行应为 V2，实际「' + $lines[0] + '」—— 版本头不对会整份不认') }
 
@@ -40,7 +42,7 @@ Test-Case DAT-001 '数据' 'layout.dat 格式合法' medium {
 Test-Case DAT-002 '数据' 'items.tsv 路径可落地' medium {
     $p = Join-Path (Get-DshInstall) 'items.tsv'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'items.tsv 不存在（图标缓存没建过）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { throw 'items.tsv 是空的（抽屉里会一个图标都没有）' }
     $badCol = 0; $checked = 0; $missing = @()
     foreach ($l in $lines) {
@@ -63,7 +65,7 @@ Test-Case DAT-002 '数据' 'items.tsv 路径可落地' medium {
 Test-Case DAT-003 '数据' 'hidden.dat 没有孤儿条目' low {
     $p = Join-Path (Get-DshInstall) 'hidden.dat'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'hidden.dat 不存在（没有隐藏过图标）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { return '隐藏名单为空' }
     $orphan = @($lines | Where-Object { -not (Test-Path -LiteralPath $_) })
     if ($orphan.Count -gt 0) {
@@ -75,7 +77,7 @@ Test-Case DAT-003 '数据' 'hidden.dat 没有孤儿条目' low {
 Test-Case DAT-004 '数据' 'dock.txt 不超上限且路径有效' medium {
     $p = Join-Path (Get-DshInstall) 'dock.txt'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'dock.txt 不存在（没加过快捷启动）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -gt 6) { throw ($lines.Count.ToString() + ' 行，超过面板上限 6 行（第 7 项起画不出来）') }
     $bad = @(); $dead = @()
     foreach ($l in $lines) {
@@ -129,7 +131,7 @@ Test-Case DAT-005 '数据' '生成物 JS 语法合法' medium {
 Test-Case DAT-006 '数据' 'desktop_positions.tsv 格式合法' low {
     $p = Join-Path (Get-DshInstall) 'desktop_positions.tsv'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'desktop_positions.tsv 不存在（没同步过真实桌面）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { throw '文件为空' }
     $bad = 0
     foreach ($l in $lines) {
@@ -149,7 +151,7 @@ Test-Case DAT-007 '数据' '图标缓存没有大面积缺失' low {
     if (-not (Test-Path -LiteralPath $itemsP) -or -not (Test-Path -LiteralPath $iconDir)) {
         return @{ Status = 'skip'; Detail = '图标缓存还没建（items.tsv 或 icons\ 不存在）' }
     }
-    $lines = Data-Lines $itemsP
+    $lines = @(Data-Lines $itemsP)
     $ref = @()
     foreach ($l in $lines) {
         $c = $l -split "`t"
