@@ -191,8 +191,18 @@ foreach ($line in ($text -split "`n")) {
     [void]$sb.Append($p).Append("`t").Append($parts[1]).Append("`t").Append($parts[2]).Append("`r`n")
 }
 $text = $sb.ToString()
+$n = ($text -split "`n" | Where-Object { $_.Trim() -ne "" }).Count
 $dir = Split-Path -Parent $Out
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-[System.IO.File]::WriteAllText($Out, $text, (New-Object System.Text.UTF8Encoding($false)))
-$n = ($text -split "`n" | Where-Object { $_.Trim() -ne '' }).Count
+# 2026-11-14 13:04 事故：图标当时是隐藏的，枚举回来 0 行，这里照样整文件覆盖 →
+# desktop_positions.tsv 变成 0 字节，抽屉失去"原始桌面"落位，113 条集体回网格重排。
+# 现在先写临时文件，只有真抓到坐标才替换；0 行就保留旧文件，让调用方继续用旧 dpos。
+$tmp = "$Out.tmp-$PID"
+[System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+if ($n -lt 1) {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    Write-Output "positions: 0 (kept existing $Out)"
+    exit 4
+}
+Move-Item -LiteralPath $tmp -Destination $Out -Force
 Write-Output "positions: $n -> $Out"

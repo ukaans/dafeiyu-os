@@ -269,11 +269,18 @@ Test-Case STA-012 '静态' '重命名框必须压在覆盖层上面' high {
 Test-Case STA-013 '静态' '重命名收尾要把覆盖层补回来' medium {
     $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
     if ($t -notmatch 'AfterRenameDialog\(\)') { throw '没有 AfterRenameDialog（确定/取消都要补覆盖层）' }
-    foreach ($fn in 'ApplyRename', 'CloseRename') {
+    # 2026-11-14 第 11 轮：ApplyRename 变成「wrapper + ApplyRenameCore」（先用快照护栏），
+    # 所以真正的函数体要在 Core 里找
+    foreach ($fn in 'ApplyRenameCore', 'ApplyRename', 'CloseRename') {
         $m = [regex]::Match($t, "(?s)$fn\([^)]*\)\s*\{(.*?)\r?\n\}")
-        if (-not $m.Success) { throw "找不到 $fn 函数体" }
-        if ($m.Groups[1].Value -notmatch 'AfterRenameDialog\(\)') { throw "$fn 结束时没有调用 AfterRenameDialog" }
+        if (-not $m.Success) { continue }
+        if ($m.Groups[1].Value -notmatch 'AfterRenameDialog\(\)') {
+            if ($fn -eq 'ApplyRename') { continue }   # wrapper 只负责快照
+            throw "$fn 结束时没有调用 AfterRenameDialog"
+        }
+        $found = $true
     }
+    if (-not $found) { throw 'ApplyRename/ApplyRenameCore 都没有调用 AfterRenameDialog' }
     # 文件夹弹窗身份不匹配时，FolderPopupWatch 不能把重命名框当"已关闭"来收尾
     $w = [regex]::Match($t, '(?s)FolderPopupWatch\(\)\s*\{(.*?)\r?\n\}')
     if (-not $w.Success) { throw '找不到 FolderPopupWatch' }
@@ -386,3 +393,89 @@ Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     }
     ('壁纸 ' + (@(Get-ChildItem -LiteralPath (Join-Path $root 'wallpaper') -File).Count) + ' 个文件与运行时一致')
 } -Hint '壁纸改了要拷到 Lively 库那份（路径见 WallpaperLayout.json 的 LivelyInfoPath），再重启 Lively'
+
+Test-Case STA-017 '静态' '图标开关必须走代理（Low IL 本地必失败）' high {
+    $root = Get-DshRoot
+    $ahk = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPage.ahk'), [Text.Encoding]::UTF8)
+    # 抽屉是 Low IL（il=0x1000）：本地跑 DesktopIcons.ps1 会在 Add-Type 处「拒绝访问」，
+    # 2026-11-14 用户报「显示桌面图标没反应」就是这个原因。
+    if ($ahk -notmatch 'AgentIcons\(mode\)') { throw 'AHK 里没有 AgentIcons() helper' }
+    $iIcon = $ahk.IndexOf('if (AgentIcons(mode) != "")')
+    $iLocal = $ahk.IndexOf('local fallback mode=')
+    if ($iIcon -lt 0 -or $iLocal -lt 0 -or $iIcon -gt $iLocal) { throw 'IconsScript 没有先走代理再本地兜底' }
+    $q = $ahk.IndexOf('st := AgentIcons("query")')
+    if ($q -lt 0) { throw 'QueryIcons 没有先问代理' }
+    $ag = [IO.File]::ReadAllText((Join-Path $root 'drawer\dsh-agent.ps1'), [Text.Encoding]::UTF8)
+    if ($ag -notmatch "'/icons\.gif'\s*=\s*@\{") { throw '代理没有 /icons.gif 路由' }
+    if ($ag -notmatch 'function Invoke-Icons') { throw '代理没有 Invoke-Icons 处理函数' }
+    $di = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopIcons.ps1'), [Text.Encoding]::UTF8)
+    if ($di -notmatch 'try \{\s*Add-Type') { throw 'DesktopIcons.ps1 的 Add-Type 没有 try（失败会变成未处理异常）' }
+    if ($di -notmatch 'add-type failed') { throw 'DesktopIcons.ps1 没有明确错误文案' }
+    'AHK 图标开关先走代理 /icons.gif，本地兜底有日志；DesktopIcons.ps1 的 Add-Type 失败可诊断'
+} -Hint 'Low IL 进程做不了 Add-Type；任何需要 P/Invoke 的动作都要交给代理（High）'
+
+Test-Case STA-018 '静态' '重扫不许抹空 dpos：先快照、空 dpos 才重抓' high {
+    $root = Get-DshRoot
+    $ahk = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPage.ahk'), [Text.Encoding]::UTF8)
+    if ($ahk -notmatch 'SnapshotVisiblePositions\(\)\s*\{') { throw '没有 SnapshotVisiblePositions()' }
+    $r = $ahk.IndexOf('RescanDesktop(*) {')
+    if ($r -lt 0) { throw '找不到 RescanDesktop()' }
+    $snap = $ahk.IndexOf('SnapshotVisiblePositions()', $r)
+    # 注释里也会出现 DesktopPositions.ps1 字样，所以按「判据行」定位真正那次调用
+    $guard = $ahk.IndexOf('if (POS_DESK.Count = 0)', $r)
+    if ($snap -lt 0 -or $guard -lt 0 -or $snap -gt $guard) { throw 'RescanDesktop 没有在「dpos 为空才重抓」判据之前先快照' }
+    if ($ahk.IndexOf('DesktopPositions.ps1', $guard) -lt 0) { throw '判据下面没有 DesktopPositions.ps1 调用' }
+    $dp = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPositions.ps1'), [Text.Encoding]::UTF8)
+    if ($dp -notmatch '\.tmp-\$PID') { throw 'DesktopPositions.ps1 不是写临时文件再换入' }
+    if ($dp -notmatch 'positions: 0 \(kept existing') { throw 'DesktopPositions.ps1 抓到 0 行时没有保留旧文件' }
+    '重扫：先快照可见位置 → dpos 非空就跳过重抓 → 抓不到就保留旧文件'
+} -Hint '2026-11-14 13:04：图标隐藏时 DesktopPositions 写出 0 行并覆盖，113 条集体回网格重排'
+
+Test-Case STA-019 '静态' '改布局前先拍快照、抛错自动回滚' high {
+    $root = Get-DshRoot
+    $ahk = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPage.ahk'), [Text.Encoding]::UTF8)
+    foreach ($need in @('SnapshotLayout(reason) {', 'PruneLayoutSnapshots() {', 'RollbackLayout(reason) {', 'LayoutOp(reason, fn) {')) {
+        if ($ahk.IndexOf($need) -lt 0) { throw "缺 $need" }
+    }
+    $op = $ahk.IndexOf('LayoutOp(reason, fn) {')
+    $snap = $ahk.IndexOf('SNAP_LAST := SnapshotLayout(reason)', $op)
+    $call = $ahk.IndexOf('fn.Call()', [Math]::Max($op, $snap))
+    if ($ahk.IndexOf('if (LAYOUT_OP != "")', $op) -lt 0) { throw 'LayoutOp 没有嵌套守卫（Core 里再调会重复拍快照）' }
+    $rb   = $ahk.IndexOf('RollbackLayout(reason)', $op)
+    if ($snap -lt 0 -or $call -lt 0 -or $snap -gt $call) { throw 'LayoutOp 没有在跑操作之前先拍快照' }
+    if ($rb -lt 0 -or $rb -lt $call) { throw 'LayoutOp 的 catch 里没有回滚' }
+    # 每个会改写 layout.dat 的入口都必须是「wrapper + Core」，且 wrapper 里带上自己的 reason
+    $pairs = @(
+        @('FinishDrag(d, cx, cy) {', 'drag'),
+        @('RescanDesktop(*) {', 'rescan'),
+        @('ApplyRename(f, ed, g, *) {', 'rename'),
+        @('DissolveFolder(f) {', 'dissolve'),
+        @('RemoveFromFolder(path) {', 'unfolder'),
+        @('RemoveItemFromDrawer(path) {', 'remove'),
+        @('HideSystemItem(it) {', 'hide')
+    )
+    foreach ($pr in $pairs) {
+        $i = $ahk.IndexOf($pr[0])
+        if ($i -lt 0) { throw "缺入口 $($pr[0])" }
+        $seg = $ahk.Substring($i, [Math]::Min(400, $ahk.Length - $i))
+        if ($seg.IndexOf('LayoutOp("' + $pr[1] + '"') -lt 0) { throw "$($pr[0]) 没有包 LayoutOp($($pr[1]))" }
+        if ($seg.IndexOf('Core(') -lt 0) { throw "$($pr[0]) 后面没有 *Core 实现" }
+    }
+    if ($ahk -notmatch 'StrCompare\(arr\[j\], arr\[j \+ 1\]\)') { throw 'SortNames 用了 > 比文件名（AHK v2 会报 Expected a Number）' }
+    '七个改布局入口都先拍快照；抛错回滚；快照按名字排序、只留最近 40 份'
+} -Hint '2026-11-14 用户要求：改布局前留快照，失败回滚'
+
+Test-Case STA-020 '静态' '拖文件夹时只藏被拖的那一个' high {
+    $root = Get-DshRoot
+    $ahk = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPage.ahk'), [Text.Encoding]::UTF8)
+    if ($ahk -notmatch 'global FOLDER_CTRL_OF := Map\(\)') { throw '没有 FOLDER_CTRL_OF 映射' }
+    $rf = $ahk.IndexOf('RenderFolders() {')
+    if ($rf -lt 0) { throw '找不到 RenderFolders()' }
+    if ($ahk.IndexOf('FOLDER_CTRL_OF[f["id"]] := mine', $rf) -lt 0) { throw 'RenderFolders 没有按文件夹收集自己的控件' }
+    $dm = $ahk.IndexOf('DragMove(x, y) {')
+    if ($dm -lt 0) { throw '找不到 DragMove()' }
+    $seg = $ahk.Substring($dm, [Math]::Min(1600, $ahk.Length - $dm))
+    if ($seg.IndexOf('for c in FOLDER_CTRLS') -ge 0) { throw 'DragMove 还在整片隐藏 FOLDER_CTRLS（其它文件夹会消失）' }
+    if ($seg.IndexOf('FOLDER_CTRL_OF[FOLDERS[fi]["id"]]') -lt 0) { throw 'DragMove 没有改成只藏被拖的文件夹' }
+    '拖文件夹只隐藏自己那一组控件，其它合成文件夹保持可见'
+} -Hint '2026-11-14 用户反馈：拖文件夹时其它文件夹会消失，松手才回来'

@@ -5,7 +5,12 @@
 
 $ErrorActionPreference = 'Stop'
 
-Add-Type @'
+# 2026-11-14：本机 AutoHotkey64 跑在 Low 完整性（il=0x1000），它派生的 powershell
+# 写不了 %TEMP%，Add-Type（csc 编译）必然「拒绝访问」。以前这里直接抛异常，
+# 抽屉那边 RunWait 拿到非 0 却没人看 —— 于是顶栏「原始桌面」/ Ctrl+Alt+D 看着像"没反应"。
+# 现在给出明确错误并让抽屉改走代理（High）的 /icons.gif。
+try {
+    Add-Type @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
@@ -61,6 +66,11 @@ public class DeskIcons {
     }
 }
 '@
+} catch {
+    Write-Output ('add-type failed: ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message)
+    Write-Output 'icons untouched; needs a high-integrity caller (agent /icons.gif?mode=show|hide|query)'
+    exit 4
+}
 
 $progman = [DeskIcons]::Progman()
 if ($progman -eq [IntPtr]::Zero) { Write-Output 'error: progman not found'; exit 2 }

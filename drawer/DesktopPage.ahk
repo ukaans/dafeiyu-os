@@ -113,6 +113,7 @@ global OVER_DOWN := false, OVER_DOWN_AT := 0
 ; 文件夹弹窗当前那个 Gui 对象：BindOpen/BindRemove 会直接 Destroy，靠它做存活判定
 global FOLDER_POPUP := 0
 global FOLDER_CTRLS := []
+global FOLDER_CTRL_OF := Map()   ; f["id"] -> 该文件夹自己的控件（bg/mini/txt），拖拽时只藏自己
 ; 文件夹弹窗里每个成员"真正绑上去的那个闭包"，onclick 用的就是它。
 ; 自检 summon.cmd=foldertest=<路径> 直接调用它，等价于用户点了一下。
 global FOLDER_BINDS := []
@@ -198,7 +199,10 @@ global SUMMON_CMDS := Map(
     "edge=1",      {fn: Summon_CmdEdgeOn,     prefix: false},
     "log=",        {fn: Summon_CmdLog,        prefix: true},
     "foldertest=", {fn: Summon_CmdFolderTest, prefix: true},
-    "dirtest=",    {fn: Summon_CmdDirTest,    prefix: true}
+    "dirtest=",    {fn: Summon_CmdDirTest,    prefix: true},
+    "rescan",      {fn: Summon_CmdRescan,     prefix: false},
+    "rollback",    {fn: Summon_CmdRollback,   prefix: false},
+    "snaptest",    {fn: Summon_CmdSnapTest,   prefix: false}
 )
 ; 代理不可用时的启动队列文件（看门狗 / 巡检进程读它并拉起程序）。
 ; 行格式：<epoch 秒>|<完整路径>
@@ -622,6 +626,34 @@ AgentDockAdd(path, name, iconName) {
     }
 }
 
+; 桌面图标开关也必须走代理：本机 AutoHotkey64 是 Low IL（il=0x1000 实测），
+; 抽屉自己跑 DesktopIcons.ps1 会在 Add-Type（csc 写 %TEMP%）那步「拒绝访问」，
+; 顶栏「原始桌面」/ Ctrl+Alt+D 于是看起来毫无反应（脚本其实每次都 exit 1）。
+; 代理是 High，同一份脚本 33ms（query）/ 250ms（hide/show）出结果。
+; 返回 'shown' / 'hidden'；代理不可用时返回 ''，调用方再退回本地。
+AgentIcons(mode) {
+    global AGENT_BASE
+    try {
+        t0 := A_TickCount
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.SetTimeouts(300, 300, 2500, 2500)
+        req.Open("GET", AGENT_BASE "/icons.gif?mode=" mode, false)
+        tk := AgentToken()
+        if (tk != "")
+            req.SetRequestHeader("X-DSH-Token", tk)
+        req.Send()
+        rt := req.ResponseText
+        LogWrite("icons agent: mode=" mode " status=" req.Status " " (A_TickCount - t0) "ms " rt)
+        if (req.Status != 200 || InStr(rt, '"ok":true') = 0)
+            return ""
+        if RegExMatch(rt, '"state":"(shown|hidden)"', &m)
+            return m[1]
+        return ""
+    } catch as e {
+        LogWrite("icons agent unavailable: " e.Message)
+        return ""
+    }
+}
 ; 图标缓存重建也必须走代理：本机 AutoHotkey64 是 Low IL（il=0x1000 实测），
 ; 抽屉自己跑 Build-IconCache.ps1 会在 Add-Type（csc 写 %TEMP%）那步「拒绝访问」，
 ; 而旧版脚本先删 icons\ —— 于是图标全空、所有格子建不出控件、热键全"失灵"。
@@ -1312,6 +1344,126 @@ SaveLayout() {
     }
 }
 
+; ------------------------------------------------------------
+;  布局快照 / 回滚（2026-11-14）
+; ------------------------------------------------------------
+; 任何会改写 layout.dat 的动作（拖拽、合成/解散文件夹、重命名、移除图标、重扫）
+; 动手前先留一份快照到 snapshots\，保留最近 40 份；动作里抛错就自动回滚到这份快照。
+; 为什么不是"每次写盘都备份"：拖拽过程中 SaveLayout 会被反复调用，按"操作"备份才有意义。
+global SNAP_DIR := A_ScriptDir "\snapshots"
+global SNAP_KEEP := 40
+global SNAP_LAST := ""
+global LAYOUT_OP := ""
+
+SnapshotLayout(reason) {
+    global SNAP_DIR, SNAP_LAST, LAYOUT_FILE
+    if !FileExist(LAYOUT_FILE)
+        return ""
+    if !InStr(FileExist(SNAP_DIR), "D") {
+        try DirCreate(SNAP_DIR)
+    }
+    if !InStr(FileExist(SNAP_DIR), "D")
+        return ""
+    safe := RegExReplace(reason, "[^A-Za-z0-9_-]", "_")
+    name := FormatTime(A_Now, "yyyyMMdd-HHmmss") "-" Format("{:03}", Mod(A_MSec, 1000)) "-" safe ".dat"
+    dst := SNAP_DIR "\" name
+    try FileCopy(LAYOUT_FILE, dst, 1)
+    catch as e {
+        LogWrite("snapshot failed: " e.Message)
+        return ""
+    }
+    SNAP_LAST := dst
+    PruneLayoutSnapshots()
+    LogWrite("snapshot: " name)
+    return dst
+}
+
+PruneLayoutSnapshots() {
+    global SNAP_DIR, SNAP_KEEP
+    files := []
+    loop files, SNAP_DIR "\*.dat", "F"
+        files.Push(A_LoopFileName)
+    if (files.Length <= SNAP_KEEP)
+        return
+    SortNames(files)
+    while (files.Length > SNAP_KEEP) {
+        old := files.RemoveAt(1)
+        try FileDelete(SNAP_DIR "\" old)
+    }
+}
+
+SortNames(arr) {
+    ; 注意：AHK v2 的 > / < 是数值比较，文件名直接比会报 "Expected a Number"
+    n := arr.Length
+    loop n - 1 {
+        i := A_Index
+        j := i
+        while (j >= 1 && StrCompare(arr[j], arr[j + 1]) > 0) {
+            tmp := arr[j], arr[j] := arr[j + 1], arr[j + 1] := tmp
+            j -= 1
+        }
+    }
+}
+
+NewestSnapshot() {
+    global SNAP_DIR
+    files := []
+    loop files, SNAP_DIR "\*.dat", "F"
+        files.Push(A_LoopFileName)
+    if (files.Length = 0)
+        return ""
+    SortNames(files)
+    return SNAP_DIR "\" files[files.Length]
+}
+
+RollbackLayout(reason) {
+    global SNAP_LAST, SNAP_DIR, LAYOUT_FILE
+    snap := SNAP_LAST
+    if (snap = "" || !FileExist(snap))
+        snap := NewestSnapshot()
+    if (snap = "" || !FileExist(snap)) {
+        LogWrite("rollback: no snapshot available (" reason ")")
+        return false
+    }
+    try {
+        buf := FileRead(snap, "UTF-8")
+        if !InStr(buf, "V2")
+            throw Error("snapshot has no V2 header")
+        WriteFileAtomic(LAYOUT_FILE, buf)
+        LoadLayout()
+        try RenderFolders()
+        try UpdatePage()
+        LogWrite("rollback: layout restored from " snap " (" reason ")")
+        AuditLog("layout.rollback", "reason=" Aq(reason) " snap=" Aq(snap))
+        ToolTip("布局操作出错，已回滚到上一次快照", A_ScreenWidth // 2 - 160, A_ScreenHeight // 3)
+        SetTimer(() => ToolTip(), -3500)
+        return true
+    } catch as e {
+        LogWrite("rollback failed: " e.Message " (" reason ")")
+        return false
+    }
+}
+
+; 带快照护栏执行一次布局操作：先留快照 → 跑 → 抛错就回滚
+LayoutOp(reason, fn) {
+    global SNAP_LAST, LAYOUT_OP
+    if (LAYOUT_OP != "") {          ; 已经在一次受保护操作里，别嵌套拍快照（外层 catch 负责回滚）
+        fn.Call()
+        return true
+    }
+    LAYOUT_OP := reason
+    SNAP_LAST := SnapshotLayout(reason)
+    ok := false
+    try {
+        fn.Call()
+        ok := true
+    } catch as e {
+        LogWrite("layout op failed: " reason " :: " e.Message " @line " e.Line)
+        RollbackLayout(reason)
+    }
+    LAYOUT_OP := ""
+    return ok
+}
 NormalizeLayout() {
     global FOLDERS, GROUP_OF
     seen := Map()
@@ -1472,6 +1624,11 @@ ItemMenu(idx) {
 
 ; 只写 HIDDEN，不动 items.tsv —— 系统项不是文件，没有"保留文件"这回事。
 HideSystemItem(it) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("hide", () => HideSystemItemCore(it))
+}
+
+HideSystemItemCore(it) {
     global HIDDEN
     HIDDEN[it["path"]] := true
     SaveHidden()
@@ -2504,6 +2661,11 @@ CloseRename(g, *) {
 }
 
 ApplyRename(f, ed, g, *) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("rename", () => ApplyRenameCore(f, ed, g))
+}
+
+ApplyRenameCore(f, ed, g, *) {
     global gFolderGui
     n := Trim(ed.Value)
     try g.Destroy()
@@ -2529,6 +2691,11 @@ AfterRenameDialog() {
 }
 
 DissolveFolder(f) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("dissolve", () => DissolveFolderCore(f))
+}
+
+DissolveFolderCore(f) {
     FORCE_DIRTY := true
     global FOLDERS, GROUP_OF, gFolderGui, FORCE_DIRTY
     if IsObject(gFolderGui)
@@ -2555,6 +2722,11 @@ DissolveFolder(f) {
 }
 
 RemoveItemFromDrawer(path) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("remove", () => RemoveItemFromDrawerCore(path))
+}
+
+RemoveItemFromDrawerCore(path) {
     global HIDDEN, GROUP_OF
     t0 := A_TickCount
     if GROUP_OF.Has(path)
@@ -2654,7 +2826,7 @@ AddPathsToDrawer(paths, reopen := false) {
 
 
 DragMove(x, y) {
-    global DRAG, gGhost, ITEMS, APP_DIR, ICON_PX, FOLDER_CTRLS
+    global DRAG, gGhost, ITEMS, APP_DIR, ICON_PX, FOLDER_CTRLS, FOLDERS, FOLDER_CTRL_OF
     if !DRAG["active"] {
         if (Abs(x - DRAG["sx"]) + Abs(y - DRAG["sy"]) < 10)
             return
@@ -2666,9 +2838,13 @@ DragMove(x, y) {
             it["txt"].Visible := false
         } else {
             gGhost.Value := APP_DIR "\folder.png"
-            ; 拖文件夹时先把它自己藏起来，避免"一个跟手一个留在原地"的错觉
-            for c in FOLDER_CTRLS
-                try c.Visible := false
+            ; 只藏"正在拖的这一个"文件夹：以前是把 FOLDER_CTRLS 全藏掉，
+            ; 用户会看到其它合成文件夹整片消失，松手才回来（2026-11-14 反馈）
+            fi := DRAG["folder"]
+            if (fi && fi <= FOLDERS.Length && FOLDER_CTRL_OF.Has(FOLDERS[fi]["id"])) {
+                for c in FOLDER_CTRL_OF[FOLDERS[fi]["id"]]
+                    try c.Visible := false
+            }
         }
         gGhost.Visible := true
     }
@@ -2676,6 +2852,11 @@ DragMove(x, y) {
 }
 
 FinishDrag(d, cx, cy) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("drag", () => FinishDragCore(d, cx, cy))
+}
+
+FinishDragCore(d, cx, cy) {
     global ITEMS, FOLDERS, POS, gGhost, GUI_W, GUI_H, ICON_PX, CELL_W, CELL_H
     try gGhost.Visible := false
     nx := SnapX(cx - ICON_PX // 2)
@@ -2940,6 +3121,11 @@ HasMember(f, path) {
 }
 
 RemoveFromFolder(path) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("unfolder", () => RemoveFromFolderCore(path))
+}
+
+RemoveFromFolderCore(path) {
     FORCE_DIRTY := true
     global GROUP_OF, FOLDERS, FORCE_DIRTY
     if !GROUP_OF.Has(path)
@@ -2978,7 +3164,7 @@ RemoveFromFolder(path) {
 }
 
 RenderFolders() {
-    global FOLDERS, FOLDER_CTRLS, POOL_BG, POOL_MINI, POOL_TXT, gDrawer, ITEMS, CELL_W, CELL_H, ICON_PX, SCALE, APP_DIR
+    global FOLDERS, FOLDER_CTRLS, FOLDER_CTRL_OF, POOL_BG, POOL_MINI, POOL_TXT, gDrawer, ITEMS, CELL_W, CELL_H, ICON_PX, SCALE, APP_DIR
     NormalizeLayout()
     if !gDrawer
         return
@@ -2988,6 +3174,7 @@ RenderFolders() {
         try c.Visible := false
     for c in POOL_TXT
         try c.Visible := false
+    FOLDER_CTRL_OF := Map()
 
     foldPx := ICON_PX                         ; 和普通图标一样长宽
     m := Round(foldPx * 0.30)
@@ -2995,6 +3182,7 @@ RenderFolders() {
     bi := 0, mi := 0, ti := 0
 
     for f in FOLDERS {
+        mine := []
         x := f["x"], y := f["y"]
         tx := x + (CELL_W - foldPx) // 2
         ty := y + Round(2 * SCALE)
@@ -3008,6 +3196,7 @@ RenderFolders() {
             bg.Move(tx, ty, foldPx, foldPx)
         }
         bg.Visible := true
+        mine.Push(bg)
 
         gridW := m * 2 + gap
         bx := tx + (foldPx - gridW) // 2
@@ -3031,6 +3220,7 @@ RenderFolders() {
                 pc.Move(mx, my, m, m)
             }
             pc.Visible := true
+            mine.Push(pc)
 
             n += 1
         }
@@ -3059,6 +3249,8 @@ RenderFolders() {
             tc.Move(x + Round(8 * SCALE), ly, CELL_W - Round(16 * SCALE), CELL_H - (ly - y) - 2)
         }
         tc.Visible := true
+        mine.Push(tc)
+        FOLDER_CTRL_OF[f["id"]] := mine
     }
 
     FOLDER_CTRLS := []
@@ -3200,13 +3392,23 @@ LogError(err, mode) {
 }
 
 IconsScript(mode) {
+    ; 优先走代理（High）。抽屉自己是 Low IL，本地子进程里的 Add-Type 一律「拒绝访问」，
+    ; 这条路径以前每次都失败却没人看返回值 —— 「显示桌面图标」按钮就是这样"失效"的。
+    if (AgentIcons(mode) != "")
+        return 0
     global APP_DIR
+    LogWrite("icons: agent path failed, local fallback mode=" mode)
     cmd := 'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' APP_DIR '\DesktopIcons.ps1" -Mode ' mode
     try return RunWait(cmd, , "Hide")
     return 1
 }
 
 QueryIcons() {
+    ; 同上：先问代理要真实状态；代理不可用才本地跑（Low IL 下会拿到空输出，
+    ; 旧代码把“空输出”当成 shown —— 于是状态灯与真实桌面长期不一致）。
+    st := AgentIcons("query")
+    if (st != "")
+        return st
     global APP_DIR
     try {
         shell := ComObject("WScript.Shell")
@@ -3215,8 +3417,11 @@ QueryIcons() {
         out := exec.StdOut.ReadAll()
         if InStr(out, "hidden")
             return "hidden"
+        if InStr(out, "shown")
+            return "shown"
     }
-    return "shown"
+    LogWrite("icons: query unavailable (agent + local both empty)")
+    return "unknown"
 }
 
 RestoreIconState() {
@@ -3316,7 +3521,32 @@ SelfTest(*) {
     ExitApp
 }
 
+; 重扫前把当前可见条目的真实坐标写进 layout（POS）。只在 dpos 为空时做 —— 那时
+; DefaultSlot 会失去桌面落位，快照是唯一能保住原样的东西。
+SnapshotVisiblePositions() {
+    global POS, POS_DESK, ITEMS, GROUP_OF, HIDDEN
+    if (POS_DESK.Count > 0)
+        return 0
+    n := 0
+    for it in ITEMS {
+        if !it.Has("pic") || !it["pic"].Visible
+            continue
+        if GROUP_OF.Has(it["path"]) || HIDDEN.Has(it["path"])
+            continue
+        POS[it["path"]] := [it["x"], it["y"]]
+        n += 1
+    }
+    if (n > 0)
+        SaveLayout()
+    LogWrite("rescan: snapshot " n " visible positions (dpos empty)")
+    return n
+}
 RescanDesktop(*) {
+    ; 改布局前先留快照，失败自动回滚（见 SnapshotLayout / RollbackLayout）
+    return LayoutOp("rescan", () => RescanDesktopCore())
+}
+
+RescanDesktopCore(*) {
     FORCE_DIRTY := true
     global gDrawer, curPage, CTRL_POOL, FORCE_DIRTY
     t0 := A_TickCount
@@ -3332,7 +3562,16 @@ RescanDesktop(*) {
         LogWrite("rescan: agent icon build failed, direct fallback")
         RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\Build-IconCache.ps1"', , "Hide")
     }
-    RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\DesktopPositions.ps1"', , "Hide")
+    ; 2026-11-14 13:04 事故：图标隐藏状态下 DesktopPositions.ps1 写出了 0 行，
+    ; 覆盖后 POS_DESK 空 → DefaultSlot 全部退回"按下标铺网格" → 113 条整体重排，
+    ; 而 14 个文件夹的 F 坐标还在 → 用户看到「顺序打乱 + 一堆重叠」。
+    ; 现在的规矩：(1) 位置文件还没被抹空前先给"当前看得见的位置"打快照进 layout；
+    ; (2) 只有 dpos 为空时才重新抓，抓到 0 行时脚本自己也不覆盖旧文件。
+    SnapshotVisiblePositions()
+    if (POS_DESK.Count = 0)
+        RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\DesktopPositions.ps1"', , "Hide")
+    else
+        LogWrite("rescan: keep existing desktop_positions.tsv (" POS_DESK.Count " 行)")
     LoadPositions()
     LoadItems()
     LoadLayout()
@@ -3774,6 +4013,33 @@ Summon_CmdShow(arg := "") {
     AuditLog("summon", "cmd=show")
 }
 
+Summon_CmdRescan(arg := "") {
+    ; 无人值守重扫入口：既能测「重扫不打乱布局」，也让看门狗有机会修复图标缓存。
+    LogWrite("summon: rescan via file")
+    AuditLog("summon", "cmd=rescan")
+    RescanDesktop()
+}
+Summon_CmdRollback(arg := "") {
+    ; 手工回滚：把 layout.dat 换回最近一份快照（用户喊「乱了我不要了」时的逃生口）
+    LogWrite("summon: rollback via file")
+    AuditLog("summon", "cmd=rollback")
+    SNAP_LAST := ""
+    if !RollbackLayout("manual")
+        LogWrite("rollback: manual request failed (no snapshot?)")
+}
+Summon_CmdSnapTest(arg := "") {
+    ; 调试用：故意在受保护操作里抛错，验证「快照 → 失败 → 自动回滚」这条链
+    LogWrite("summon: snaptest via file")
+    before := ""
+    try before := FileRead(LAYOUT_FILE, "UTF-8")
+    ok := LayoutOp("snaptest", (*) => SnapTestBoom())
+    after := ""
+    try after := FileRead(LAYOUT_FILE, "UTF-8")
+    LogWrite("snaptest: ok=" (ok ? 1 : 0) " same=" ((before = after) ? 1 : 0))
+}
+SnapTestBoom() {
+    throw Error("boom-snaptest")
+}
 Summon_CmdHide(arg := "") {
     HideDrawer()
     LogWrite("summon: hide via file")
@@ -3906,4 +4172,3 @@ WriteFileAtomic(path, text, enc := "UTF-8") {
 ; ------------------------------------------------------------
 
 ; ------------------------------------------------------------
-
