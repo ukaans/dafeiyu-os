@@ -306,6 +306,32 @@ Test-Case STA-014 '静态' '点击层收尾后仍在最顶、无配对的鼠标�
     '覆盖层收尾抬回最顶；无配对的抬起被忽略'
 } -Hint '2026-11-14：重命名一个之后要退出抽屉再进来才能改下一个的两条根因'
 
+Test-Case STA-016 '静态' '天气城市以 Windows 定位为主、IP 兜底' medium {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\wxmon.ps1')
+
+    # 1) 主路径必须是 Windows 系统定位（比 IP 准：本机实测 2s 出坐标、精度 76m，IP 却解析成香港）
+    if ($t -notmatch 'GeoCoordinateWatcher') { throw 'wxmon 没接 Windows 定位服务（GeoCoordinateWatcher）' }
+    if ($t -notmatch 'function Get-WinLoc') { throw '找不到 Get-WinLoc' }
+    if ($t -notmatch '\$WIN_TIMEOUT') { throw '缺少 Windows 定位等待超时，定位服务卡住时会把整轮天气拖死' }
+
+    # 2) Resolve-Loc 里 Windows 必须先于 IP
+    $m = [regex]::Match($t, '(?s)function Resolve-Loc\s*\{(.*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 Resolve-Loc' }
+    $body = $m.Groups[1].Value
+    $iWin = $body.IndexOf('Get-WinLoc')
+    $iIp = $body.IndexOf('Resolve-IpLoc')
+    if ($iWin -lt 0 -or $iIp -lt 0 -or $iWin -gt $iIp) { throw 'Resolve-Loc 不是「Windows 定位 → IP 兜底」的顺序' }
+
+    # 3) Windows 只给坐标，必须反向地理编码出城市名（否则面板只能显示经纬度）
+    if ($t -notmatch 'nominatim\.openstreetmap\.org') { throw '缺少反向地理编码（坐标 → 城市名）' }
+    if ($t -notmatch "DesktopPage/1\.0") { throw '反向地理编码没带 UA（Nominatim 会 403）' }
+
+    # 4) 主循环必须走 Resolve-Loc，不能绕过 Windows 直接问 IP
+    $w = [regex]::Match($t, '(?s)while \(\$true\)\s*\{(.*?)\r?\n\}')
+    if (-not $w.Success) { throw '找不到主循环' }
+    if ($w.Groups[1].Value -notmatch 'Resolve-Loc') { throw '主循环没走 Resolve-Loc（Windows 定位永远不会被用上）' }
+    'Windows 定位优先 + Nominatim 反查城市 + IP 兜底'
+} -Hint '2026-11-14：IP 解析成香港、系统定位在广州时，必须信系统定位'
 Test-Case STA-015 '静态' '天气城市按 IP 定时重解析（多家兜底 + 磁盘缓存）' medium {
     $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\wxmon.ps1')
 
@@ -322,7 +348,7 @@ Test-Case STA-015 '静态' '天气城市按 IP 定时重解析（多家兜底 + 
     $w = [regex]::Match($t, '(?s)while \(\$true\)\s*\{(.*?)\r?\n\}')
     if (-not $w.Success) { throw '找不到主循环' }
     $body = $w.Groups[1].Value
-    if ($body -notmatch 'Resolve-IpLoc') { throw '主循环里没有重解析位置（城市只在启动时算一次）' }
+    if ($body -notmatch 'Resolve-Loc') { throw '主循环里没有重解析位置（城市只在启动时算一次）' }
     if ($body -notmatch 'LOC_TTL') { throw '主循环里没有 TTL 判据' }
     if ($body -notmatch 'Get-WeatherUrl') { throw '位置变了但天气 URL 没重建' }
 
