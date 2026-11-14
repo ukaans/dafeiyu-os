@@ -24,6 +24,7 @@ if ($Port -le 0) { $Port = 17433 }
 #    /open.gif          ← 用浏览器打开 DSH 网页
 #    /clear.gif         ← 清空 dsh-run.log + dsh-run.err.log
 #    /drawer.gif        ← 通过计划任务启动桌面抽屉（DesktopPage.ahk）
+#    /iconbuild.gif     ← 以代理权限（High）重建 icons\*.png + items.tsv；返回 {"ok":true,"items":N}
 #    /rect.gif?x&y&w&h  ← 壁纸右侧控制台的屏幕矩形（万分比）→ panel-rect.txt
 #    /scroll.gif?d=±1   ← 滚轮意图 → scroll.dat；/scroll.js ← 取走增量（并放行热重载令牌）
 #    /reload.gif        ← 写 page-reload.txt：让壁纸页软重载（重插 dsh.js?hot=，不导航）
@@ -435,7 +436,7 @@ function Write-Raw($ctx, [byte[]]$bytes, [string]$type) {
     $res.OutputStream.Close()
 }
 
-function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err, $dbg) {
+function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err, $dbg, $drawerUp) {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('window.__DSH_STATE = {web:')
     [void]$sb.Append($(if ($web) { 'true' } else { 'false' }))
@@ -444,13 +445,18 @@ function Write-Js($ctx, $web, $busy, $lines, $bal, $drawer, $scroll, $sig, $err,
     [void]$sb.Append($(if ($busy) { 'true' } else { 'false' }))
     [void]$sb.Append(',bal:"').Append((Escape-Js $bal)).Append('",drawer:')
     [void]$sb.Append($(if ($drawer) { 'true' } else { 'false' }))
+    # drawerUp：进程在但控件/心跳不健康时为 true —— 页面据此显示黄点而不是红灯。
+    [void]$sb.Append(',drawerUp:')
+    [void]$sb.Append($(if ($drawerUp) { 'true' } else { 'false' }))
     # 2026-11-05 会话视图新增三个薄字段（都是小标量，别在这里塞正文）：
     #   sig    日志身份（长度-mtime），页面据此决定是否拉 /log.js
     #   err    上一轮失败原因（stderr 的 dsh: 行），面板顶部挂一行警告
     #   （reload 热重载令牌已于 2026-11-11 从 /state.js 移除：只走 /scroll.js 40ms 通道）
     [void]$sb.Append(',sig:"').Append((Escape-Js $sig)).Append('"')
     [void]$sb.Append(',err:"').Append((Escape-Js $err)).Append('"')
-    [void]$sb.Append(',dbg:')
+    # 2026-11-14 修：这里曾连写两行 ',dbg:'（18c57d5 删 reload 时把上面那行改成了 dbg），
+    # 输出变成 dbg:,dbg:false —— 整条 JS 语法错误，页面拿不到 __DSH_STATE，开机就「离线」。
+    # 只允许有这一处 dbg 键；tests/cases/20-contract.ps1 会直接解析响应，重复键必须报错。
     [void]$sb.Append(',dbg:')
     [void]$sb.Append($(if ($dbg) { 'true' } else { 'false' }))
     [void]$sb.Append(',lines:[')
@@ -658,8 +664,28 @@ function Save-TodoItems($items) {
 $ahkExe = Join-Path $appDir 'AutoHotkey64.exe'
 $ahkScript = Join-Path $appDir 'DesktopPage.ahk'
 
-function Get-DrawerRunning {
-    return [bool](Get-Process -Name 'AutoHotkey64' -ErrorAction SilentlyContinue)
+function Get-DrawerState {
+    # 2026-11-14：以前只看「有没有 AutoHotkey64 进程」。抽屉控件建失败时进程照样在，
+    # 页面于是显示绿灯，用户按热键却什么都没发生（"显示对不上"就是这样来的）。
+    # 现在分两档：up=进程在；ok=进程在 + 心跳新鲜 + 每条 item 都建出了控件。
+    # 页面按 ok 显示绿、按 up 显示黄（运行中但不健康）、都不成立显示红。
+    $procs = @(Get-Process -Name 'AutoHotkey64' -ErrorAction SilentlyContinue)
+    if ($procs.Count -eq 0) { return @{ up = $false; ok = $false } }
+    $hb = Join-Path $appDir 'drawer-hb.txt'
+    if (-not (Test-Path $hb)) { return @{ up = $true; ok = $true } }   # 老版本没有心跳：退回只看进程
+    try {
+        $txt = [System.IO.File]::ReadAllText($hb)
+        $ts = 0; $items = 0; $pics = 0
+        if ($txt -match 'ts=(\d+)') { $ts = [long]$matches[1] }
+        if ($txt -match 'items=(\d+)') { $items = [int]$matches[1] }
+        if ($txt -match 'pics=(\d+)') { $pics = [int]$matches[1] }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        if ($ts -le 0) { return @{ up = $true; ok = $false } }
+        if (($now - $ts) -gt 90000) { return @{ up = $true; ok = $false } }   # 心跳超过 90s 没写：卡死
+        if ($items -le 0) { return @{ up = $true; ok = $false } }
+        if ($pics -lt $items) { return @{ up = $true; ok = $false } }         # 有 item 没建出控件：热键会"没反应"
+        return @{ up = $true; ok = $true }
+    } catch { return @{ up = $true; ok = $true } }
 }
 
 function Start-Drawer {
@@ -1364,13 +1390,15 @@ function Invoke-StateJs($ctx, $query) {
     $busy = [bool](Cache-Get 'busy' 1000 { Get-RunBusy })
     $lines = Cache-Get 'lines' 500 { Get-LogTail 40 }
     $bal = [string](Cache-Get 'bal' 300000 { Get-Balance })
-    $drawer = [bool](Cache-Get 'drawer' 2000 { Get-DrawerRunning })
+    $dst = Cache-Get 'drawer' 2000 { Get-DrawerState }
+    $drawer = [bool]$dst.ok
+    $drawerUp = [bool]$dst.up
     # 会话视图的两个指针：sig 变了页面才去拉 /log.js（正文在那边，这里不塞）
     $sig = [string](Cache-Get 'sig' 500 { Get-LogSig })
     $err = [string](Cache-Get 'err' 500 { Get-ErrText })
     # 调试旗标每次看盘（没有缓存）：改完不用重启代理就能开/关信标
     $dbg = Test-Path $dbgFlag
-    Write-Js $ctx $web $busy $lines $bal $drawer 0 $sig $err $dbg
+    Write-Js $ctx $web $busy $lines $bal $drawer 0 $sig $err $dbg $drawerUp
     # cache=1 → 全部命中；cache=0:lines → 只重算了日志尾巴
     # 用 $script: 是因为 handler 是函数：局部变量传不回主循环的日志行
     $script:stateTag = if ($script:missKeys.Count -eq 0) { ' (cache=1)' } else { ' (cache=0:' + ($script:missKeys -join ',') + ')' }
@@ -1495,6 +1523,19 @@ function Invoke-LaunchPath($ctx, $query) {
     # 快捷方式（.lnk）单独处理：走 ShellExecute 会弹「打开文件 - 安全警告」（实测 E:\ 下的
     # .lnk 必弹；弹窗挂着时 Start-Process 一直不返回，用户看到的就是"弹了个框、文件没打开"）。
     # 能解析出 exe 就直接起目标 exe，绕过快捷方式本身的风险检查；其余类型仍走 explorer 中转。
+    # shell 命名空间（此电脑 / 回收站）：抽屉是 Low 完整性，它自己 Run explorer 起不来；由代理（High）代跑。
+    if ($lp -and $lp.StartsWith('::')) {
+        $st0 = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $lp + '"') | Out-Null
+            Agent-Log ('launchpath shell: ' + $lp + ' (' + $st0.ElapsedMilliseconds + 'ms)')
+            Write-Audit 'launch' ('path={0} via=shell ok=1 ms={1}' -f (Quote-Audit $lp), $st0.ElapsedMilliseconds)
+        } catch {
+            Agent-Log ('launchpath shell failed: ' + $lp + ' err=' + $_.Exception.Message)
+            Write-Audit 'launch' ('path={0} via=shell ok=0 ms={1}' -f (Quote-Audit $lp), $st0.ElapsedMilliseconds)
+        }
+        return
+    }
     $lnkDone = $false
     if ($lp -and ($lp -like '*.lnk') -and (Test-Path -LiteralPath $lp)) {
         $sc = $null
@@ -1805,7 +1846,47 @@ function Invoke-AuditGif($ctx, $query) {
     if ($ae) { Write-Audit $ae $ak 'WEB' }
 }
 
+function Invoke-IconBuild($ctx, $query) {
+    # 重建抽屉图标缓存（icons\*.png + items.tsv）。必须由代理（High）跑：
+    # 本机 AutoHotkey64 实测是 Low IL（il=0x1000），它自己调 Build-IconCache 会在
+    # Add-Type（csc 要写 %TEMP%）那步「拒绝访问」，而脚本此时已经把 icons\ 删了
+    # —— 2026-11-14 00:25 点「重新扫描」后图标全空、抽屉再也出不来就是这么来的。
+    # 代理是单线程：这里同步跑约 2~3 秒，期间 /state.js 会排队；失败重试三次才判离线，不受影响。
+    $scriptPath = Join-Path $appDir 'Build-IconCache.ps1'
+    $ok = $false
+    $items = -1
+    $msg = ''
+    $t0 = [Environment]::TickCount
+    # 只认抽屉带来的 token（本机任意页面放个 <img> 不能触发重建）
+    $tk = ''
+    try { $tk = [string]$query.req.Headers['X-DSH-Token'] } catch { }
+    if (-not $tk -or $tk -ne $script:launchToken) {
+        Write-Raw $ctx ([System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"msg":"token"}')) 'application/json; charset=utf-8'
+        Agent-Log 'iconbuild rejected: bad token'
+        return
+    }
+    try {
+        if (Test-Path -LiteralPath $scriptPath) {
+            $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $scriptPath 2>&1
+            $text = ($out | Out-String)
+            if ($text -match 'items:\s*(\d+)') { $items = [int]$matches[1] }
+            $ok = ($LASTEXITCODE -eq 0 -and $items -gt 0)
+            if (-not $ok) { $msg = ($text -replace '[\r\n]+', ' ').Trim() }
+        } else {
+            $msg = 'Build-IconCache.ps1 missing'
+        }
+    } catch {
+        $msg = $_.Exception.Message
+    }
+    $ms = [Environment]::TickCount - $t0
+    if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) }
+    $js = '{"ok":' + $(if ($ok) { 'true' } else { 'false' }) + ',"items":' + $items + ',"ms":' + $ms + ',"msg":"' + (Escape-Js $msg) + '"}'
+    Write-Raw $ctx ([System.Text.Encoding]::UTF8.GetBytes($js)) 'application/json; charset=utf-8'
+    Write-Audit 'iconbuild' ('ok={0} items={1} ms={2}' -f $ok, $items, $ms) 'API'
+}
+
 $script:ROUTES = @{
+    '/iconbuild.gif'  = @{ handler = 'Invoke-IconBuild';  kind = 'iconbuild';  poll = $false; audit = $false }
     '/state.js'       = @{ handler = 'Invoke-StateJs';    kind = 'state';      poll = $true;  audit = $false }
     '/state'          = @{ handler = 'Invoke-StateJs';    kind = 'state';      poll = $true;  audit = $false }
     '/log.js'         = @{ handler = 'Invoke-LogJs';      kind = 'log';        poll = $true;  audit = $false }

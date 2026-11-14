@@ -478,8 +478,19 @@ function dshInit() {
       DEBUG = !!st.dbg;
       if (balEl) balEl.textContent = st.bal || '—';
       if (runDot) {
-        runDot.className = 'drawer-dot ' + (st.drawer ? 'on' : 'off');
-        runDot.title = st.drawer ? '桌面抽屉：运行中' : '桌面抽屉：未启动';
+        // 三态：绿=在跑且健康；黄=进程在但图标/心跳异常（多半是正在重启或重扫）；
+        // 红=没进程。以前只有 有进程/没进程 两种，抽屉控件建不出来时仍亮绿灯，
+        // 于是「显示绿但按热键没反应」「显示黄却能用」这两类对不上都出现过。
+        if (st.drawer) {
+          runDot.className = 'drawer-dot on';
+          runDot.title = '桌面抽屉：运行中';
+        } else if (st.drawerUp) {
+          runDot.className = 'drawer-dot busy';
+          runDot.title = '桌面抽屉：进程在，但图标或心跳异常（正在重启/重扫？）';
+        } else {
+          runDot.className = 'drawer-dot off';
+          runDot.title = '桌面抽屉：未启动';
+        }
       }
       // 上一轮失败原因（stderr 里的 dsh: xxx）挂成一行提示，不占对话气泡
       if (errEl) {

@@ -442,11 +442,21 @@ Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清�
         }
         if ($hitEmpty -gt 0) { throw "空令牌文件仍下发了软重载 $hitEmpty 次 —— 清不掉令牌的机器会无限重插 dsh.js" }
         # 真令牌：必须发一次，发完立刻失效（第二次不能再发，否则页面被重插两份 dsh.js）
-        [System.IO.File]::WriteAllText($rf, [string][long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), $enc)
-        $r1 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
-        $r2 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
-        $emit1 = ($r1.Ok -and $r1.Body -match '__DSH_RELOAD_OK')
-        $emit2 = ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK')
+        # 壁纸那边也在按 40ms 轮询 /scroll.js；令牌写下去后可能被页面的在途请求抢先取走，
+        # 那样本进程这次就拿不到 __DSH_RELOAD_OK（2026-11-14 起偶发）。重试若干次：
+        # 只要有一次「本进程拿到发射、紧接着第二次没有」就算链路正常。
+        $emit1 = $false; $emit2 = $false
+        for ($try = 0; $try -lt 5 -and -not $emit1; $try++) {
+            [System.IO.File]::WriteAllText($rf, [string][long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $try, $enc)
+            $r1 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+            if (-not ($r1.Ok -and $r1.Body -match '__DSH_RELOAD_OK')) {
+                Start-Sleep -Milliseconds 80
+                continue
+            }
+            $r2 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+            $emit1 = $true
+            $emit2 = ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK')
+        }
         if (-not $emit1) { throw '真令牌没有触发软重载（改坏了：改完壁纸就不会热重载了）' }
         if ($emit2) { throw '同一个令牌下发了两次 —— 页面会被重插两份 dsh.js' }
         '判据看有效数字 + 先清后发；空令牌 0 次下发，真令牌只下发 1 次'

@@ -9,13 +9,15 @@
 function Data-Lines([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return @() }
     $t = Read-Raw $path
+    # 调用点一律 @(Data-Lines <file>) 包一层：只有一行时 PowerShell 会把单元素数组拆成字符串，
+    # 后面 $lines[0].Trim() 就会变成对 [char] 调用 Trim 而报错（DAT-001 假失败）。
     return @($t -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
 }
 
 Test-Case DAT-001 '数据' 'layout.dat 格式合法' medium {
     $p = Join-Path (Get-DshInstall) 'layout.dat'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'layout.dat 不存在（还没拖过图标）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { throw 'layout.dat 是空的（抽屉会重扫桌面，用户自定义布局丢失）' }
     if ($lines[0].Trim() -ne 'V2') { throw ('首行应为 V2，实际「' + $lines[0] + '」—— 版本头不对会整份不认') }
 
@@ -40,7 +42,7 @@ Test-Case DAT-001 '数据' 'layout.dat 格式合法' medium {
 Test-Case DAT-002 '数据' 'items.tsv 路径可落地' medium {
     $p = Join-Path (Get-DshInstall) 'items.tsv'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'items.tsv 不存在（图标缓存没建过）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { throw 'items.tsv 是空的（抽屉里会一个图标都没有）' }
     $badCol = 0; $checked = 0; $missing = @()
     foreach ($l in $lines) {
@@ -63,7 +65,7 @@ Test-Case DAT-002 '数据' 'items.tsv 路径可落地' medium {
 Test-Case DAT-003 '数据' 'hidden.dat 没有孤儿条目' low {
     $p = Join-Path (Get-DshInstall) 'hidden.dat'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'hidden.dat 不存在（没有隐藏过图标）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { return '隐藏名单为空' }
     $orphan = @($lines | Where-Object { -not (Test-Path -LiteralPath $_) })
     if ($orphan.Count -gt 0) {
@@ -75,7 +77,7 @@ Test-Case DAT-003 '数据' 'hidden.dat 没有孤儿条目' low {
 Test-Case DAT-004 '数据' 'dock.txt 不超上限且路径有效' medium {
     $p = Join-Path (Get-DshInstall) 'dock.txt'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'dock.txt 不存在（没加过快捷启动）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -gt 6) { throw ($lines.Count.ToString() + ' 行，超过面板上限 6 行（第 7 项起画不出来）') }
     $bad = @(); $dead = @()
     foreach ($l in $lines) {
@@ -129,7 +131,7 @@ Test-Case DAT-005 '数据' '生成物 JS 语法合法' medium {
 Test-Case DAT-006 '数据' 'desktop_positions.tsv 格式合法' low {
     $p = Join-Path (Get-DshInstall) 'desktop_positions.tsv'
     if (-not (Test-Path -LiteralPath $p)) { return @{ Status = 'skip'; Detail = 'desktop_positions.tsv 不存在（没同步过真实桌面）' } }
-    $lines = Data-Lines $p
+    $lines = @(Data-Lines $p)
     if ($lines.Count -eq 0) { throw '文件为空' }
     $bad = 0
     foreach ($l in $lines) {
@@ -149,7 +151,7 @@ Test-Case DAT-007 '数据' '图标缓存没有大面积缺失' low {
     if (-not (Test-Path -LiteralPath $itemsP) -or -not (Test-Path -LiteralPath $iconDir)) {
         return @{ Status = 'skip'; Detail = '图标缓存还没建（items.tsv 或 icons\ 不存在）' }
     }
-    $lines = Data-Lines $itemsP
+    $lines = @(Data-Lines $itemsP)
     $ref = @()
     foreach ($l in $lines) {
         $c = $l -split "`t"
@@ -210,3 +212,40 @@ Test-Case DAT-008 '数据' '待办生成物整份替换（先删再写会把它�
     }
     ('整份替换（tmp+FileMove，UTF-8-RAW）；生成物 1 份定义，' + (Get-Item -LiteralPath $tj).Length + ' 字节')
 } -Hint '生成物一律「先写 .tmp 再 FileMove 覆盖」；不要先 Delete 再 Append —— 空窗期读者看到的是「文件不存在」'
+
+Test-Case DAT-009 '数据' '图标重建失败时不毁旧图标' high {
+    # 00:25 事故的机制：全量模式先删 icons\ 再 Add-Type；抽屉是 Low IL，Add-Type（csc 写 %TEMP%）
+    # 抛「拒绝访问」→ 目录已空、脚本中断 → 所有格子建不出控件，热键/滚轮/按钮全废。
+    # 这里在临时副本上把 Add-Type 换成必抛异常，验证「失败 → 非 0 退出 + 旧图标原样保留」。
+    $src = Join-Path (Get-DshRoot) 'drawer\Build-IconCache.ps1'
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-iconcache-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    try { [void](New-Item -ItemType Directory -Path $tmpRoot -Force) } catch { }
+    $script = Read-Raw $src
+    $script = $script.Replace('Add-Type -AssemblyName System.Drawing', "throw 'simulated add-type failure'")
+    [System.IO.File]::WriteAllText((Join-Path $tmpRoot 'Build-IconCache.ps1'), $script, (New-Object System.Text.UTF8Encoding($true)))
+    $icons = Join-Path $tmpRoot 'icons'
+    [void](New-Item -ItemType Directory -Path $icons -Force)
+    $sentinel = Join-Path $icons 'keep-me.png'
+    [System.IO.File]::WriteAllBytes($sentinel, [byte[]](0x89, 0x50, 0x4E, 0x47))
+    [System.IO.File]::WriteAllText((Join-Path $tmpRoot 'items.tsv'), "keep`tC:\keep.png`ticons\keep-me.png`tfile`r`n", (New-Object System.Text.UTF8Encoding($false)))
+
+    # 注意：不能用 & powershell 2>&1 —— 测试库里 $ErrorActionPreference='Stop'，
+    # 子进程写到 stderr 的每一行都会变成终止性错误，脚本会直接在这里炸掉。
+    $so = Join-Path $tmpRoot 'run.out.txt'
+    $se = Join-Path $tmpRoot 'run.err.txt'
+    $proc = Start-Process -FilePath 'powershell.exe' -Wait -PassThru -WindowStyle Hidden `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $tmpRoot 'Build-IconCache.ps1')) `
+        -RedirectStandardOutput $so -RedirectStandardError $se
+    $rc = $proc.ExitCode
+    $errText = ''
+    try { $errText = Read-Raw $se } catch { }
+    $kept = Test-Path -LiteralPath $sentinel
+    $stageLeft = @(Get-ChildItem -LiteralPath $tmpRoot -Directory -Filter 'icons.new-*' -ErrorAction SilentlyContinue).Count
+    try { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+
+    if ($rc -eq 0) { throw 'Add-Type 失败时脚本仍然返回 0（调用方会以为重建成功）' }
+    if (-not $kept) { throw 'Add-Type 失败后旧图标被删掉了 —— 这正是 00:25 图标全空的成因' }
+    if ($stageLeft -gt 0) { throw ('失败后留下 ' + $stageLeft + ' 个 icons.new-* 暂存目录（应清理）') }
+    if ($errText -notmatch 'add-type failed') { throw ('stderr 里没有明确的 add-type failed 提示：' + $errText.Trim()) }
+    ('add-type 失败 → exit=' + $rc + '，旧图标保留，暂存目录已清理')
+} -Hint '重扫在 Low IL 抽屉里必失败；脚本必须失败得干净，绝不能先删后建'

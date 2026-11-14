@@ -37,7 +37,7 @@ function Static-ShaNoBom([string]$path) {
 $script:StaticRuntimePairs = @(
     'DesktopPage.ahk', 'dsh-agent.ps1', 'agent-watch.ps1', 'ensure-all.ps1', 'ensure-all.vbs',
     'agent-config.ps1', 'start-all.vbs', 'hwmon.ps1', 'wxmon.ps1', 'Build-IconCache.ps1', 'DesktopIcons.ps1',
-    'DesktopPositions.ps1', 'dock-add-host.ps1', 'dock-add.ps1', 'npix.exe', 'AutoHotkey64.exe'
+    'DesktopPositions.ps1', 'dock-add-host.ps1', 'dock-add.ps1', 'wheel-bridge.ps1', 'npix.exe', 'AutoHotkey64.exe'
 )
 
 Test-Case STA-001 '静态' '核心文件齐全' high {
@@ -218,6 +218,93 @@ Test-Case STA-008 '静态' '源码无个人绝对路径' low {
     if ($hits.Count -gt 0) { throw ('出现个人绝对路径：' + ($hits -join '、') + '（换机器会坏）') }
     ('扫描 ' + $files.Count + ' 个文件，未发现个人绝对路径')
 } -Hint '用 $env:LOCALAPPDATA / Resolve-WallpaperDir() 代替写死路径'
+
+Test-Case STA-010 '静态' 'Write-Js 只拼一次 dbg 键' high {
+    $p = Join-Path (Get-DshRoot) 'drawer\dsh-agent.ps1'
+    $t = Read-Raw $p
+    $n = ([regex]::Matches($t, [regex]::Escape("Append(',dbg:')"))).Count
+    # 2026-11-14 离线事故：18c57d5 把 reload 那行改成 ',dbg:'，而下一行本来就是 ',dbg:'，
+    # 输出 dbg:,dbg:false —— 整条赋值语法错误，__DSH_STATE 未定义，控制台永久「离线」。
+    if ($n -ne 1) { throw ("Append(',dbg:') 出现 " + $n + ' 次，必须恰好 1 次') }
+    # 顺带守住参数顺序：Write-Js 的形参个数与调用处实参个数必须一致
+    $sig = [regex]::Match($t, 'function Write-Js\(([^)]*)\)')
+    if (-not $sig.Success) { throw '找不到 Write-Js 定义' }
+    $argc = @($sig.Groups[1].Value.Split(',')).Count
+    $call = [regex]::Match($t, 'Write-Js\s+(\$ctx[^\r\n]*)')
+    if (-not $call.Success) { throw '找不到 Write-Js 调用点' }
+    $passed = @($call.Groups[1].Value.Trim().Split(' ')).Count
+    if ($argc -ne $passed) { throw ('Write-Js 形参 ' + $argc + ' 个，调用传了 ' + $passed + ' 个') }
+    ('dbg 键 1 处；Write-Js 形参/实参一致（' + $argc + ' 个）')
+} -Hint 'JSONP 响应里任何重复键/空值都会让整条赋值语法错误；改签名必须同步改调用点'
+
+Test-Case STA-011 '静态' '图标缓存先编译后落盘' high {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\Build-IconCache.ps1')
+    $addType = $t.IndexOf('Add-Type -ReferencedAssemblies')
+    $firstDel = $t.IndexOf('Remove-Item $iconDir')
+    $stage = $t.IndexOf('icons.new-')
+    # 00:25 事故：脚本先 Remove-Item icons\ 再 Add-Type；Low IL 下 Add-Type 失败 → 图标永久空。
+    # 契约：编译必须在任何删除之前；全量模式必须走暂存目录 + 原子换入。
+    if ($addType -lt 0) { throw '找不到 Add-Type' }
+    if ($firstDel -ge 0 -and $firstDel -lt $addType) { throw 'Add-Type 之前就删了 icons\（失败即永久空目录）' }
+    if ($stage -lt 0) { throw '全量模式没有暂存目录（icons.new-<pid>）' }
+    if ($t -notmatch 'Move-Item -LiteralPath \$iconDir -Destination \$bak') { throw '没有「旧 icons 改名备份」这一步，换入失败无法回滚' }
+    '编译先行 + 暂存换入 + 失败回滚 三步齐全'
+} -Hint '重扫在 Low IL 抽屉里必失败；脚本必须幂等失败，绝不能毁掉现有图标'
+Test-Case STA-012 '静态' '重命名框必须压在覆盖层上面' high {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+    $m = [regex]::Match($t, '(?s)RenameFolder\(f\)\s*\{(.*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 RenameFolder 函数体' }
+    $b = $m.Groups[1].Value
+    # 2026-11-14 用户反馈「建了文件夹之后不能重命名」：重命名框和文件夹弹窗共用 gFolderGui，
+    # 覆盖层 gOverlay 是全屏 TOPMOST 点击层，不撤掉/不抬 z 序就会被压住，点了像没反应。
+    if ($b -notmatch 'HideOverlay\(\)') { throw 'RenameFolder 没有先撤掉覆盖层（重命名框会被全屏点击层压住）' }
+    $iShow = $b.IndexOf('.Show(')
+    $iTop = $b.IndexOf('SetWindowPos')
+    if ($iShow -lt 0) { throw 'RenameFolder 没有 Show 对话框' }
+    if ($iTop -lt 0 -or $iTop -lt $iShow) { throw 'Show 之后没有把重命名框抬到 TOPMOST 顶端' }
+    if ($b -notmatch 'HideOverlay\(\)[\s\S]*\.Show\(') { throw '先 HideOverlay 再 Show 的顺序被调换了' }
+    '覆盖层先撤、对话框后抬顶'
+} -Hint '重命名框点击无效的根因：全屏 TOPMOST 覆盖层在看守点击'
+
+Test-Case STA-013 '静态' '重命名收尾要把覆盖层补回来' medium {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+    if ($t -notmatch 'AfterRenameDialog\(\)') { throw '没有 AfterRenameDialog（确定/取消都要补覆盖层）' }
+    foreach ($fn in 'ApplyRename', 'CloseRename') {
+        $m = [regex]::Match($t, "(?s)$fn\([^)]*\)\s*\{(.*?)\r?\n\}")
+        if (-not $m.Success) { throw "找不到 $fn 函数体" }
+        if ($m.Groups[1].Value -notmatch 'AfterRenameDialog\(\)') { throw "$fn 结束时没有调用 AfterRenameDialog" }
+    }
+    # 文件夹弹窗身份不匹配时，FolderPopupWatch 不能把重命名框当"已关闭"来收尾
+    $w = [regex]::Match($t, '(?s)FolderPopupWatch\(\)\s*\{(.*?)\r?\n\}')
+    if (-not $w.Success) { throw '找不到 FolderPopupWatch' }
+    # 已销毁的 Gui 不能直接摸 .Hwnd（会抛 `Gui has no window` 并让计时器永远收不了尾）
+    if ($w.Groups[1].Value -notmatch 'try vis := DllCall\("IsWindowVisible"') { throw 'FolderPopupWatch 读 .Hwnd 没有 try 保护（BindOpen 销毁弹窗后会每 300ms 抛错）' }
+    if ($w.Groups[1].Value -notmatch 'ObjPtr\(FOLDER_POPUP\) = ObjPtr\(gFolderGui\)') { throw 'FolderPopupWatch 没有按对象身份区分文件夹弹窗与重命名框' }
+    if ($w.Groups[1].Value -notmatch 'if \(!isPopup and vis\)') { throw 'FolderPopupWatch 没有把可见的重命名框排除在外（会误判关闭并重新盖上覆盖层）' }
+    '确定/取消都恢复覆盖层，监视计时器不误杀重命名框'
+} -Hint '2026-11-14：重命名框借 gFolderGui 名字，监视器身份判断必须容它'
+Test-Case STA-014 '静态' '点击层收尾后仍在最顶、无配对的鼠标抬起不收起抽屉' medium {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+
+    # 1) RestoreOverlayForDrawer 必须和 ShowDrawer 一样：最后再把覆盖层抬回最顶。
+    #    点击由覆盖层接收（抽屉只是画出来的），覆盖层被压在抽屉下面就"看得见、点不动"。
+    $r = [regex]::Match($t, '(?s)RestoreOverlayForDrawer\(\)\s*\{(.*?)\r?\n\}')
+    if (-not $r.Success) { throw '找不到 RestoreOverlayForDrawer' }
+    $body = $r.Groups[1].Value
+    $iDrawer = $body.IndexOf('gDrawer.Hwnd')
+    $iLast = $body.LastIndexOf('EnsureOverlay()')
+    if ($iDrawer -lt 0 -or $iLast -lt 0 -or $iLast -lt $iDrawer) { throw 'RestoreOverlayForDrawer 末尾没有把覆盖层抬回最顶（重命名后点不动）' }
+
+    # 2) OnOverUp 必须先确认本次抬起有配对的 DOWN，否则重命名框关掉时飘过来的 UP 会收起抽屉。
+    $u = [regex]::Match($t, '(?s)OnOverUp\(wParam, lParam, msg, hwnd\)\s*\{(.*?)\r?\n\}')
+    if (-not $u.Success) { throw '找不到 OnOverUp' }
+    $up = $u.Groups[1].Value
+    $iGuard = $up.IndexOf('!OVER_DOWN')
+    $iHide = $up.IndexOf('HideDrawer()')
+    if ($iGuard -lt 0) { throw 'OnOverUp 没有 OVER_DOWN 配对检查（改完名字抽屉会自己关）' }
+    if ($iHide -ge 0 -and $iHide -lt $iGuard) { throw 'OnOverUp 在配对检查之前就 HideDrawer()' }
+    '覆盖层收尾抬回最顶；无配对的抬起被忽略'
+} -Hint '2026-11-14：重命名一个之后要退出抽屉再进来才能改下一个的两条根因'
 
 Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     $root = Get-DshRoot
