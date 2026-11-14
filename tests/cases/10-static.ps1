@@ -277,9 +277,34 @@ Test-Case STA-013 '静态' '重命名收尾要把覆盖层补回来' medium {
     # 文件夹弹窗身份不匹配时，FolderPopupWatch 不能把重命名框当"已关闭"来收尾
     $w = [regex]::Match($t, '(?s)FolderPopupWatch\(\)\s*\{(.*?)\r?\n\}')
     if (-not $w.Success) { throw '找不到 FolderPopupWatch' }
-    if ($w.Groups[1].Value -notmatch 'IsWindowVisible[\s\S]*!= ObjPtr\(gFolderGui\)') { throw 'FolderPopupWatch 没有把可见的重命名框排除在外（会误判关闭并重新盖上覆盖层）' }
+    # 已销毁的 Gui 不能直接摸 .Hwnd（会抛 `Gui has no window` 并让计时器永远收不了尾）
+    if ($w.Groups[1].Value -notmatch 'try vis := DllCall\("IsWindowVisible"') { throw 'FolderPopupWatch 读 .Hwnd 没有 try 保护（BindOpen 销毁弹窗后会每 300ms 抛错）' }
+    if ($w.Groups[1].Value -notmatch 'ObjPtr\(FOLDER_POPUP\) = ObjPtr\(gFolderGui\)') { throw 'FolderPopupWatch 没有按对象身份区分文件夹弹窗与重命名框' }
+    if ($w.Groups[1].Value -notmatch 'if \(!isPopup and vis\)') { throw 'FolderPopupWatch 没有把可见的重命名框排除在外（会误判关闭并重新盖上覆盖层）' }
     '确定/取消都恢复覆盖层，监视计时器不误杀重命名框'
 } -Hint '2026-11-14：重命名框借 gFolderGui 名字，监视器身份判断必须容它'
+Test-Case STA-014 '静态' '点击层收尾后仍在最顶、无配对的鼠标抬起不收起抽屉' medium {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+
+    # 1) RestoreOverlayForDrawer 必须和 ShowDrawer 一样：最后再把覆盖层抬回最顶。
+    #    点击由覆盖层接收（抽屉只是画出来的），覆盖层被压在抽屉下面就"看得见、点不动"。
+    $r = [regex]::Match($t, '(?s)RestoreOverlayForDrawer\(\)\s*\{(.*?)\r?\n\}')
+    if (-not $r.Success) { throw '找不到 RestoreOverlayForDrawer' }
+    $body = $r.Groups[1].Value
+    $iDrawer = $body.IndexOf('gDrawer.Hwnd')
+    $iLast = $body.LastIndexOf('EnsureOverlay()')
+    if ($iDrawer -lt 0 -or $iLast -lt 0 -or $iLast -lt $iDrawer) { throw 'RestoreOverlayForDrawer 末尾没有把覆盖层抬回最顶（重命名后点不动）' }
+
+    # 2) OnOverUp 必须先确认本次抬起有配对的 DOWN，否则重命名框关掉时飘过来的 UP 会收起抽屉。
+    $u = [regex]::Match($t, '(?s)OnOverUp\(wParam, lParam, msg, hwnd\)\s*\{(.*?)\r?\n\}')
+    if (-not $u.Success) { throw '找不到 OnOverUp' }
+    $up = $u.Groups[1].Value
+    $iGuard = $up.IndexOf('!OVER_DOWN')
+    $iHide = $up.IndexOf('HideDrawer()')
+    if ($iGuard -lt 0) { throw 'OnOverUp 没有 OVER_DOWN 配对检查（改完名字抽屉会自己关）' }
+    if ($iHide -ge 0 -and $iHide -lt $iGuard) { throw 'OnOverUp 在配对检查之前就 HideDrawer()' }
+    '覆盖层收尾抬回最顶；无配对的抬起被忽略'
+} -Hint '2026-11-14：重命名一个之后要退出抽屉再进来才能改下一个的两条根因'
 
 Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     $root = Get-DshRoot

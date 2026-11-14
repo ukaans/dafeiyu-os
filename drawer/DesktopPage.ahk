@@ -105,6 +105,11 @@ EnsureSingleInstance() {
 }
 
 global DRAG := 0, gGhost := 0, gFolderGui := 0, gOverlay := 0
+; 覆盖层上「按下」的记账：只处理与本层 DOWN 配对的 UP。
+; 2026-11-14 用户反馈「重命名一个之后要退出抽屉再进来」：重命名框关掉、覆盖层刚恢复时，
+; 点「确定」的那次 WM_LBUTTONUP 会落到覆盖层上；原逻辑 sees !DRAG → HideDrawer()，
+; 于是每改完一个名字抽屉就把自己收起来。
+global OVER_DOWN := false, OVER_DOWN_AT := 0
 ; 文件夹弹窗当前那个 Gui 对象：BindOpen/BindRemove 会直接 Destroy，靠它做存活判定
 global FOLDER_POPUP := 0
 global FOLDER_CTRLS := []
@@ -1047,11 +1052,12 @@ FadeOut(hwnd) {
     }
 }
 HideDrawer() {
-    global gDrawer, GUI_W, GUI_H, curPage, LAST_HOVER
+    global gDrawer, GUI_W, GUI_H, curPage, LAST_HOVER, OVER_DOWN
     HideTip()
     if !IsObject(gDrawer)
         return
     pageBefore := curPage
+    OVER_DOWN := false
     HideOverlay()
     hwnd := gDrawer.Hwnd
     LogWrite("HideDrawer vis=" DllCall("IsWindowVisible", "Ptr", hwnd))
@@ -1361,11 +1367,12 @@ OnOverMove(wParam, lParam, msg, hwnd) {
 
 OnOverDown(wParam, lParam, msg, hwnd) {
     HideTip()
-    global gOverlay, DRAG, curPage, BAR_H
+    global gOverlay, DRAG, curPage, BAR_H, OVER_DOWN, OVER_DOWN_AT
     if (!IsObject(gOverlay) || hwnd != gOverlay.Hwnd || curPage = 0)
         return
     x := lParam & 0xFFFF
     y := (lParam >> 16) & 0xFFFF
+    OVER_DOWN := true, OVER_DOWN_AT := A_TickCount
     if (y < BAR_H)
         return
     fi := HitFolder(x, y)
@@ -1376,11 +1383,18 @@ OnOverDown(wParam, lParam, msg, hwnd) {
 }
 
 OnOverUp(wParam, lParam, msg, hwnd) {
-    global gOverlay, DRAG, ITEMS, FOLDERS, curPage, BAR_H, BAR_BTNS
+    global gOverlay, DRAG, ITEMS, FOLDERS, curPage, BAR_H, BAR_BTNS, OVER_DOWN, OVER_DOWN_AT
     if (!IsObject(gOverlay) || hwnd != gOverlay.Hwnd || curPage = 0)
         return
     x := lParam & 0xFFFF
     y := (lParam >> 16) & 0xFFFF
+    ; 只认与本层 DOWN 配对的 UP：重命名框/文件夹弹窗关掉时，那次按钮抬起会飘到刚恢复的
+    ; 覆盖层上，原逻辑会把它当成"点空白"→ 收起抽屉（用户看到的就是改完名字抽屉自己关了）。
+    if (!OVER_DOWN || A_TickCount - OVER_DOWN_AT > 3000) {
+        OVER_DOWN := false
+        return
+    }
+    OVER_DOWN := false
     if (y < BAR_H) {
         DRAG := 0
         for b in BAR_BTNS
@@ -3571,18 +3585,18 @@ CloseFolderPopup(g) {
 
 FolderPopupWatch() {
     global gFolderGui, FOLDER_POPUP
-    alive := false
-    ; 只认 OpenFolder 建的那个 Gui（RenameFolder 也用 gFolderGui 这个全局名，
-    ; 用 ObjPtr 身份比较排除掉，免得重命名框被当成"文件夹弹窗"来收尾）
-    ; 重命名框也借用 gFolderGui：它 Visible 期间绝不能当成"文件夹弹窗已关闭"来收尾，
-    ; 否则 RestoreOverlayForDrawer() 会把全屏覆盖层重新抬上来，把重命名框盖住、点不动。
-    if (IsObject(gFolderGui) && DllCall("IsWindowVisible", "Ptr", gFolderGui.Hwnd) && (!IsObject(FOLDER_POPUP) || ObjPtr(FOLDER_POPUP) != ObjPtr(gFolderGui)))
-        return
-    if (IsObject(FOLDER_POPUP) && IsObject(gFolderGui) && ObjPtr(FOLDER_POPUP) = ObjPtr(gFolderGui)) {
-        try alive := DllCall("IsWindowVisible", "Ptr", gFolderGui.Hwnd) ? true : false
+    ; 两条收尾路径：Esc/关闭 → CloseFolderPopup；点了弹窗里的图标 → BindOpen 直接 Destroy，
+    ; 由这个 300ms 计时器兜底。注意 gFolderGui 可能已经是"已销毁的 Gui 对象"（BindOpen 那条），
+    ; 直接摸 .Hwnd 会抛 `Gui has no window`，计时器就会每 300ms 报一次错、永远收不了尾。
+    isPopup := (IsObject(gFolderGui) && IsObject(FOLDER_POPUP) && ObjPtr(FOLDER_POPUP) = ObjPtr(gFolderGui))
+    vis := false
+    if (IsObject(gFolderGui)) {
+        try vis := DllCall("IsWindowVisible", "Ptr", gFolderGui.Hwnd) ? true : false
     }
-    if alive
-        return
+    if (isPopup and vis)
+        return                      ; 文件夹弹窗还开着
+    if (!isPopup and vis)
+        return                      ; 可见的重命名框（借用同一个全局名），不许当成弹窗关闭
     SetTimer(FolderPopupWatch, 0)
     FOLDER_POPUP := 0
     gFolderGui := 0
@@ -3597,9 +3611,14 @@ RestoreOverlayForDrawer() {
     global gDrawer, curPage
     if (curPage <= 0)
         return
+    ; 顺序必须和 ShowDrawer 的收尾一致：先补覆盖层、再把抽屉抬上来合成、最后再把覆盖层
+    ; 抬回最顶。点击由覆盖层接收（抽屉只是画出来的），覆盖层不在顶就会「看得见、点不动」。
+    ; 2026-11-14 用户反馈「重命名一个之后，必须退出抽屉再进来才能改下一个」——
+    ; 重命名框关掉走的就是这里，旧实现把抽屉抬在覆盖层上面，之后所有点击都打在抽屉上。
     EnsureOverlay()
     if IsObject(gDrawer)
         try DllCall("SetWindowPos", "Ptr", gDrawer.Hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0013)
+    EnsureOverlay()
 }
 
 ; 自检：dirtest=<目录> 的定时器回调（单独成函数是为了能用 .Bind() 按值捕获路径）。
