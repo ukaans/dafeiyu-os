@@ -2358,6 +2358,16 @@ SummonTick() {
     ; 写出来的文件末尾一定带换行 —— 以前这种调用会被当成未知命令静默丢弃（文件已删、无日志），
     ; 排查时看起来像"文件通道也是坏的"。这里显式把回车换行也当空白剪掉。
     try cmd := Trim(FileRead(SUMMON_FILE, "UTF-8"), " `t`r`n")
+    ; 「读到空」不等于「命令被取走」（2026-11-14）：写方是「建文件 → 再写内容」两步，
+    ; 中间那一瞬文件存在但 0 字节。以前读完立刻删 → 命令被吞、文件也没了（RES-014 偶发失败、
+    ; 真实场景是 /summon.gif 与壁纸信标正好撞上 tick）。空读先别删，等 2s 还是空才当脏文件清掉。
+    if (cmd = "") {
+        age := 0
+        try age := DateDiff(A_Now, FileGetTime(SUMMON_FILE, "M"), "Seconds")
+        if (age >= 2)
+            try FileDelete(SUMMON_FILE)
+        return
+    }
     try FileDelete(SUMMON_FILE)
     ; 「读到」不等于「取走」（2026-11-09）：原来删不掉也照样派发，同一条命令每 400ms 重放一次 ——
     ; show/hide 幂等所以看不出来，diag 会刷日志、foldertest= 会反复弹窗、log=N 会反复导出。
