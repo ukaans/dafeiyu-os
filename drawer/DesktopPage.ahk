@@ -198,7 +198,8 @@ global SUMMON_CMDS := Map(
     "edge=1",      {fn: Summon_CmdEdgeOn,     prefix: false},
     "log=",        {fn: Summon_CmdLog,        prefix: true},
     "foldertest=", {fn: Summon_CmdFolderTest, prefix: true},
-    "dirtest=",    {fn: Summon_CmdDirTest,    prefix: true}
+    "dirtest=",    {fn: Summon_CmdDirTest,    prefix: true},
+    "rescan",      {fn: Summon_CmdRescan,     prefix: false}
 )
 ; 代理不可用时的启动队列文件（看门狗 / 巡检进程读它并拉起程序）。
 ; 行格式：<epoch 秒>|<完整路径>
@@ -622,6 +623,34 @@ AgentDockAdd(path, name, iconName) {
     }
 }
 
+; 桌面图标开关也必须走代理：本机 AutoHotkey64 是 Low IL（il=0x1000 实测），
+; 抽屉自己跑 DesktopIcons.ps1 会在 Add-Type（csc 写 %TEMP%）那步「拒绝访问」，
+; 顶栏「原始桌面」/ Ctrl+Alt+D 于是看起来毫无反应（脚本其实每次都 exit 1）。
+; 代理是 High，同一份脚本 33ms（query）/ 250ms（hide/show）出结果。
+; 返回 'shown' / 'hidden'；代理不可用时返回 ''，调用方再退回本地。
+AgentIcons(mode) {
+    global AGENT_BASE
+    try {
+        t0 := A_TickCount
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.SetTimeouts(300, 300, 2500, 2500)
+        req.Open("GET", AGENT_BASE "/icons.gif?mode=" mode, false)
+        tk := AgentToken()
+        if (tk != "")
+            req.SetRequestHeader("X-DSH-Token", tk)
+        req.Send()
+        rt := req.ResponseText
+        LogWrite("icons agent: mode=" mode " status=" req.Status " " (A_TickCount - t0) "ms " rt)
+        if (req.Status != 200 || InStr(rt, '"ok":true') = 0)
+            return ""
+        if RegExMatch(rt, '"state":"(shown|hidden)"', &m)
+            return m[1]
+        return ""
+    } catch as e {
+        LogWrite("icons agent unavailable: " e.Message)
+        return ""
+    }
+}
 ; 图标缓存重建也必须走代理：本机 AutoHotkey64 是 Low IL（il=0x1000 实测），
 ; 抽屉自己跑 Build-IconCache.ps1 会在 Add-Type（csc 写 %TEMP%）那步「拒绝访问」，
 ; 而旧版脚本先删 icons\ —— 于是图标全空、所有格子建不出控件、热键全"失灵"。
@@ -3200,13 +3229,23 @@ LogError(err, mode) {
 }
 
 IconsScript(mode) {
+    ; 优先走代理（High）。抽屉自己是 Low IL，本地子进程里的 Add-Type 一律「拒绝访问」，
+    ; 这条路径以前每次都失败却没人看返回值 —— 「显示桌面图标」按钮就是这样"失效"的。
+    if (AgentIcons(mode) != "")
+        return 0
     global APP_DIR
+    LogWrite("icons: agent path failed, local fallback mode=" mode)
     cmd := 'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' APP_DIR '\DesktopIcons.ps1" -Mode ' mode
     try return RunWait(cmd, , "Hide")
     return 1
 }
 
 QueryIcons() {
+    ; 同上：先问代理要真实状态；代理不可用才本地跑（Low IL 下会拿到空输出，
+    ; 旧代码把“空输出”当成 shown —— 于是状态灯与真实桌面长期不一致）。
+    st := AgentIcons("query")
+    if (st != "")
+        return st
     global APP_DIR
     try {
         shell := ComObject("WScript.Shell")
@@ -3215,8 +3254,11 @@ QueryIcons() {
         out := exec.StdOut.ReadAll()
         if InStr(out, "hidden")
             return "hidden"
+        if InStr(out, "shown")
+            return "shown"
     }
-    return "shown"
+    LogWrite("icons: query unavailable (agent + local both empty)")
+    return "unknown"
 }
 
 RestoreIconState() {
@@ -3316,6 +3358,26 @@ SelfTest(*) {
     ExitApp
 }
 
+; 重扫前把当前可见条目的真实坐标写进 layout（POS）。只在 dpos 为空时做 —— 那时
+; DefaultSlot 会失去桌面落位，快照是唯一能保住原样的东西。
+SnapshotVisiblePositions() {
+    global POS, POS_DESK, ITEMS, GROUP_OF, HIDDEN
+    if (POS_DESK.Count > 0)
+        return 0
+    n := 0
+    for it in ITEMS {
+        if !it.Has("pic") || !it["pic"].Visible
+            continue
+        if GROUP_OF.Has(it["path"]) || HIDDEN.Has(it["path"])
+            continue
+        POS[it["path"]] := [it["x"], it["y"]]
+        n += 1
+    }
+    if (n > 0)
+        SaveLayout()
+    LogWrite("rescan: snapshot " n " visible positions (dpos empty)")
+    return n
+}
 RescanDesktop(*) {
     FORCE_DIRTY := true
     global gDrawer, curPage, CTRL_POOL, FORCE_DIRTY
@@ -3332,7 +3394,16 @@ RescanDesktop(*) {
         LogWrite("rescan: agent icon build failed, direct fallback")
         RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\Build-IconCache.ps1"', , "Hide")
     }
-    RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\DesktopPositions.ps1"', , "Hide")
+    ; 2026-11-14 13:04 事故：图标隐藏状态下 DesktopPositions.ps1 写出了 0 行，
+    ; 覆盖后 POS_DESK 空 → DefaultSlot 全部退回"按下标铺网格" → 113 条整体重排，
+    ; 而 14 个文件夹的 F 坐标还在 → 用户看到「顺序打乱 + 一堆重叠」。
+    ; 现在的规矩：(1) 位置文件还没被抹空前先给"当前看得见的位置"打快照进 layout；
+    ; (2) 只有 dpos 为空时才重新抓，抓到 0 行时脚本自己也不覆盖旧文件。
+    SnapshotVisiblePositions()
+    if (POS_DESK.Count = 0)
+        RunWait('powershell -NoProfile -ExecutionPolicy Bypass -File "' APP_DIR '\DesktopPositions.ps1"', , "Hide")
+    else
+        LogWrite("rescan: keep existing desktop_positions.tsv (" POS_DESK.Count " 行)")
     LoadPositions()
     LoadItems()
     LoadLayout()
@@ -3774,6 +3845,12 @@ Summon_CmdShow(arg := "") {
     AuditLog("summon", "cmd=show")
 }
 
+Summon_CmdRescan(arg := "") {
+    ; 无人值守重扫入口：既能测「重扫不打乱布局」，也让看门狗有机会修复图标缓存。
+    LogWrite("summon: rescan via file")
+    AuditLog("summon", "cmd=rescan")
+    RescanDesktop()
+}
 Summon_CmdHide(arg := "") {
     HideDrawer()
     LogWrite("summon: hide via file")

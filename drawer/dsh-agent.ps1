@@ -1885,8 +1885,50 @@ function Invoke-IconBuild($ctx, $query) {
     Write-Audit 'iconbuild' ('ok={0} items={1} ms={2}' -f $ok, $items, $ms) 'API'
 }
 
+# ---- GET /icons.gif?mode=show|hide|query ← 以代理权限（High）切系统桌面图标 ----
+# 2026-11-14：本机 AutoHotkey64 是 Low IL（il=0x1000），抽屉自己跑 DesktopIcons.ps1 会在
+# Add-Type（csc 写 %TEMP%）那步「拒绝访问」→ 顶栏「原始桌面」/ Ctrl+Alt+D 看起来完全没反应。
+# 代理是 High，同一份脚本 300ms 内出结果（实测 query 33ms / hide 250ms）。
+function Invoke-Icons($ctx, $query) {
+    $mode = 'query'
+    try { $m = [string](Get-UrlParam $query.req 'mode'); if ($m) { $mode = $m } } catch { }
+    if ($mode -notin @('show', 'hide', 'query')) { $mode = 'query' }
+    # 只认抽屉带来的 token（任意网页不能借代理切桌面图标）
+    $tk = ''
+    try { $tk = [string]$query.req.Headers['X-DSH-Token'] } catch { }
+    if (-not $tk -or $tk -ne $script:launchToken) {
+        Write-Raw $ctx ([System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"msg":"token"}')) 'application/json; charset=utf-8'
+        Agent-Log 'icons rejected: bad token'
+        return
+    }
+    $state = ''
+    $ok = $false
+    $msg = ''
+    $t0 = [Environment]::TickCount
+    $scriptPath = Join-Path $appDir 'DesktopIcons.ps1'
+    try {
+        if (Test-Path -LiteralPath $scriptPath) {
+            $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $scriptPath -Mode $mode 2>&1
+            $text = ($out | Out-String)
+            $lines = @($text -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+            if ($lines.Count -gt 0 -and $lines[-1].Trim() -match '^(shown|hidden)$') { $state = $lines[-1].Trim() }
+            $ok = ($LASTEXITCODE -eq 0 -and $state -ne '')
+            if (-not $ok) { $msg = ($text -replace '[\r\n]+', ' ').Trim() }
+        } else {
+            $msg = 'DesktopIcons.ps1 missing'
+        }
+    } catch {
+        $msg = $_.Exception.Message
+    }
+    $ms = [Environment]::TickCount - $t0
+    if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) }
+    $js = '{"ok":' + $(if ($ok) { 'true' } else { 'false' }) + ',"mode":"' + $mode + '","state":"' + $state + '","ms":' + $ms + ',"msg":"' + (Escape-Js $msg) + '"}'
+    Write-Raw $ctx ([System.Text.Encoding]::UTF8.GetBytes($js)) 'application/json; charset=utf-8'
+    Write-Audit 'icons' ('mode={0} ok={1} state={2} ms={3}' -f $mode, $ok, $state, $ms) 'API'
+}
 $script:ROUTES = @{
     '/iconbuild.gif'  = @{ handler = 'Invoke-IconBuild';  kind = 'iconbuild';  poll = $false; audit = $false }
+    '/icons.gif'      = @{ handler = 'Invoke-Icons';      kind = 'icons';      poll = $false; audit = $false }
     '/state.js'       = @{ handler = 'Invoke-StateJs';    kind = 'state';      poll = $true;  audit = $false }
     '/state'          = @{ handler = 'Invoke-StateJs';    kind = 'state';      poll = $true;  audit = $false }
     '/log.js'         = @{ handler = 'Invoke-LogJs';      kind = 'log';        poll = $true;  audit = $false }

@@ -386,3 +386,40 @@ Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     }
     ('壁纸 ' + (@(Get-ChildItem -LiteralPath (Join-Path $root 'wallpaper') -File).Count) + ' 个文件与运行时一致')
 } -Hint '壁纸改了要拷到 Lively 库那份（路径见 WallpaperLayout.json 的 LivelyInfoPath），再重启 Lively'
+
+Test-Case STA-017 '静态' '图标开关必须走代理（Low IL 本地必失败）' high {
+    $root = Get-DshRoot
+    $ahk = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPage.ahk'), [Text.Encoding]::UTF8)
+    # 抽屉是 Low IL（il=0x1000）：本地跑 DesktopIcons.ps1 会在 Add-Type 处「拒绝访问」，
+    # 2026-11-14 用户报「显示桌面图标没反应」就是这个原因。
+    if ($ahk -notmatch 'AgentIcons\(mode\)') { throw 'AHK 里没有 AgentIcons() helper' }
+    $iIcon = $ahk.IndexOf('if (AgentIcons(mode) != "")')
+    $iLocal = $ahk.IndexOf('local fallback mode=')
+    if ($iIcon -lt 0 -or $iLocal -lt 0 -or $iIcon -gt $iLocal) { throw 'IconsScript 没有先走代理再本地兜底' }
+    $q = $ahk.IndexOf('st := AgentIcons("query")')
+    if ($q -lt 0) { throw 'QueryIcons 没有先问代理' }
+    $ag = [IO.File]::ReadAllText((Join-Path $root 'drawer\dsh-agent.ps1'), [Text.Encoding]::UTF8)
+    if ($ag -notmatch "'/icons\.gif'\s*=\s*@\{") { throw '代理没有 /icons.gif 路由' }
+    if ($ag -notmatch 'function Invoke-Icons') { throw '代理没有 Invoke-Icons 处理函数' }
+    $di = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopIcons.ps1'), [Text.Encoding]::UTF8)
+    if ($di -notmatch 'try \{\s*Add-Type') { throw 'DesktopIcons.ps1 的 Add-Type 没有 try（失败会变成未处理异常）' }
+    if ($di -notmatch 'add-type failed') { throw 'DesktopIcons.ps1 没有明确错误文案' }
+    'AHK 图标开关先走代理 /icons.gif，本地兜底有日志；DesktopIcons.ps1 的 Add-Type 失败可诊断'
+} -Hint 'Low IL 进程做不了 Add-Type；任何需要 P/Invoke 的动作都要交给代理（High）'
+
+Test-Case STA-018 '静态' '重扫不许抹空 dpos：先快照、空 dpos 才重抓' high {
+    $root = Get-DshRoot
+    $ahk = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPage.ahk'), [Text.Encoding]::UTF8)
+    if ($ahk -notmatch 'SnapshotVisiblePositions\(\)\s*\{') { throw '没有 SnapshotVisiblePositions()' }
+    $r = $ahk.IndexOf('RescanDesktop(*) {')
+    if ($r -lt 0) { throw '找不到 RescanDesktop()' }
+    $snap = $ahk.IndexOf('SnapshotVisiblePositions()', $r)
+    # 注释里也会出现 DesktopPositions.ps1 字样，所以按「判据行」定位真正那次调用
+    $guard = $ahk.IndexOf('if (POS_DESK.Count = 0)', $r)
+    if ($snap -lt 0 -or $guard -lt 0 -or $snap -gt $guard) { throw 'RescanDesktop 没有在「dpos 为空才重抓」判据之前先快照' }
+    if ($ahk.IndexOf('DesktopPositions.ps1', $guard) -lt 0) { throw '判据下面没有 DesktopPositions.ps1 调用' }
+    $dp = [IO.File]::ReadAllText((Join-Path $root 'drawer\DesktopPositions.ps1'), [Text.Encoding]::UTF8)
+    if ($dp -notmatch '\.tmp-\$PID') { throw 'DesktopPositions.ps1 不是写临时文件再换入' }
+    if ($dp -notmatch 'positions: 0 \(kept existing') { throw 'DesktopPositions.ps1 抓到 0 行时没有保留旧文件' }
+    '重扫：先快照可见位置 → dpos 非空就跳过重抓 → 抓不到就保留旧文件'
+} -Hint '2026-11-14 13:04：图标隐藏时 DesktopPositions 写出 0 行并覆盖，113 条集体回网格重排'
