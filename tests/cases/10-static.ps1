@@ -306,6 +306,33 @@ Test-Case STA-014 '静态' '点击层收尾后仍在最顶、无配对的鼠标�
     '覆盖层收尾抬回最顶；无配对的抬起被忽略'
 } -Hint '2026-11-14：重命名一个之后要退出抽屉再进来才能改下一个的两条根因'
 
+Test-Case STA-015 '静态' '天气城市按 IP 定时重解析（多家兜底 + 磁盘缓存）' medium {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\wxmon.ps1')
+
+    # 1) 不许再回到"启动只解析一次"：那就是换城市后永远显示旧城市的原因
+    if ($t -match '位置只解析一次') { throw 'wxmon 又写成"位置只解析一次"了（换城市/挂代理后城市不会更新）' }
+
+    # 2) 多家服务按顺序兜底：单家被墙/改接口/403 时不能整块退化成北京
+    if ($t -notmatch 'function Resolve-IpLoc') { throw '找不到 Resolve-IpLoc' }
+    foreach ($h in @('ipwho.is', 'ipinfo.io', 'ip-api.com')) {
+        if ($t -notmatch [regex]::Escape($h)) { throw "Resolve-IpLoc 缺少兜底服务 $h" }
+    }
+
+    # 3) 主循环里必须按 TTL 重解析（不是只在进程启动时算一次）
+    $w = [regex]::Match($t, '(?s)while \(\$true\)\s*\{(.*?)\r?\n\}')
+    if (-not $w.Success) { throw '找不到主循环' }
+    $body = $w.Groups[1].Value
+    if ($body -notmatch 'Resolve-IpLoc') { throw '主循环里没有重解析位置（城市只在启动时算一次）' }
+    if ($body -notmatch 'LOC_TTL') { throw '主循环里没有 TTL 判据' }
+    if ($body -notmatch 'Get-WeatherUrl') { throw '位置变了但天气 URL 没重建' }
+
+    # 4) 结果要落盘：解析服务偶发失败时用上次结果，而不是退回北京
+    foreach ($k in @('wx-loc.json', 'function Save-Loc', 'function Load-Loc')) {
+        if ($t -notmatch [regex]::Escape($k)) { throw "缺少位置缓存：$k" }
+    }
+    if ($t -notmatch '\$DEFAULT_LOC') { throw '缺少兜底默认位置定义' }
+    '多家兜底 + TTL 重解析 + wx-loc.json 缓存'
+} -Hint '2026-11-14：天气一直显示北京（进程启动时解析一次，之后永不更新）'
 Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     $root = Get-DshRoot
     $wall = Get-DshWall

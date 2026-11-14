@@ -94,23 +94,107 @@ function ConvertTo-JsString([string]$s) {
     return ($s -replace '\\', '\\\\' -replace "'", "\'" -replace "`r", ' ' -replace "`n", ' ')
 }
 
-# 位置只解析一次（失败就用北京兜底）
-$lat = 39.911
-$lon = 116.395
-$city = '北京'
-try {
-    $ip = Invoke-RestMethod -TimeoutSec 15 'http://ip-api.com/json/?fields=status,city,regionName,lat,lon&lang=zh-CN'
-    if ($ip.status -eq 'success' -and $ip.lat) {
-        $lat = [double]$ip.lat
-        $lon = [double]$ip.lon
-        if ($ip.city) { $city = "$($ip.city)" }
-        elseif ($ip.regionName) { $city = "$($ip.regionName)" }
-    }
-} catch { }
+# ---------------------------------------------------------------
+# 位置解析（2026-11-14 修复）
+# 原来只在进程启动时解析一次：换城市 / 挂代理 / 开机那一刻定位失败之后，
+# 城市会一直停在启动时那个（失败时甚至是写死的「北京」），天气也跟着查错地方。
+# 现在：多家 HTTPS 服务按顺序兜底 → 结果缓存到 wx-loc.json（带时间戳）
+#      → 每 $LOC_TTL 秒重解析一次；全部失败就保留上次结果，绝不覆盖成北京。
+# ---------------------------------------------------------------
+$locFile = Join-Path $env:LOCALAPPDATA 'DesktopPage\wx-loc.json'
+$wxLogFile = Join-Path $env:LOCALAPPDATA 'DesktopPage\wxmon.log'
+$LOC_TTL = 1800          # 位置多久重解析一次（秒）
+$LOC_RETRY = 300         # 重解析失败后多久再试（秒）
+$DEFAULT_LOC = @{ city = '北京'; lat = 39.911; lon = 116.395; src = 'default' }
 
-$weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon" +
-    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code" +
-    "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%2FShanghai"
+function Write-WxLog([string]$msg) {
+    try {
+        if ((Test-Path -LiteralPath $wxLogFile) -and ((Get-Item -LiteralPath $wxLogFile).Length -gt 256KB)) {
+            Move-Item -LiteralPath $wxLogFile -Destination ($wxLogFile + '.1') -Force
+        }
+        $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $msg + "`r`n"
+        [System.IO.File]::AppendAllText($wxLogFile, $line, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Get-IpLocJson([string]$url) {
+    Invoke-RestMethod -TimeoutSec 12 -Uri $url -Headers @{ 'User-Agent' = 'DesktopPage/1.0' }
+}
+
+function Resolve-IpLoc {
+    # 1) ipwho.is：HTTPS 免费、支持中文城市名、一次给全经纬度
+    try {
+        $r = Get-IpLocJson 'https://ipwho.is/?lang=zh-CN'
+        if ($r.success -and $r.city -and $r.latitude -and $r.longitude) {
+            return @{ city = [string]$r.city; lat = [double]$r.latitude; lon = [double]$r.longitude; src = 'ipwho.is' }
+        }
+    } catch { }
+    # 2) ipinfo.io：英文城市名 + "lat,lon"
+    try {
+        $r = Get-IpLocJson 'https://ipinfo.io/json'
+        if ($r.city -and $r.loc) {
+            $xy = ([string]$r.loc) -split ','
+            if ($xy.Count -eq 2) {
+                return @{ city = [string]$r.city; lat = [double]$xy[0]; lon = [double]$xy[1]; src = 'ipinfo.io' }
+            }
+        }
+    } catch { }
+    # 3) ip-api.com 免费版只给 HTTP（HTTPS 会 403），最后兜底
+    try {
+        $r = Get-IpLocJson 'http://ip-api.com/json/?fields=status,city,regionName,lat,lon&lang=zh-CN'
+        if ($r.status -eq 'success' -and $r.lat) {
+            $c = ''
+            if ($r.city) { $c = [string]$r.city }
+            elseif ($r.regionName) { $c = [string]$r.regionName }
+            if ($c) { return @{ city = $c; lat = [double]$r.lat; lon = [double]$r.lon; src = 'ip-api.com' } }
+        }
+    } catch { }
+    return $null
+}
+
+function Save-Loc($l) {
+    try {
+        $o = [ordered]@{
+            ts   = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            city = $l.city; lat = $l.lat; lon = $l.lon; src = $l.src
+        }
+        [System.IO.File]::WriteAllText($locFile, (ConvertTo-Json $o -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Load-Loc {
+    try {
+        if (-not (Test-Path -LiteralPath $locFile)) { return $null }
+        $o = [System.IO.File]::ReadAllText($locFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (-not $o.city -or -not $o.lat -or -not $o.lon) { return $null }
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$o.ts
+        # 太旧（超过 2 个周期）就当没有：宁可重解析，也不拿半年前的缓存当年底
+        if ($age -lt 0 -or $age -gt ($LOC_TTL * 2)) { return $null }
+        return @{ city = [string]$o.city; lat = [double]$o.lat; lon = [double]$o.lon; src = [string]$o.src }
+    } catch { return $null }
+}
+
+function Get-WeatherUrl($l) {
+    "https://api.open-meteo.com/v1/forecast?latitude=$($l.lat)&longitude=$($l.lon)" +
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code" +
+        "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%2FShanghai"
+}
+
+$loc = Load-Loc
+$locAt = [DateTime]::UtcNow
+if (-not $loc) {
+    $loc = Resolve-IpLoc
+    if ($loc) {
+        Save-Loc $loc
+        Write-WxLog ('loc: ' + $loc.city + ' (' + $loc.lat + ',' + $loc.lon + ') via ' + $loc.src)
+    } else {
+        $loc = $DEFAULT_LOC
+        $locAt = [DateTime]::MinValue      # 立刻在下一轮重试
+        Write-WxLog 'loc: resolve failed at startup, using default; will retry'
+    }
+}
+$city = $loc.city
+$weatherUrl = Get-WeatherUrl $loc
 
 $lastOk = $null
 # 启动时从上一份 wx-data.js 播种 lastOk（2026-11-13 实测教训）：
@@ -126,6 +210,22 @@ try {
 } catch { }
 
 while ($true) {
+    # 到点重解析位置：换城市 / 挂代理 之后不用重启进程也能跟上；失败保留上次结果
+    if (([DateTime]::UtcNow - $locAt).TotalSeconds -gt $LOC_TTL) {
+        $nl = Resolve-IpLoc
+        if ($nl) {
+            if ($nl.city -ne $loc.city) { Write-WxLog ('loc: ' + $loc.city + ' -> ' + $nl.city + ' via ' + $nl.src) }
+            $loc = $nl
+            Save-Loc $loc
+            $locAt = [DateTime]::UtcNow
+        } else {
+            $locAt = [DateTime]::UtcNow.AddSeconds($LOC_TTL - $LOC_RETRY)
+            Write-WxLog ('loc: resolve failed, keep ' + $loc.city)
+        }
+        $city = $loc.city
+        $weatherUrl = Get-WeatherUrl $loc
+    }
+
     $js = $null
     try {
         $w = Invoke-RestMethod -TimeoutSec 20 -Uri $weatherUrl
