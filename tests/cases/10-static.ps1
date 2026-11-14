@@ -32,13 +32,19 @@ function Static-ShaNoBom([string]$path) {
     return ([System.BitConverter]::ToString($hash) -replace '-', '')
 }
 
-# 会被 install.ps1 拷进 %LOCALAPPDATA%\DesktopPage 的文件：
-# 源工程与运行时副本不一致 = 改了半天其实跑的还是旧代码，是这套系统最常见的"幽灵故障"。
-$script:StaticRuntimePairs = @(
-    'DesktopPage.ahk', 'dsh-agent.ps1', 'agent-watch.ps1', 'ensure-all.ps1', 'ensure-all.vbs',
-    'agent-config.ps1', 'start-all.vbs', 'hwmon.ps1', 'wxmon.ps1', 'Build-IconCache.ps1', 'DesktopIcons.ps1',
-    'DesktopPositions.ps1', 'dock-add-host.ps1', 'dock-add.ps1', 'wheel-bridge.ps1', 'npix.exe', 'AutoHotkey64.exe'
-)
+# 会被 install.ps1 拷进 %LOCALAPPDATA%\DesktopPage 的文件：**从 drawer\ 目录推导**，不写死清单。
+# 2026-11-13 事故：清单是硬编码的，wheel-bridge.ps1 从 11-05 诞生起就没被列进去 ——
+# 于是它丢了 BOM、桥 35 小时起不来，而 STA-005 一直绿。目录推导后，新加的 .ps1 自动纳入核对。
+# 排除：*.bak-*（历史备份）、components.md（文档）、*.log/*.pid/*.err/*.dat/*.txt（运行时产物）。
+function Static-DeployedFiles {
+    $dir = Join-Path (Get-DshRoot) 'drawer'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -File | Where-Object {
+            $_.Name -notmatch '\.bak-\d+$' -and
+            $_.Name -notmatch '\.(log|pid|err|dat|txt)$' -and
+            $_.Name -ne 'components.md'
+        } | Sort-Object Name | ForEach-Object { $_.Name })
+}
 
 Test-Case STA-001 '静态' '核心文件齐全' high {
     $root = Get-DshRoot
@@ -126,7 +132,7 @@ Test-Case STA-005 '静态' '源工程与运行时副本一致' high {
     $inst = Get-DshInstall
     if (-not (Test-Path -LiteralPath $inst)) { return @{ Status = 'skip'; Detail = '运行时目录不存在（还没安装）' } }
     $diff = @()
-    foreach ($n in $script:StaticRuntimePairs) {
+    foreach ($n in (Static-DeployedFiles)) {
         $s = Join-Path (Join-Path $root 'drawer') $n
         $d = Join-Path $inst $n
         if (-not (Test-Path -LiteralPath $s)) { continue }
@@ -479,3 +485,19 @@ Test-Case STA-020 '静态' '拖文件夹时只藏被拖的那一个' high {
     if ($seg.IndexOf('FOLDER_CTRL_OF[FOLDERS[fi]["id"]]') -lt 0) { throw 'DragMove 没有改成只藏被拖的文件夹' }
     '拖文件夹只隐藏自己那一组控件，其它合成文件夹保持可见'
 } -Hint '2026-11-14 用户反馈：拖文件夹时其它文件夹会消失，松手才回来'
+
+Test-Case STA-021 '静态' '桥存活走互斥体、启动失败留痕' high {
+    $root = Get-DshRoot
+    $ens = [IO.File]::ReadAllText((Join-Path $root 'drawer\ensure-all.ps1'), [Text.Encoding]::UTF8)
+    $wb = [IO.File]::ReadAllText((Join-Path $root 'drawer\wheel-bridge.ps1'), [Text.Encoding]::UTF8)
+    if ($ens -match 'CommandLine[^\r\n]*wheel-bridge\.ps1') { throw 'ensure-all 还在用命令行匹配判桥存活（探针/自检会误匹配成"活着"）' }
+    if ($ens.IndexOf("Test-Mutex 'Local\DshWheelBridge'") -lt 0) { throw 'ensure-all 没有用桥自己的互斥体 Local\DshWheelBridge 判存活' }
+    if ($ens.IndexOf('wheel-bridge-launch.err') -lt 0) { throw 'ensure-all 没有把桥的 stderr 重定向留痕（解析级死亡时这是唯一线索）' }
+    if ($ens.IndexOf('wheel-bridge FAILED to start') -lt 0) { throw 'ensure-all 拉起桥后没有复查是否真起来并记录失败' }
+    if ($ens.IndexOf('died before its first line') -lt 0) { throw 'ensure-all 没有区分「死在第一行之前」与「起来后崩」' }
+    if ($ens.IndexOf('no beat ') -lt 0) { throw 'ensure-all 没有按心跳判卡死' }
+    if ($wb.IndexOf('wheel-bridge-boot.log') -lt 0) { throw 'wheel-bridge 没有写 boot 标记（无法区分解析级死亡与运行期崩溃）' }
+    if ($wb.IndexOf('Add-Type failed') -lt 0) { throw 'wheel-bridge 的 Add-Type 失败没有留痕' }
+    if ($wb.IndexOf('wheel-bridge" + _id + ".pid') -lt 0) { throw 'wheel-bridge 没有写 pid 文件（卡死时无法定位进程）' }
+    '桥用互斥体判存活；启动失败有 stderr + boot 阶段留痕；卡死按 pid 文件 + 心跳处理'
+} -Hint '2026-11-13 事故：桥解析级死亡 35 小时无人知，ensure-all 每 2 分钟"正确地拉起一个必死的桥"'

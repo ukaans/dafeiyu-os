@@ -78,6 +78,27 @@ function StartHidden([string]$exe, [string[]]$argv) {
     }
 }
 
+function StartHiddenCmd([string]$cmdline) {
+    # 用 cmd.exe /c 起进程，唯一目的是能把子进程的 stderr 重定向到文件 ——
+    # 桥解析级死亡（丢 BOM / 语法错）时进程一条日志都写不出来，stderr 是唯一线索。
+    # 必须 ShellExecute：子进程不能继承本脚本的 stdout 管道，否则桥（长期进程）会一直
+    # 占着句柄，任何「用管道读 ensure-all 输出」的调用方都会挂到桥退出（2026-11-14 实测）。
+    # WindowStyle Hidden 保证不闪控制台（2026-11-03 的教训见 StartHidden 注释）。
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $psi.Arguments = $cmdline
+    $psi.WorkingDirectory = $appDir
+    $psi.UseShellExecute = $true
+    $psi.WindowStyle = 'Hidden'
+    try {
+        [void][System.Diagnostics.Process]::Start($psi)
+        return $true
+    } catch {
+        Log ('ensure: cmd spawn failed err=' + $_.Exception.Message)
+        return $false
+    }
+}
+
 function AgentHealthy {
     if (-not (Test-Path $agentHbF)) { return $false }
     $age = ((Get-Date) - (Get-Item $agentHbF).LastWriteTime).TotalSeconds
@@ -135,19 +156,81 @@ if (-not (DrawerAlive)) {
 # 为什么要有它：本机 AHK 进程的鼠标通道会整条哑掉（WheelDown/WheelUp 热键不触发、
 # WM_INPUT 一条都收不到），而同一时刻普通 .NET 进程装 WH_MOUSE_LL 能稳定收到滚轮
 # （2026-11-04 23:2x 对照实测）。编译成 exe 的同一份代码反而收不到事件，
-# 所以桥由 powershell.exe 承载（23:44–23:50 三组对照）。存活判定看命令行里有没有
-# wheel-bridge.ps1；桥自带互斥体，重复拉起会立刻自己退出。
+# 所以桥由 powershell.exe 承载（23:44–23:50 三组对照）。
+#
+# 存活判定（2026-11-13 事故后重写）：旧实现找「命令行里含 wheel-bridge.ps1 的 powershell」，
+# 探针/自检命令会误匹配；更糟的是桥解析级死亡时压根没有进程可匹配 —— 于是每天每 2 分钟
+# 「正确地拉起一个必死的桥」，35 小时没人知道（桥日志零新行）。现在只看桥自己持有的
+# 互斥体 Local\DshWheelBridge（probe 不持有它），再用心跳判卡死：
+#   互斥体不在            → 拉起，并把 stderr 重定向留痕 + 6 秒内复查是否真起来
+#   互斥体在但心跳 >180s  → 卡死，按 pid 文件 T 掉，下一轮重拉
 $bridgeScript = Join-Path $appDir 'wheel-bridge.ps1'
+$bridgeErr    = Join-Path $appDir 'wheel-bridge-launch.err'
+$bridgeBoot   = Join-Path $appDir 'wheel-bridge-boot.log'
+$bridgePidF   = Join-Path $appDir 'wheel-bridge.pid'
+$bridgeLog    = Join-Path $appDir 'wheel-bridge.log'
 if (Test-Path $bridgeScript) {
-    $bridgeAlive = $false
-    try {
-        $bridgeAlive = [bool](Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like '*wheel-bridge.ps1*' })
-    } catch { $bridgeAlive = $false }
-    if (-not $bridgeAlive) {
-        StartHidden 'powershell.exe' @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $bridgeScript + '"'))
-        Log 'ensure: wheel-bridge was down, started'
+    $ageBeat = -1
+    if (Test-Path $bridgeLog) { $ageBeat = [int]((Get-Date) - (Get-Item $bridgeLog).LastWriteTime).TotalSeconds }
+    # 先判互斥体（唯一可信的判活依据）；若互斥体在但 beat 太老 = 卡死，杀掉并当场重启，
+    # 不把恢复留给下一轮（下一次 ensure 最多要等 2 分钟，这段时间滚轮是哑的 —— 2026-11-14 实测）。
+    $needStart = -not (Test-Mutex 'Local\DshWheelBridge')
+    if (-not $needStart -and $ageBeat -gt 180) {
+        $bp = ReadPid $bridgePidF
+        if ($bp -gt 0 -and (ProcAlive $bp)) {
+            & taskkill.exe /PID $bp /T /F 2>&1 | Out-Null
+            Log ('ensure: wheel-bridge hung (no beat ' + $ageBeat + 's), killed pid=' + $bp)
+        } else {
+            Log ('ensure: wheel-bridge hung (no beat ' + $ageBeat + 's) but pid file missing/stale')
+        }
+        $needStart = $true
     }
+    if ($needStart) {
+        $bootBefore = 0
+        if (Test-Path $bridgeBoot) { $bootBefore = (Get-Item $bridgeBoot).Length }
+        try { [IO.File]::WriteAllText($bridgeErr, '') } catch { }
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        # cmd 命令串：无外层引号 + 末尾 >NUL。这是实测唯一能同时做到「stderr 进文件」和
+        # 「不挂住调用方」的写法（外层引号形式 cmd 会误解析，stderr 文件根本不生成）。
+        if ($psExe -match ' ' -or $bridgeScript -match ' ' -or $bridgeErr -match ' ') {
+            Log 'ensure: wheel-bridge launch skipped (path contains space; stderr capture unsupported)'
+            $cmd = $null
+        } else {
+            $cmd = '/c ' + $psExe + ' -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $bridgeScript + '" 2>"' + $bridgeErr + '" >NUL'
+        }
+        if ($cmd -and (StartHiddenCmd $cmd)) {
+            $t0 = [Environment]::TickCount
+            $up = $false
+            while ((([Environment]::TickCount - $t0) -lt 6000)) {
+                Start-Sleep -Milliseconds 300
+                if (Test-Mutex 'Local\DshWheelBridge') { $up = $true; break }
+            }
+            if ($up) {
+                Log ('ensure: wheel-bridge was down, started (mutex up, previous beat age ' + $ageBeat + 's)')
+            } else {
+                $why = ''
+                # stderr 的编码取决于子进程启动时的控制台代码页（实测两种都出现过：
+                # UTF-8 与 936/GBK）。先按严格 UTF-8 解，解不开再按 936 解，才能保证留痕可读。
+                try {
+                    if (Test-Path $bridgeErr) {
+                        $bytes = [IO.File]::ReadAllBytes($bridgeErr)
+                        $strict = New-Object System.Text.UTF8Encoding($false, $true)
+                        try { $why = $strict.GetString($bytes) }
+                        catch { $why = [Text.Encoding]::GetEncoding(936).GetString($bytes) }
+                        $why = $why -replace '\s+', ' '
+                    }
+                } catch { }
+                $why = $why.Trim()
+                if ($why.Length -gt 240) { $why = $why.Substring(0, 240) + '…' }
+                $bootNow = 0
+                if (Test-Path $bridgeBoot) { $bootNow = (Get-Item $bridgeBoot).Length }
+                $phase = 'died before its first line (BOM/encoding/parse)'
+                if ($bootNow -gt $bootBefore) { $phase = 'died after boot line (Add-Type/mutex/window)' }
+                Log ('ensure: wheel-bridge FAILED to start - ' + $phase + '; stderr=' + $why)
+            }
+        }
+    }
+
 } else {
     Log 'ensure: wheel-bridge.ps1 missing'
 }
