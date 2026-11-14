@@ -94,23 +94,177 @@ function ConvertTo-JsString([string]$s) {
     return ($s -replace '\\', '\\\\' -replace "'", "\'" -replace "`r", ' ' -replace "`n", ' ')
 }
 
-# 位置只解析一次（失败就用北京兜底）
-$lat = 39.911
-$lon = 116.395
-$city = '北京'
-try {
-    $ip = Invoke-RestMethod -TimeoutSec 15 'http://ip-api.com/json/?fields=status,city,regionName,lat,lon&lang=zh-CN'
-    if ($ip.status -eq 'success' -and $ip.lat) {
-        $lat = [double]$ip.lat
-        $lon = [double]$ip.lon
-        if ($ip.city) { $city = "$($ip.city)" }
-        elseif ($ip.regionName) { $city = "$($ip.regionName)" }
-    }
-} catch { }
+# ---------------------------------------------------------------
+# 位置解析（2026-11-14 修复）
+# 原来只在进程启动时解析一次：换城市 / 挂代理 / 开机那一刻定位失败之后，
+# 城市会一直停在启动时那个（失败时甚至是写死的「北京」），天气也跟着查错地方。
+# 现在：多家 HTTPS 服务按顺序兜底 → 结果缓存到 wx-loc.json（带时间戳）
+#      → 每 $LOC_TTL 秒重解析一次；全部失败就保留上次结果，绝不覆盖成北京。
+# ---------------------------------------------------------------
+$locFile = Join-Path $env:LOCALAPPDATA 'DesktopPage\wx-loc.json'
+$wxLogFile = Join-Path $env:LOCALAPPDATA 'DesktopPage\wxmon.log'
+$LOC_TTL = 900           # 位置多久重解析一次（秒）
+$LOC_RETRY = 300         # 重解析失败后多久再试（秒）
+$WIN_TIMEOUT = 8         # 等 Windows 定位结果的秒数
+$DEFAULT_LOC = @{ city = '北京'; lat = 39.911; lon = 116.395; src = 'default' }
 
-$weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon" +
-    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code" +
-    "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%2FShanghai"
+function Write-WxLog([string]$msg) {
+    try {
+        if ((Test-Path -LiteralPath $wxLogFile) -and ((Get-Item -LiteralPath $wxLogFile).Length -gt 256KB)) {
+            Move-Item -LiteralPath $wxLogFile -Destination ($wxLogFile + '.1') -Force
+        }
+        $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $msg + "`r`n"
+        [System.IO.File]::AppendAllText($wxLogFile, $line, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Get-IpLocJson([string]$url) {
+    Invoke-RestMethod -TimeoutSec 12 -Uri $url -Headers @{ 'User-Agent' = 'DesktopPage/1.0' }
+}
+
+function Resolve-IpLoc {
+    # 1) ipwho.is：HTTPS 免费、支持中文城市名、一次给全经纬度
+    try {
+        $r = Get-IpLocJson 'https://ipwho.is/?lang=zh-CN'
+        if ($r.success -and $r.city -and $r.latitude -and $r.longitude) {
+            return @{ city = [string]$r.city; lat = [double]$r.latitude; lon = [double]$r.longitude; src = 'ipwho.is' }
+        }
+    } catch { }
+    # 2) ipinfo.io：英文城市名 + "lat,lon"
+    try {
+        $r = Get-IpLocJson 'https://ipinfo.io/json'
+        if ($r.city -and $r.loc) {
+            $xy = ([string]$r.loc) -split ','
+            if ($xy.Count -eq 2) {
+                return @{ city = [string]$r.city; lat = [double]$xy[0]; lon = [double]$xy[1]; src = 'ipinfo.io' }
+            }
+        }
+    } catch { }
+    # 3) ip-api.com 免费版只给 HTTP（HTTPS 会 403），最后兜底
+    try {
+        $r = Get-IpLocJson 'http://ip-api.com/json/?fields=status,city,regionName,lat,lon&lang=zh-CN'
+        if ($r.status -eq 'success' -and $r.lat) {
+            $c = ''
+            if ($r.city) { $c = [string]$r.city }
+            elseif ($r.regionName) { $c = [string]$r.regionName }
+            if ($c) { return @{ city = $c; lat = [double]$r.lat; lon = [double]$r.lon; src = 'ip-api.com' } }
+        }
+    } catch { }
+    return $null
+}
+
+function Get-WinLoc {
+    # Windows 定位服务（GeoCoordinateWatcher）。比 IP 准得多（本机实测 2 秒出坐标、精度 76m），
+    # 但它依赖两件事：①「设置 → 隐私 → 定位」开着；②「让桌面应用访问你的位置」= Allow
+    #（本机 HKCU/HKLM 的 CapabilityAccessManager\ConsentStore\location 都是 Allow）。
+    # 拿不到就返回 $null，由 IP 兜底 —— 绝不让一次失败把城市钉死在旧值上。
+    try {
+        if (-not ('System.Device.Location.GeoCoordinateWatcher' -as [type])) { Add-Type -AssemblyName System.Device }
+        $w = New-Object System.Device.Location.GeoCoordinateWatcher
+        $w.Start()
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $fix = $null
+        while ($sw.Elapsed.TotalSeconds -lt $WIN_TIMEOUT) {
+            $pos = $w.Position
+            if ($pos -and $pos.Location -and -not $pos.Location.IsUnknown) { $fix = $pos.Location; break }
+            Start-Sleep -Milliseconds 300
+        }
+        $perm = [string]$w.Permission
+        $st = [string]$w.Status
+        $w.Stop()
+        if ($fix) {
+            return @{ lat = [double]$fix.Latitude; lon = [double]$fix.Longitude; src = 'windows'; perm = $perm; status = $st }
+        }
+        Write-WxLog ('winloc: no fix (permission=' + $perm + ' status=' + $st + ')')
+        return $null
+    } catch {
+        Write-WxLog ('winloc: failed ' + $_.Exception.Message)
+        return $null
+    }
+}
+
+function Get-CityFromLatLon([double]$la, [double]$lo) {
+    # Windows 只给坐标；城市名要反向地理编码。用 OpenStreetMap Nominatim：免费、无 key，
+    # 要求带 UA、≤1 次/秒 —— 我们最多 15 分钟一次，远低于限制。
+    try {
+        $u = "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=$la&lon=$lo&accept-language=zh-CN&zoom=10"
+        $r = Invoke-RestMethod -TimeoutSec 12 -Uri $u -Headers @{ 'User-Agent' = 'DesktopPage/1.0 (desktop drawer weather)' }
+        $city = ''
+        # 中文结果里 address.city 常是「区」（天河区），真正的市藏在 display_name（…, 广州市, 广东省, …）
+        if ($r.display_name) {
+            foreach ($part in ([string]$r.display_name -split ',\s*')) {
+                if ($part -match '市$') { $city = $part; break }
+            }
+        }
+        if (-not $city -and $r.address) {
+            foreach ($k in @('city', 'town', 'county', 'state')) {
+                $v = $r.address.$k
+                if ($v) { $city = [string]$v; break }
+            }
+        }
+        if (-not $city -and $r.name) { $city = [string]$r.name }
+        if ($city) { $city = $city -replace '市$', '' }
+        return $city
+    } catch {
+        Write-WxLog ('reverse-geo failed: ' + $_.Exception.Message)
+        return ''
+    }
+}
+
+function Resolve-Loc {
+    # 顺序：Windows 系统定位（准）→ IP 定位（兜底）。两边都失败返回 $null，调用方保留旧值。
+    $w = Get-WinLoc
+    if ($w) {
+        $c = Get-CityFromLatLon $w.lat $w.lon
+        if ($c) { return @{ city = $c; lat = $w.lat; lon = $w.lon; src = 'windows+nominatim' } }
+        Write-WxLog 'winloc: got fix but reverse-geo gave no city, fallback to IP'
+    }
+    return Resolve-IpLoc
+}
+function Save-Loc($l) {
+    try {
+        $o = [ordered]@{
+            ts   = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            city = $l.city; lat = $l.lat; lon = $l.lon; src = $l.src
+        }
+        [System.IO.File]::WriteAllText($locFile, (ConvertTo-Json $o -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Load-Loc {
+    try {
+        if (-not (Test-Path -LiteralPath $locFile)) { return $null }
+        $o = [System.IO.File]::ReadAllText($locFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (-not $o.city -or -not $o.lat -or -not $o.lon) { return $null }
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$o.ts
+        # 太旧（超过 2 个周期）就当没有：宁可重解析，也不拿半年前的缓存当年底
+        if ($age -lt 0 -or $age -gt ($LOC_TTL * 2)) { return $null }
+        return @{ city = [string]$o.city; lat = [double]$o.lat; lon = [double]$o.lon; src = [string]$o.src }
+    } catch { return $null }
+}
+
+function Get-WeatherUrl($l) {
+    "https://api.open-meteo.com/v1/forecast?latitude=$($l.lat)&longitude=$($l.lon)" +
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code" +
+        "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=Asia%2FShanghai"
+}
+
+$loc = Resolve-Loc
+$locAt = [DateTime]::UtcNow
+if (-not $loc) {
+    $loc = Load-Loc
+    if ($loc) { Write-WxLog ('loc: resolve failed at startup, using cache ' + $loc.city) }
+}
+if (-not $loc) {
+    $loc = $DEFAULT_LOC
+    $locAt = [DateTime]::MinValue      # 立刻在下一轮重试
+    Write-WxLog 'loc: resolve failed at startup, using default; will retry'
+} else {
+    Save-Loc $loc
+    Write-WxLog ('loc: ' + $loc.city + ' (' + $loc.lat + ',' + $loc.lon + ') via ' + $loc.src)
+}
+$city = $loc.city
+$weatherUrl = Get-WeatherUrl $loc
 
 $lastOk = $null
 # 启动时从上一份 wx-data.js 播种 lastOk（2026-11-13 实测教训）：
@@ -126,6 +280,22 @@ try {
 } catch { }
 
 while ($true) {
+    # 到点重解析位置：换城市 / 挂代理 之后不用重启进程也能跟上；失败保留上次结果
+    if (([DateTime]::UtcNow - $locAt).TotalSeconds -gt $LOC_TTL) {
+        $nl = Resolve-Loc
+        if ($nl) {
+            if ($nl.city -ne $loc.city) { Write-WxLog ('loc: ' + $loc.city + ' -> ' + $nl.city + ' via ' + $nl.src) }
+            $loc = $nl
+            Save-Loc $loc
+            $locAt = [DateTime]::UtcNow
+        } else {
+            $locAt = [DateTime]::UtcNow.AddSeconds($LOC_TTL - $LOC_RETRY)
+            Write-WxLog ('loc: resolve failed, keep ' + $loc.city)
+        }
+        $city = $loc.city
+        $weatherUrl = Get-WeatherUrl $loc
+    }
+
     $js = $null
     try {
         $w = Invoke-RestMethod -TimeoutSec 20 -Uri $weatherUrl
