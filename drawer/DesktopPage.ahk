@@ -1644,9 +1644,16 @@ FolderMenu(fi) {
 }
 
 RenameFolder(f) {
-    global gFolderGui
+    global gFolderGui, FOLDER_POPUP
+    ; 2026-11-14 用户反馈「建了文件夹之后不能重命名」：
+    ; 1) 覆盖层 gOverlay 是全屏 TOPMOST 的点击层，重命名框只 Show 不抬 z 序会被它盖住，
+    ;    看起来像"点了没反应"（OpenFolder 早就这么做了，这里漏了）。
+    ; 2) FolderPopupWatch 只在 FOLDER_POPUP 身份匹配时才算"活着"，重命名框借用同一个
+    ;    全局名，计时器会把它当已关闭、顺手 RestoreOverlayForDrawer() 再把覆盖层压上来。
     if IsObject(gFolderGui)
         try gFolderGui.Destroy()
+    SetTimer(FolderPopupWatch, 0)
+    FOLDER_POPUP := 0
     gFolderGui := Gui("+AlwaysOnTop -DPIScale", "重命名文件夹")
     gFolderGui.SetFont("s10", "Microsoft YaHei UI")
     gFolderGui.Add("Text", "x18 y16 w320", "给这个文件夹起个名字：")
@@ -1654,11 +1661,15 @@ RenameFolder(f) {
     ok := gFolderGui.Add("Button", "x18 y88 w90 Default", "确定")
     cc := gFolderGui.Add("Button", "x120 y88 w90", "取消")
     gFolderGui.OnEvent("Close", CloseRename.Bind(gFolderGui))
+    gFolderGui.OnEvent("Escape", CloseRename.Bind(gFolderGui))
     cc.OnEvent("Click", CloseRename.Bind(gFolderGui))
     ok.OnEvent("Click", ApplyRename.Bind(f, ed, gFolderGui))
     ed.Focus()
+    HideOverlay()
     gFolderGui.Show("w356 h140")
+    try DllCall("SetWindowPos", "Ptr", gFolderGui.Hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0013)
     try WinActivate("ahk_id " gFolderGui.Hwnd)
+    LogWrite("folder rename: dialog open " f["name"])
 }
 
 ; ------------------------------------------------------------
@@ -2472,9 +2483,10 @@ CurPageInit() {
 }
 
 CloseRename(g, *) {
-    global gFolderGui
+    global gFolderGui, gDrawer
     try g.Destroy()
     gFolderGui := 0
+    AfterRenameDialog()
 }
 
 ApplyRename(f, ed, g, *) {
@@ -2489,6 +2501,17 @@ ApplyRename(f, ed, g, *) {
     RenderFolders()
     Repaint()
     LogWrite("folder renamed: " n)
+    AuditLog("folder.rename", "name=" Aq(n))
+    AfterRenameDialog()
+}
+
+; 重命名框收掉之后：覆盖层要补回来（它负责"点空白收起抽屉"），抽屉再抬回覆盖层之上。
+AfterRenameDialog() {
+    global gDrawer
+    if (IsObject(gDrawer) && DllCall("IsWindowVisible", "Ptr", gDrawer.Hwnd))
+        RestoreOverlayForDrawer()
+    else
+        HideOverlay()
 }
 
 DissolveFolder(f) {
@@ -3551,6 +3574,10 @@ FolderPopupWatch() {
     alive := false
     ; 只认 OpenFolder 建的那个 Gui（RenameFolder 也用 gFolderGui 这个全局名，
     ; 用 ObjPtr 身份比较排除掉，免得重命名框被当成"文件夹弹窗"来收尾）
+    ; 重命名框也借用 gFolderGui：它 Visible 期间绝不能当成"文件夹弹窗已关闭"来收尾，
+    ; 否则 RestoreOverlayForDrawer() 会把全屏覆盖层重新抬上来，把重命名框盖住、点不动。
+    if (IsObject(gFolderGui) && DllCall("IsWindowVisible", "Ptr", gFolderGui.Hwnd) && (!IsObject(FOLDER_POPUP) || ObjPtr(FOLDER_POPUP) != ObjPtr(gFolderGui)))
+        return
     if (IsObject(FOLDER_POPUP) && IsObject(gFolderGui) && ObjPtr(FOLDER_POPUP) = ObjPtr(gFolderGui)) {
         try alive := DllCall("IsWindowVisible", "Ptr", gFolderGui.Hwnd) ? true : false
     }

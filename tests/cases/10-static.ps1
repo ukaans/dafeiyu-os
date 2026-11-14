@@ -250,6 +250,36 @@ Test-Case STA-011 '静态' '图标缓存先编译后落盘' high {
     if ($t -notmatch 'Move-Item -LiteralPath \$iconDir -Destination \$bak') { throw '没有「旧 icons 改名备份」这一步，换入失败无法回滚' }
     '编译先行 + 暂存换入 + 失败回滚 三步齐全'
 } -Hint '重扫在 Low IL 抽屉里必失败；脚本必须幂等失败，绝不能毁掉现有图标'
+Test-Case STA-012 '静态' '重命名框必须压在覆盖层上面' high {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+    $m = [regex]::Match($t, '(?s)RenameFolder\(f\)\s*\{(.*?)\r?\n\}')
+    if (-not $m.Success) { throw '找不到 RenameFolder 函数体' }
+    $b = $m.Groups[1].Value
+    # 2026-11-14 用户反馈「建了文件夹之后不能重命名」：重命名框和文件夹弹窗共用 gFolderGui，
+    # 覆盖层 gOverlay 是全屏 TOPMOST 点击层，不撤掉/不抬 z 序就会被压住，点了像没反应。
+    if ($b -notmatch 'HideOverlay\(\)') { throw 'RenameFolder 没有先撤掉覆盖层（重命名框会被全屏点击层压住）' }
+    $iShow = $b.IndexOf('.Show(')
+    $iTop = $b.IndexOf('SetWindowPos')
+    if ($iShow -lt 0) { throw 'RenameFolder 没有 Show 对话框' }
+    if ($iTop -lt 0 -or $iTop -lt $iShow) { throw 'Show 之后没有把重命名框抬到 TOPMOST 顶端' }
+    if ($b -notmatch 'HideOverlay\(\)[\s\S]*\.Show\(') { throw '先 HideOverlay 再 Show 的顺序被调换了' }
+    '覆盖层先撤、对话框后抬顶'
+} -Hint '重命名框点击无效的根因：全屏 TOPMOST 覆盖层在看守点击'
+
+Test-Case STA-013 '静态' '重命名收尾要把覆盖层补回来' medium {
+    $t = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+    if ($t -notmatch 'AfterRenameDialog\(\)') { throw '没有 AfterRenameDialog（确定/取消都要补覆盖层）' }
+    foreach ($fn in 'ApplyRename', 'CloseRename') {
+        $m = [regex]::Match($t, "(?s)$fn\([^)]*\)\s*\{(.*?)\r?\n\}")
+        if (-not $m.Success) { throw "找不到 $fn 函数体" }
+        if ($m.Groups[1].Value -notmatch 'AfterRenameDialog\(\)') { throw "$fn 结束时没有调用 AfterRenameDialog" }
+    }
+    # 文件夹弹窗身份不匹配时，FolderPopupWatch 不能把重命名框当"已关闭"来收尾
+    $w = [regex]::Match($t, '(?s)FolderPopupWatch\(\)\s*\{(.*?)\r?\n\}')
+    if (-not $w.Success) { throw '找不到 FolderPopupWatch' }
+    if ($w.Groups[1].Value -notmatch 'IsWindowVisible[\s\S]*!= ObjPtr\(gFolderGui\)') { throw 'FolderPopupWatch 没有把可见的重命名框排除在外（会误判关闭并重新盖上覆盖层）' }
+    '确定/取消都恢复覆盖层，监视计时器不误杀重命名框'
+} -Hint '2026-11-14：重命名框借 gFolderGui 名字，监视器身份判断必须容它'
 
 Test-Case STA-009 '静态' '壁纸文件与 Lively 运行目录一致' high {
     $root = Get-DshRoot
