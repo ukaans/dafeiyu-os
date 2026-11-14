@@ -33,6 +33,17 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $PSCommandPath
 if ([string]::IsNullOrEmpty($scriptDir)) { $scriptDir = (Get-Location).Path }
 
+# 启动留痕（2026-11-14 事故：丢 BOM 后解析即死，日志一行没有、谁都看不见）。
+# 解析级死亡时下面这些行根本不会执行 —— 只能靠启动方（ensure-all.ps1）把 stderr
+# 重定向到 wheel-bridge-launch.err。这行 boot 标记用来区分两种死法：
+#   没有 boot 行  = 死在第一行之前（BOM/编码/语法）
+#   有 boot 行无 start 行 = 死在 Add-Type / 互斥体 / 建窗前
+try {
+    $bootFile = Join-Path $scriptDir 'wheel-bridge-boot.log'
+    if ((Test-Path $bootFile) -and ((Get-Item $bootFile).Length -gt 64KB)) { [IO.File]::WriteAllText($bootFile, '') }
+    [IO.File]::AppendAllText($bootFile, ((Get-Date).ToString('MM-dd HH:mm:ss') + '  boot: parse ok args=' + ($args -join ' ') + [Environment]::NewLine))
+} catch { }
+
 $cs = @'
 using System;
 using System.IO;
@@ -82,7 +93,7 @@ public static class DshWheelBridge
     static IntPtr _hook = IntPtr.Zero;
     static IntPtr _target = IntPtr.Zero;
     static IntPtr _win = IntPtr.Zero;
-    static string _logPath, _hwndPath, _id = "", _dir;
+    static string _logPath, _hwndPath, _id = "", _dir, _pidPath;
     static long _hits, _posts, _failPost, _rearms, _follows;
     static DateTime _lastEvent = DateTime.MinValue, _lastBeat = DateTime.MinValue, _lastRead = DateTime.MinValue, _lastFailLog = DateTime.MinValue;
 
@@ -260,10 +271,13 @@ public static class DshWheelBridge
         _logPath = Path.Combine(_dir, "wheel-bridge" + _id + ".log");
         _hwndPath = Path.Combine(_dir, "wheel-bridge.hwnd");
         bool created;
+        _pidPath = Path.Combine(_dir, "wheel-bridge" + _id + ".pid");
         using (var mutex = new Mutex(true, @"Local\DshWheelBridge" + _id, out created))
         {
             if (!created) { Log("start: another instance running, exit"); return 0; }
             _started = DateTime.Now;
+            try { File.WriteAllText(_pidPath, System.Diagnostics.Process.GetCurrentProcess().Id.ToString()); }
+            catch (Exception) { }
             _lastBeat = _started;
 
             string cls = "DshWheelBridgeWnd" + _id;
@@ -290,6 +304,7 @@ public static class DshWheelBridge
                 DispatchMessageW(ref m);
             }
             Log("exit: loop ended r=" + r);
+            try { if (File.Exists(_pidPath)) File.Delete(_pidPath); } catch (Exception) { }
             return 0;
         }
     }
@@ -300,7 +315,13 @@ try {
     Add-Type -TypeDefinition $cs -Language CSharp | Out-Null
 } catch {
     # 已加载过同名类型时忽略
-    if ($_.Exception.Message -notmatch 'already exists') { throw }
+    if ($_.Exception.Message -notmatch 'already exists') {
+        try {
+            [IO.File]::AppendAllText((Join-Path $scriptDir 'wheel-bridge-boot.log'), ((Get-Date).ToString('MM-dd HH:mm:ss') + '  boot: Add-Type failed: ' + $_.Exception.Message + [Environment]::NewLine))
+        } catch { }
+        Write-Error ('wheel-bridge Add-Type failed: ' + $_.Exception.Message)
+        exit 3
+    }
 }
 
 if ($args -contains '--probe') {

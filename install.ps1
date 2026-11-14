@@ -72,12 +72,15 @@ if (-not $lib) {
 }
 
 Step "安装抽屉系统"
-$drawerFiles = @(
-    'AutoHotkey64.exe','AutoHotkey64.exe.manifest','DesktopPage.ahk','dsh-agent.ps1',
-    'npix.cs','npix.exe','npix.manifest','hwmon.ps1','wxmon.ps1','dock-add.ps1','dock-add-host.ps1',
-    'DesktopIcons.ps1','DesktopPositions.ps1','Build-IconCache.ps1','recycle_tmp.ps1','start-all.vbs',
-    'agent-watch.ps1','ensure-all.ps1','ensure-all.vbs','wheel-bridge.ps1','agent-config.ps1'
-)
+# 部署清单从目录推导，不写死（2026-11-13 事故：硬编码清单漏了 wheel-bridge.ps1，
+# 运行目录丢了 BOM 也没人发现，桥 35 小时起不来）。tests\cases\10-static.ps1 的 STA-005
+# 用同一条规则核对源码与运行时副本，新加的脚本自动纳入。
+# 排除：*.bak-*（历史备份）、components.md（文档）、*.log/*.pid/*.err/*.dat/*.txt（运行时产物）。
+$drawerFiles = @(Get-ChildItem -LiteralPath $drawerSrc -File | Where-Object {
+        $_.Name -notmatch '\.bak-\d+$' -and
+        $_.Name -notmatch '\.(log|pid|err|dat|txt)$' -and
+        $_.Name -ne 'components.md'
+    } | Sort-Object Name | ForEach-Object { $_.Name })
 if ($DryRun) {
     foreach ($f in $drawerFiles) { Say ("  [dry] copy " + $f) }
     Say ("  [dry] copy fonts\ -> " + (Join-Path $InstallDir 'fonts'))
