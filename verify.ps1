@@ -116,6 +116,7 @@ if (Test-Path $rect) {
     $line = (Get-Content $rect -Raw).Trim()
     $parts = $line -split '\s+'
     if ($parts.Count -eq 4 -and $parts[2] -ne '0') { Ok ("panel-rect.txt = " + $line) }
+    elseif ($parts.Count -eq 4 -and $line -eq '0 0 0 0') { Info "控制台当前未显示（显式零矩形 0 0 0 0 —— 正常态，AHK 据此不接管右侧滚轮）" }
     else { Info ("panel-rect.txt 内容异常：" + $line) }
     $rage = ((Get-Date) - (Get-Item $rect).LastWriteTime).TotalSeconds
     if ($rage -gt 120) { Info ("panel-rect.txt 已 {0:N0} 秒没更新（壁纸被全屏窗口遮住时正常）" -f $rage) }
@@ -139,8 +140,37 @@ if (Test-Path $sal) {
 
 $awl = Join-Path $InstallDir 'agent-watch.log'
 if (Test-Path $awl) {
+    # 「出现过 restart FAILED」不能直接判失败：机器满载时代理冷启动要十几秒，看门狗 25→45 秒
+    # 等不到心跳就记一条 FAILED，下一轮往往就起来了（2026-11-14 21:39~22:06 那一串，22:06:42
+    # 恢复后十几个小时没再动）。只报「现在还在失败」：最近 60 分钟内失败过，或最后一次动手
+    # 就是失败、之后没有成功重启。历史失败写成 info，保留证据但不制造噪音。
     $al2 = @(Get-Content $awl -Tail 60 -Encoding utf8)
-    if (@($al2 | Where-Object { $_ -match 'restart FAILED' }).Count -ge 1) { Bad "agent-watch.log 出现过 restart FAILED" } else { Ok "agent-watch.log 无 restart FAILED" }
+    $nowW = Get-Date
+    $rst = @()
+    foreach ($ln in $al2) {
+        $kind = $null
+        if ($ln -match 'restart FAILED') { $kind = 'FAILED' } elseif ($ln -match 'restart ok') { $kind = 'ok' }
+        if (-not $kind) { continue }
+        $m = [regex]::Match($ln, '(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})')
+        if (-not $m.Success) { continue }
+        try {
+            $dt = [datetime]::ParseExact(($m.Groups[1].Value + '-' + $m.Groups[2].Value + ' ' + $m.Groups[3].Value + ':' + $m.Groups[4].Value + ':' + $m.Groups[5].Value), 'MM-dd HH:mm:ss', $null)
+            if ($dt -gt $nowW.AddDays(1)) { $dt = $dt.AddYears(-1) }
+            $rst += [pscustomobject]@{ At = $dt; Kind = $kind; Line = $ln.Trim() }
+        } catch { }
+    }
+    $rst = @($rst | Sort-Object At)
+    $bad = @($rst | Where-Object { $_.Kind -eq 'FAILED' })
+    if ($bad.Count -eq 0) {
+        Ok "agent-watch.log 无 restart FAILED"
+    } else {
+        $lastBad = $bad[-1]
+        $mins = [int](($nowW - $lastBad.At).TotalMinutes)
+        $okAfter = @($rst | Where-Object { $_.Kind -eq 'ok' -and $_.At -gt $lastBad.At }).Count -gt 0
+        if ($mins -le 60) { Bad ("agent-watch.log 最近 " + $mins + " 分钟内有 restart FAILED：" + $lastBad.Line) }
+        elseif (-not $okAfter) { Bad ("agent-watch.log 最后一次重启失败之后再没成功过：" + $lastBad.Line) }
+        else { Info ("agent-watch.log 有 " + $bad.Count + " 次历史 restart FAILED（最近 " + $mins + " 分钟前），此后已成功重启 —— 不判失败") }
+    }
 } else { Info "agent-watch.log 不存在" }
 
 $agl = Join-Path $InstallDir 'dsh-agent.log'

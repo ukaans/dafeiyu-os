@@ -74,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 
 ## 4. 用例清单
 
-### 10-static · 静态完整性（9 条）
+### 10-static · 静态完整性（21 条）
 | 编号 | 查什么 |
 |---|---|
 | STA-001 | 25 个核心文件在位 |
@@ -86,6 +86,18 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-007 | `app.js` 依赖的 6 个节点 id 仍在 `index.html` 里 |
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
 | STA-009 | **壁纸源工程 ↔ Lively 运行时目录一致**（漏拷 = 屏幕上还是旧页面，404 会被兜底掩盖） |
+| STA-010 | `Write-Js` 只拼一次 `dbg` 键（拼两次会让 `/state.js` 出现重复字段，前端 `JSON` 或取值错位） |
+| STA-011 | **图标缓存先编译后落盘**：`Add-Type` 成功之前不许动 `icons\`（Low IL 下必失败，先删后建 = 图标全空，2026-11-14 事故） |
+| STA-012 | 重命名框必须压在覆盖层**上面**（覆盖层先撤、对话框后抬顶） |
+| STA-013 | 重命名收尾要把覆盖层补回来（确定/取消都恢复；监视计时器不许误杀重命名框） |
+| STA-014 | 点击层收尾后仍在最顶；无配对的鼠标抬起不许收起抽屉 |
+| STA-015 | 天气城市按 IP 定时重解析（多家兜底 → `ipwho.is`/`ipinfo.io`/`ip-api.com`、`LOC_TTL` 重建 URL、`wx-loc.json` 缓存） |
+| STA-016 | 天气城市**以 Windows 系统定位为主、IP 兜底**（`GeoCoordinateWatcher` → Nominatim 反查，定位拿不到才降级） |
+| STA-017 | 图标开关必须走代理 `/icons.gif`（抽屉是 Low IL，本地 `DesktopIcons.ps1` 的 `Add-Type` 必失败），本地兜底要留日志 |
+| STA-018 | 重扫不许抹空 `desktop_positions.tsv`：先快照 → dpos 非空就跳过重抓 → 抓不到保留旧文件 |
+| STA-019 | 改布局前先拍快照、抛错自动回滚（`LayoutOp`；快照按名字排序、只留最近 40 份） |
+| STA-020 | 拖文件夹时只藏被拖的那一个，其它合成文件夹保持可见 |
+| STA-021 | 滚轮桥存活走**互斥体**（不再按命令行匹配，探针会误匹配）；启动失败要留 stderr + boot 阶段痕迹；卡死按 pid 文件 + 心跳处理 |
 
 ### 20-contract · 契约一致性（20 条）
 | 编号 | 查什么 |
@@ -149,7 +161,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-004 | `launch-queue.txt` 无残留（有残留=点了图标没反应） |
 | RES-005 | 数据落盘用 tmp + 原子覆盖（hw / wx / 代理侧 todo、todo-data、dock 共六处） |
 | RES-006 | `panel-rect.txt` 是 4 个 0..10000 的整数 |
-| RES-007 | 看门狗没有"10 分钟内 ≥3 次"的重启风暴；**且最近一次重启在 60 分钟内才算"仍在风暴中"**（几小时前调试留下的旧风暴判为已恢复，数字仍写进 detail） |
+| RES-007 | 看门狗没有「还在发生」的重启风暴：①**`restart FAILED` 只报仍然失败的**——最近 60 分钟内失败过，或最后一次动手失败之后没有成功重启；几小时前排掉的历史失败写成 detail 不报红（机器满载时冷启动十几秒，看门狗会正常记一条 FAILED，下一轮就好了）；②「10 分钟内 ≥3 次」的风暴按**风暴窗口的最后一次**（`$burstEnd`，不是全局最后一次重启）算是否还在发生 —— 一次合法的单发自愈不该把几小时前的旧风暴重新标成"仍在发生"（2026-11-15 修） |
 | RES-008 | `start-all.log` **最近一轮**走到 `done`、无 `STILL DOWN`。按 `start: appDir=` 切轮次，不拿末尾 N 行一刀切（一轮只写 4~6 行，40 行窗口里能躺 8 轮，一次失败会连着红七八轮）；最新一轮若还在跑（无 `done` 且 ≤120 秒）先跳过、判上一轮；**没 `done` 又超过 120 秒 = 卡住了**（2026-11-05 `start-all.vbs` 漏 `Dim`，wscript 弹不可见模态框，日志停在中途、计划任务一直 `Running`，旧判据只会报 `STILL DOWN` 或干脆看不出来） |
 | RES-009 | `hw-data.js` ≤15s、`wx-data.js` ≤330s 在更新 |
 | RES-010 | `scroll.dat` 有上限：写入方超 64KB 截断（`$script:SCROLL_MAX`）、读取方超 1MB 兜底；否则消费方一停就只增不减，而 `Take-Scroll` 是整份 `ReadAllText`，会拖死单线程代理 |
@@ -162,7 +174,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-017 | **审计轮转互斥**：`audit.log` 的 AHK 与代理两个轮转者必须共用 `Global\DesktopPage_audit` 命名互斥体，`WaitForSingleObject` / `WaitOne(250)` 抢到锁后**复检真实尺寸**再改名；抢不到就跳过本轮。否则两端同时越过 2MB 时，后一个会把 `.1` 覆盖成刚建的小文件，前一个 2MB 历史丢失（2026-11-11 修） |
 | RES-018 | **AHK 滚动写入有 64KB 上限；桥日志改名成功才截空**：`AgentScroll` 追加前必须 `FileGetSize(SCROLL_FILE) > 65536` 先截空（读取方 1MB 兜底是第二道，不是唯一一道）；`wheel-bridge.ps1` 的 `Log()` 不许再 `File.Copy` + 截空，必须 `File.Replace` / `File.Move` 成功后才 `WriteAllText(empty)`（2026-11-11 修） |
 
-### 60-data · 数据完整性（8 条）
+### 60-data · 数据完整性（9 条）
 | 编号 | 查什么 |
 |---|---|
 | DAT-001 | `layout.dat` 首行 `V2`、`P`/`F` 行字段数、`F` 有成员 |
@@ -173,8 +185,9 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-006 | `desktop_positions.tsv` 3 列且坐标是整数 |
 | DAT-007 | `items.tsv` 引用的图标文件在 `icons\` 里存在 |
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
+| DAT-009 | **图标重建失败时不毁旧图标**：在临时副本上把 `Add-Type` 换成必抛异常，验证「非 0 退出 + 旧图标原样保留 + `icons.new-*` 暂存目录清理干净 + stderr 有 `add-type` 提示」。判据用 `ProcessStartInfo` 起子进程（本机 PS 5.1 的 `Start-Process -RedirectStandard*` 有 bug，会以「测试手法坏了」的形状假红，2026-11-15 修） |
 
-合计 76 条。
+合计 89 条。
 
 ---
 
@@ -224,3 +237,4 @@ Test-Case XXX-002 '分类' '需要人工判断的' low {
 - **用例里绝对不要用 `/summon.gif` 造测试数据**：那条路由只认 `d=1|hide`，其余一切（包括 `d=diag`）都会写成 `show` —— 深夜跑测试会把抽屉弹到用户脸上（2026-11-09 踩过，改成直接写 `summon.cmd` 文件）。
 - **AHK 不能靠 `/validate` 证明没问题**：本机 `AutoHotkey64.exe /validate <script>` 返回 exit=0 且无任何输出（既不是 Syntax OK，也不是失败），所以别把它当验收。 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征；**改完仍要重启抽屉看 `wheel.log` / `audit.log` 里动作对不对**。`RUN-011` 只能证明"主循环还在转"。滚轮判定层可脚本化验证：`summon.cmd` 写 `classify=<hwnd>`，壁纸页 WebView2 的 RenderWidgetHost 应回 `desk=1`（root=Progman），Chrome 的应回 `desk=0`。
 - **`schtasks` 被拉黑**：所以测试不验证计划任务是否注册（那是 `verify.ps1` 用 `Get-ScheduledTask` 查的，走的是 COM 不是 exe）。
+- **本机 PS 5.1 的 `Start-Process -RedirectStandardInput/-Output/-Error` 有 bug**：任何一条重定向都会抛「已添加项。字典中的关键字:“path”所添加的关键字:“Path”」，与本仓库代码无关（`Start-Process -FilePath cmd.exe -RedirectStandardOutput x.txt -Wait` 单行即可复现，裸 `ProcessStartInfo` 反而正常）。所以**测子里要拿子进程的输出，一律用 `ProcessStartInfo` + `ReadToEndAsync()`**（`DAT-009`、`tests\ai-review.ps1` 均已改成这套）。历史上它把 `DAT-009` 变成假红、把夜间巡检的「AI 点评」变成永远空的（小工 exit 5、0 字节），2026-11-15 才定位到。
