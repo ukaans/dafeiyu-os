@@ -769,3 +769,27 @@ Test-Case RES-018 '健壮' 'AHK 滚动写入有 64KB 上限；桥日志改名成
     if ($iMove -ge 0 -and $iTrunc -lt $iMove) { throw '桥日志截空写在改名之前（改名失败就丢历史）' }
     '滚动文件 64KB 闸 + 桥日志改名成功才截空'
 } -Hint 'P2/P3（2026-11-11）：scroll.dat 无上限会被假死代理撑爆；桥日志 File.Copy 非原子'
+
+Test-Case RES-019 '健壮' '代理重启只有一个动手者（看门狗杀+拉，巡检只补缺失）' medium {
+    # 2026-11-14 21:39~22:06 的重启风暴里，agent-watch.ps1（5s）与 ensure-all.ps1（2min）交替
+    # taskkill + 拉起，日志里 `watch: restart FAILED` 与 `ensure: agent restart FAILED` 混着出现。
+    # 两边都动手时，任何一次「刚拉起、还没绑端口」都会被另一方判死 —— 机器越忙越刹不住。
+    # 2026-11-15 定：唯一权威是看门狗；ensure-all 只在「进程根本不在」时补起一个，
+    # 「在但不健康」只记一行、交回看门狗。判据两边都咬住，防止以后又长出第二个动手者。
+    # 先剥整行注释再匹配：注释里常引用旧写法（本文件 2026-11-15 的注释就写了旧文案），
+    # 不剥会把「解释历史」当成「还在这么干」——RES-016 当年就踩过同一个坑。
+    $root = Get-DshRoot
+    $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
+    $ens = (($ens -split "`r?`n") | Where-Object { $_.TrimStart() -notlike '#*' }) -join "`n"
+    if ($ens -match 'taskkill\.exe /PID \$agentPid') { throw 'ensure-all 还在 taskkill 代理（第二个动手者会让重启风暴复发）' }
+    if ($ens -match 'ensure: agent restart ') { throw 'ensure-all 还在走「重启代理」分支（旧文案 ensure: agent restart 仍在）' }
+    if ($ens -notmatch 'if \(-not \(ProcAlive \$agentPid\)\)') { throw 'ensure-all 没有「进程不在才补起」的分支' }
+    if ($ens -notmatch 'ensure: agent missing') { throw 'ensure-all 的补起分支没写清是「缺失」' }
+    if ($ens -notmatch 'left to watch') { throw 'ensure-all 遇到「在但不健康」没有交回看门狗（会变成静默不管）' }
+
+    $watch = Read-Raw (Join-Path $root 'drawer\agent-watch.ps1')
+    $watch = (($watch -split "`r?`n") | Where-Object { $_.TrimStart() -notlike '#*' }) -join "`n"
+    if ($watch -notmatch 'taskkill\.exe /PID \$pid2') { throw '看门狗不再杀不健康代理（权威方缺失，两边都不动手）' }
+    if ($watch -notmatch 'watch: restart ') { throw '看门狗没有 restart 结论行（失败时无从判断是进程死了还是没起来）' }
+    'ensure-all 只补缺失（不 taskkill、不健康交回看门狗）；杀 + 拉起只有 agent-watch 一处'
+} -Hint '同一件事有两个动手者时，先定权威再写判据（2026-11-14 重启风暴的教训）'

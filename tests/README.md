@@ -152,7 +152,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-012 | **滚轮桥热跟随**：`wheel-bridge.log` 末条 `beat` 必须有 `follows=`（没有 = 桥还在跑旧脚本，旧版不会跟随抽屉重启），且 `beat target=` 要等于 `wheel-bridge.hwnd` 内容。只读文件、不碰钩子。**过渡窗口不算故障**：beat 是 60 秒一行、follow 是 5 秒一次 tick，抽屉刚重启时「最后一次 beat 之后已经有 `target: follow hwnd=<当前目标>` 行」直接判过（2026-11-09 修：旧判据只看 30 秒窗口，重启后 30~60 秒那段会直接抛红）；hwnd 文件比日志新且不到 30 秒时降级 `warn` |
 | RUN-013 | **`/log.js` 会话正文通道**：`window.__DSH_LOG="…"` 前缀、≤60000 字符（超了单线程代理会排队）、`Content-Type` 是 `application/javascript`；日志为空时 `sig` 尚未生成属正常 |
 
-### 50-resilience · 健壮性与容量（18 条）
+### 50-resilience · 健壮性与容量（19 条）
 | 编号 | 查什么 |
 |---|---|
 | RES-001 | `wheel.log` / `dsh-run.log` **有 256KB 轮转**（查写入方代码里的阈值 + `FileMove`/`Move-Item` 改名，不只看尺寸）+ 未超 1MB |
@@ -173,6 +173,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-016 | **轮转是两步，改名失败不许截空**：老写法 `Move-Item … -ErrorAction SilentlyContinue` 之后无条件 `WriteAllText($log,'')` —— 改名失败（AHK 正持有句柄追加 / 有人开着 `audit.log.1` / 上一轮 dsh 的 `>>` 占着 `dsh-run.log`）时整份历史被抹成 0 字节，而 `.1` 还是上一代内容，**历史与它唯一的备份一起没了**，且哪儿都不报错。要求 `audit.log` 与 `dsh-run.log` 两处都「改名成功才许截空」，失败要把计数器拉回真实尺寸并写一行 `dsh-agent.log`；静态只看代码（剥注释，注释里引用了旧写法）；活体：`.1` 被只读句柄占住时 2.68MB 原样留着，放开句柄再写一条必须当场轮转（2026-11-11 修） |
 | RES-017 | **审计轮转互斥**：`audit.log` 的 AHK 与代理两个轮转者必须共用 `Global\DesktopPage_audit` 命名互斥体，`WaitForSingleObject` / `WaitOne(250)` 抢到锁后**复检真实尺寸**再改名；抢不到就跳过本轮。否则两端同时越过 2MB 时，后一个会把 `.1` 覆盖成刚建的小文件，前一个 2MB 历史丢失（2026-11-11 修） |
 | RES-018 | **AHK 滚动写入有 64KB 上限；桥日志改名成功才截空**：`AgentScroll` 追加前必须 `FileGetSize(SCROLL_FILE) > 65536` 先截空（读取方 1MB 兜底是第二道，不是唯一一道）；`wheel-bridge.ps1` 的 `Log()` 不许再 `File.Copy` + 截空，必须 `File.Replace` / `File.Move` 成功后才 `WriteAllText(empty)`（2026-11-11 修） |
+| RES-019 | **代理重启只有一个动手者**：`agent-watch.ps1`（5s 一轮）与 `ensure-all.ps1`（2min 一轮）原来都会 `taskkill` + 重新拉起代理，2026-11-14 21:39~22:06 两者交替动手把重启打成了风暴（`watch: restart FAILED` 与 `ensure: agent restart FAILED` 混着出现）。现在唯一权威是看门狗：`ensure-all.ps1` 只在 `-not (ProcAlive $agentPid)`（进程根本不在）时补起一个并记 `ensure: agent missing … started`，「在但不健康」只记 `ensure: agent alive but unhealthy …, left to watch`、**不许再 `taskkill`**；静态同时咬住看门狗仍保留 `taskkill.exe /PID $pid2` 与 `watch: restart ` 结论行，防止收敛过头变成两边都不动手（2026-11-15 收敛） |
 
 ### 60-data · 数据完整性（9 条）
 | 编号 | 查什么 |
@@ -187,7 +188,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 | DAT-009 | **图标重建失败时不毁旧图标**：在临时副本上把 `Add-Type` 换成必抛异常，验证「非 0 退出 + 旧图标原样保留 + `icons.new-*` 暂存目录清理干净 + stderr 有 `add-type` 提示」。判据用 `ProcessStartInfo` 起子进程（本机 PS 5.1 的 `Start-Process -RedirectStandard*` 有 bug，会以「测试手法坏了」的形状假红，2026-11-15 修） |
 
-合计 89 条。
+合计 90 条。
 
 ---
 
