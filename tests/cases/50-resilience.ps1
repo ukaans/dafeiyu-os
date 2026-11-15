@@ -161,15 +161,15 @@ Test-Case RES-007 '健壮' '看门狗没有在反复重启代理' high {
     $lines = Res-ReadLog (Join-Path $inst 'agent-watch.log') 400
     if ($lines.Count -eq 0) { return @{ Status = 'skip'; Detail = 'agent-watch.log 为空' } }
 
-    $failed = @($lines | Where-Object { $_ -match 'restart FAILED' })
-    if ($failed.Count -gt 0) { throw ('出现 restart FAILED：' + $failed[-1]) }
-
-    # 单次重启是正常自愈，连续重启才是问题（代理起来了又死 → 端口占用/脚本崩/心跳不刷新）。
-    # 所以判据不是"总数"，而是"10 分钟内 ≥3 次"这种风暴形态。
     $now = Get-Date
-    $times = @()
+
+    # 先把「重启」记录按时间解析出来（ok / FAILED 都算一次动手），后面的判据都用它。
+    $restarts = @()
     foreach ($l in $lines) {
-        if ($l -notmatch 'restart') { continue }
+        $kind = $null
+        if ($l -match 'restart FAILED') { $kind = 'FAILED' }
+        elseif ($l -match 'restart ok') { $kind = 'ok' }
+        if (-not $kind) { continue }
         $m = [regex]::Match($l, '(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})')
         if (-not $m.Success) { continue }
         $txt = ($m.Groups[1].Value + '-' + $m.Groups[2].Value + ' ' +
@@ -177,32 +177,64 @@ Test-Case RES-007 '健壮' '看门狗没有在反复重启代理' high {
         try {
             $dt = [datetime]::ParseExact($txt, 'MM-dd HH:mm:ss', $null)
             if ($dt -gt $now.AddDays(1)) { $dt = $dt.AddYears(-1) }   # 跨年
-            if (($now - $dt).TotalHours -le 24) { $times += $dt }
+            if (($now - $dt).TotalHours -le 24) {
+                $restarts += [pscustomobject]@{ At = $dt; Kind = $kind; Line = $l.Trim() }
+            }
         } catch { }
     }
-    $times = @($times | Sort-Object)
-    if ($times.Count -eq 0) { return ('末 ' + $lines.Count + ' 行无重启记录（24h 内）') }
+    $restarts = @($restarts | Sort-Object At)
+
+    # 「重启失败过一次」不等于「看门狗在反复重启」——机器满载时代理冷启动要十几秒，
+    # 看门狗 25 秒等不到心跳就记一条 FAILED，下一轮往往就起来了（2026-11-14 21:39~22:06
+    # 就是这样一串，22:06:42 恢复后到本轮开跑 11 个小时没再动过）。
+    # 原来只要末 400 行里出现过一次 FAILED 就判红，历史事件会把正常状态长期标红 —— 于是红被无视。
+    # 真正要报的是「还在失败」：最近 60 分钟内失败过，或者最后一次动手失败、之后没有成功过。
+    $failed = @($restarts | Where-Object { $_.Kind -eq 'FAILED' })
+    if ($failed.Count -gt 0) {
+        $lastFail = $failed[-1]
+        $sinceFail = ($now - $lastFail.At).TotalMinutes
+        if ($sinceFail -le 60) {
+            throw ('最近 ' + [int]$sinceFail + ' 分钟内重启失败：' + $lastFail.Line)
+        }
+        $recovered = @($restarts | Where-Object { $_.Kind -eq 'ok' -and $_.At -gt $lastFail.At }).Count -gt 0
+        if (-not $recovered) {
+            throw ('最后一次重启失败之后再没有成功过：' + $lastFail.Line)
+        }
+    }
+    $histNote = ''
+    if ($failed.Count -gt 0) {
+        $histNote = ('；历史 ' + $failed.Count + ' 次 restart FAILED（最近一次 ' +
+            $failed[-1].At.ToString('MM-dd HH:mm') + '，' + [int]($now - $failed[-1].At).TotalMinutes +
+            ' 分钟前），此后有成功重启 —— 判已恢复，不报红')
+    }
+
+    $times = @($restarts | ForEach-Object { $_.At })
+    if ($times.Count -eq 0) { return ('末 ' + $lines.Count + ' 行无重启记录（24h 内）' + $histNote) }
 
     $burst = $null
+    $burstEnd = $null
     for ($i = 0; $i -lt $times.Count; $i++) {
         $end = $times[$i].AddMinutes(10)
         $win = @($times | Where-Object { $_ -ge $times[$i] -and $_ -le $end })
         if ($win.Count -ge 3) {
             $burst = ($win[0].ToString('MM-dd HH:mm') + '~' + $win[-1].ToString('HH:mm') + ' 共 ' + $win.Count + ' 次')
+            $burstEnd = $win[-1]
             break
         }
     }
     if ($burst) {
         # 风暴是否"还在发生"才是这条用例要回答的问题。24h 窗口里躺着的样子完全一样：
         # 昨晚调试时手动重启 5 次会留 4 小时，若只看"有过风暴"会把正常状态一直标黄，
-        # 黄色一多就没人看了。判据改为：最近一次重启在 60 分钟内 → 仍在风暴中。
-        $sinceLast = ($now - $times[-1]).TotalMinutes
-        if ($sinceLast -le 60) {
-            return @{ Status = 'warn'; Detail = ('10 分钟内连续重启：' + $burst + '，最近一次在 ' + [int]$sinceLast + ' 分钟前 —— 代理起来了又死，不是偶发') }
+        # 黄色一多就没人看了。判据改为：风暴窗口的最后一次在 60 分钟内 → 仍在风暴中。
+        # 注意用 $burstEnd 而不是 $times[-1]：后者是「全局最后一次重启」，一次合法的
+        # 单发自愈（改完代码杀代理验证之类）就会把几小时前的旧风暴重新标成"仍在发生"。
+        $sinceBurst = ($now - $burstEnd).TotalMinutes
+        if ($sinceBurst -le 60) {
+            return @{ Status = 'warn'; Detail = ('10 分钟内连续重启：' + $burst + '，窗口最后一次在 ' + [int]$sinceBurst + ' 分钟前 —— 代理起来了又死，不是偶发' + $histNote) }
         }
-        return ('历史风暴 ' + $burst + '，最近一次重启在 ' + [int]$sinceLast + ' 分钟前，此后无重启 —— 判定已恢复')
+        return ('历史风暴 ' + $burst + '，窗口最后一次在 ' + [int]$sinceBurst + ' 分钟前，此后无风暴 —— 判定已恢复' + $histNote)
     }
-    ('24h 内重启 ' + $times.Count + ' 次，未出现 10 分钟 3 次的风暴（最近一次 ' + [int]($now - $times[-1]).TotalMinutes + ' 分钟前）')
+    ('24h 内重启 ' + $times.Count + ' 次，未出现 10 分钟 3 次的风暴（最近一次 ' + [int]($now - $times[-1]).TotalMinutes + ' 分钟前）' + $histNote)
 } -Hint '连着重启先看心跳是否空闲不刷新、端口是否被旧实例占着（Start 有 30 次重试）、以及 dsh-agent.log 尾部'
 
 Test-Case RES-008 '健壮' '启动链没有失败记录' high {
@@ -737,3 +769,27 @@ Test-Case RES-018 '健壮' 'AHK 滚动写入有 64KB 上限；桥日志改名成
     if ($iMove -ge 0 -and $iTrunc -lt $iMove) { throw '桥日志截空写在改名之前（改名失败就丢历史）' }
     '滚动文件 64KB 闸 + 桥日志改名成功才截空'
 } -Hint 'P2/P3（2026-11-11）：scroll.dat 无上限会被假死代理撑爆；桥日志 File.Copy 非原子'
+
+Test-Case RES-019 '健壮' '代理重启只有一个动手者（看门狗杀+拉，巡检只补缺失）' medium {
+    # 2026-11-14 21:39~22:06 的重启风暴里，agent-watch.ps1（5s）与 ensure-all.ps1（2min）交替
+    # taskkill + 拉起，日志里 `watch: restart FAILED` 与 `ensure: agent restart FAILED` 混着出现。
+    # 两边都动手时，任何一次「刚拉起、还没绑端口」都会被另一方判死 —— 机器越忙越刹不住。
+    # 2026-11-15 定：唯一权威是看门狗；ensure-all 只在「进程根本不在」时补起一个，
+    # 「在但不健康」只记一行、交回看门狗。判据两边都咬住，防止以后又长出第二个动手者。
+    # 先剥整行注释再匹配：注释里常引用旧写法（本文件 2026-11-15 的注释就写了旧文案），
+    # 不剥会把「解释历史」当成「还在这么干」——RES-016 当年就踩过同一个坑。
+    $root = Get-DshRoot
+    $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
+    $ens = (($ens -split "`r?`n") | Where-Object { $_.TrimStart() -notlike '#*' }) -join "`n"
+    if ($ens -match 'taskkill\.exe /PID \$agentPid') { throw 'ensure-all 还在 taskkill 代理（第二个动手者会让重启风暴复发）' }
+    if ($ens -match 'ensure: agent restart ') { throw 'ensure-all 还在走「重启代理」分支（旧文案 ensure: agent restart 仍在）' }
+    if ($ens -notmatch 'if \(-not \(ProcAlive \$agentPid\)\)') { throw 'ensure-all 没有「进程不在才补起」的分支' }
+    if ($ens -notmatch 'ensure: agent missing') { throw 'ensure-all 的补起分支没写清是「缺失」' }
+    if ($ens -notmatch 'left to watch') { throw 'ensure-all 遇到「在但不健康」没有交回看门狗（会变成静默不管）' }
+
+    $watch = Read-Raw (Join-Path $root 'drawer\agent-watch.ps1')
+    $watch = (($watch -split "`r?`n") | Where-Object { $_.TrimStart() -notlike '#*' }) -join "`n"
+    if ($watch -notmatch 'taskkill\.exe /PID \$pid2') { throw '看门狗不再杀不健康代理（权威方缺失，两边都不动手）' }
+    if ($watch -notmatch 'watch: restart ') { throw '看门狗没有 restart 结论行（失败时无从判断是进程死了还是没起来）' }
+    'ensure-all 只补缺失（不 taskkill、不健康交回看门狗）；杀 + 拉起只有 agent-watch 一处'
+} -Hint '同一件事有两个动手者时，先定权威再写判据（2026-11-14 重启风暴的教训）'

@@ -30,12 +30,42 @@ try {
     if ($node -and (Test-Path $binJs)) {
         $env:DSH_ROOT = $dshRoot
         if (-not $env:DSH_HOME) { $env:DSH_HOME = Join-Path $dshRoot '.dsh' }
-        $proc = Start-Process -FilePath $node -PassThru -WindowStyle Hidden `
-            -ArgumentList @(('"' + $binJs + '"'), '--profile', 'headless', '-') `
-            -RedirectStandardInput $PromptFile -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+        # 不能用 Start-Process -RedirectStandardInput/-Output：本机 PS 5.1 的重定向分支抛
+        # 「已添加项。字典中的关键字:“path”所添加的关键字:“Path”」（单独一行
+        # Start-Process -FilePath cmd -RedirectStandardOutput 就能复现，与本脚本无关），
+        # 结果是这个「AI 点评」小工一直静默退 5、输出 0 字节 —— 巡检报告里那一栏永远是空的。
+        # 改用 ProcessStartInfo：stdin 写 UTF-8 字节，stdout/stderr 异步读，既不吃 8191 参数字符上限，
+        # 也不会因为缓冲区写满而互锁。
+        $promptText = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $node
+        $psi.Arguments = ('"' + $binJs + '" --profile headless -')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($promptText)
+            $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $proc.StandardInput.BaseStream.Flush()
+            $proc.StandardInput.Close()
+        } catch { }
         $done = $proc.WaitForExit(600000)
         if (-not $done) { try { $proc.Kill() } catch { }; Write-Result ''; exit 4 }
-        $text = [System.IO.File]::ReadAllText($tmpOut, [System.Text.Encoding]::UTF8)
+        $text = ''
+        try { $text = [string]$outTask.Result } catch { }
+        $errText = ''
+        try { $errText = [string]$errTask.Result } catch { }
+        if (-not $text -and $errText) {
+            # 把 stderr 收进临时文件，排障时有东西可看（正文仍为空）。
+            try { [System.IO.File]::WriteAllText($tmpErr, $errText, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+        }
     } else {
         # 兜底：走 dsh.cmd 的 stdin 模式
         $text = (Get-Content $PromptFile -Raw -Encoding UTF8 | & (Join-Path $dshRoot 'dsh.cmd') headless - 2>$null | Out-String)

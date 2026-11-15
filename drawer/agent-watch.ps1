@@ -72,6 +72,13 @@ function Test-PortOpen([int]$p, [int]$ms) {
     } catch { return $false } finally { try { $c.Close() } catch { } }
 }
 
+# 刚拉起的代理给多久宽限（秒）。机器满载时冷启动要十几秒（2026-11-14 21:36 实测单请求
+# /state.js 15s、/rect.gif 15.5s），原来的「fails≥2 就杀」会把 9 秒前刚起来、还没绑端口的
+# 进程杀掉 —— 重启被自己打断，日志里就是一连串 restart FAILED。
+$graceAfterStartSec = 45
+$script:lastStartPid = 0
+$script:lastStartTick = 0
+
 function Start-Agent {
     # 用 CreateProcess(CREATE_NO_WINDOW) 拉起：PowerShell 立刻返回，也不会有控制台窗口。
     # 原来走 cmd.exe /c start + -WindowStyle Hidden：这台机器默认终端是 Windows Terminal，
@@ -82,7 +89,10 @@ function Start-Agent {
     $psi.WorkingDirectory = $appDir
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
-    try { [void][System.Diagnostics.Process]::Start($psi) }
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($p) { $script:lastStartPid = [int]$p.Id; $script:lastStartTick = [Environment]::TickCount }
+    }
     catch { Watch-Log ('watch: start agent FAILED err=' + $_.Exception.Message) }
 }
 
@@ -150,6 +160,20 @@ while ($true) {
     if ($alive -and $hb -and $portOk) {
         if ($fails -ge 2) { Watch-Log 'watch: agent healthy again' }
         $fails = 0
+        $script:lastStartPid = 0
+        $script:lastStartTick = 0
+        continue
+    }
+
+    # 宽限：这一轮不健康，但如果进程就是我 45 秒内刚拉起来的、且还活着，那它多半只是还没绑端口。
+    # 先别杀 —— 杀了就是「重启被自己打断」，下一轮再从零开始，机器越忙越起不来。
+    $graceMs = -1
+    if (($pid2 -gt 0) -and ($pid2 -eq $script:lastStartPid) -and ($script:lastStartTick -gt 0)) {
+        $graceMs = [Environment]::TickCount - $script:lastStartTick
+    }
+    if ($alive -and ($graceMs -ge 0) -and ($graceMs -lt ($graceAfterStartSec * 1000))) {
+        Watch-Log ('watch: grace pid=' + $pid2 + ' age=' + [int]($graceMs / 1000) + 's hb=' + $hb + ' port=' + $portOk + ' (刚拉起，这一轮不判死)')
+        $fails = 1
         continue
     }
 
@@ -172,12 +196,15 @@ while ($true) {
     Start-Agent
     $t0 = [Environment]::TickCount
     $ok = $false
-    while ((([Environment]::TickCount - $t0) -lt 25000)) {
+    # 45 秒（原来 25 秒）：满载时代理冷启动十几秒，判太短会把「正在起来」当成「起不来」。
+    while ((([Environment]::TickCount - $t0) -lt 45000)) {
         Start-Sleep -Milliseconds 500
         if ((Test-HbFresh) -and (Test-PortOpen $Port 300)) { $ok = $true; break }
     }
     $verdict = 'FAILED'
     if ($ok) { $verdict = 'ok' }
-    Watch-Log ('watch: restart ' + $verdict + ' pid=' + (Get-AgentPid))
+    # 结论行要能自己解释原因：pid 有没有换、心跳新不新、端口通不通、等了多久。
+    Watch-Log ('watch: restart ' + $verdict + ' pid=' + (Get-AgentPid) + ' hb=' + (Test-HbFresh) +
+        ' port=' + (Test-PortOpen $Port 300) + ' waited=' + [int](([Environment]::TickCount - $t0) / 1000) + 's')
     $fails = 0
 }

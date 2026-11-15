@@ -247,16 +247,13 @@ if (-not $watchAlive) {
     }
 }
 
-# 3) 代理
+# 3) 代理 —— 只补缺失，不杀不健康（2026-11-15 分工收敛）
+# 唯一有权「杀 + 重启」代理的是 agent-watch.ps1（5 秒一轮，看得住心跳与端口）；
+# 本脚本是 2 分钟兜底：进程根本不在才补起一个，「在但不健康」只记一行、交给看门狗。
+# 不再 taskkill —— 两边都能杀时，11-14 21:39~22:06 就是两者交替动手把重启打成风暴
+# （watch: restart FAILED 与 ensure: agent restart FAILED 混着出现），机器越忙越刹不住。
 $agentPid = ReadPid $agentPidF
-$agentOk = (ProcAlive $agentPid) -and (AgentHealthy)
-if (-not $agentOk) {
-    if (ProcAlive $agentPid) {
-        & taskkill.exe /PID $agentPid /T /F 2>&1 | Out-Null
-        $t0 = [Environment]::TickCount
-        while ((([Environment]::TickCount - $t0) -lt 4000) -and (ProcAlive $agentPid)) { Start-Sleep -Milliseconds 200 }
-        Log ('ensure: agent unhealthy (pid=' + $agentPid + ' alive=' + (ProcAlive $agentPid) + '), killed')
-    }
+if (-not (ProcAlive $agentPid)) {
     if (Test-Path $agentScript) {
         StartHidden 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $agentScript + '"'))
         $t0 = [Environment]::TickCount
@@ -267,10 +264,12 @@ if (-not $agentOk) {
         }
         $v = 'FAILED'
         if ($ok) { $v = 'ok' }
-        Log ('ensure: agent restart ' + $v + ' pid=' + (ReadPid $agentPidF))
+        Log ('ensure: agent missing (pid=' + $agentPid + '), started ' + $v + ' pid=' + (ReadPid $agentPidF))
     } else {
         Log 'ensure: dsh-agent.ps1 missing'
     }
+} elseif (-not (AgentHealthy)) {
+    Log ('ensure: agent alive but unhealthy (pid=' + $agentPid + '), left to watch')
 }
 # 4) 启动队列：抽屉点图标时代理不在 → 它写 launch-queue.txt 而不是让 AHK 自己 Run
 #    （AHK 祖先会让鹰角启动器报 Load launcher failed）。看门狗通常 1 秒内就处理了；

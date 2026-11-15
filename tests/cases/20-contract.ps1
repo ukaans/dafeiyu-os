@@ -432,36 +432,67 @@ Test-Case CON-017 '契约' '热重载令牌：两条路径同源判据 + 先清�
     # 活体复现（只动令牌文件，不弹窗、不动桌面）：空文件必须一次软重载都不发
     if (-not (Test-DshApiUp)) { return @{ Status = 'warn'; Detail = '静态契约通过；代理未在线，活体复现跳过' } }
     $rf = Join-Path $env:LOCALAPPDATA 'DesktopPage\page-reload.txt'
+    $logF = Join-Path (Get-DshInstall) 'dsh-agent.log'
     $enc = New-Object System.Text.UTF8Encoding($false)
+
+    # 令牌的消费者不止本进程：壁纸那边 40ms 一轮 /scroll.js，写下去之后大概率是页面那一轮先取走
+    # （2026-11-15 10:10 实测：连写 5 个令牌全被页面抢走，本进程一次都没拿到 __DSH_RELOAD_OK，
+    #  旧判据于是判红 —— 而链路本身是好的，页面当场就软重载了）。
+    # 所以判据改成「一个令牌恰好触发一次软重载」：代理每发一次都会写一行
+    # 'scroll: page-reload emitted'，谁抢到都算数，本进程能不能抢到不影响结论。
+    function Count-Emits {
+        if (-not (Test-Path -LiteralPath $logF)) { return 0 }
+        try { $t = [System.IO.File]::ReadAllText($logF, [System.Text.Encoding]::UTF8) } catch { return -1 }
+        return ([regex]::Matches($t, 'scroll: page-reload emitted')).Count
+    }
+
     try {
+        Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 120
+        $base = Count-Emits
+        if ($base -lt 0) { throw '读不到 dsh-agent.log，没法确认软重载到底有没有下发' }
+
         [System.IO.File]::WriteAllText($rf, '', $enc)
         $hitEmpty = 0
         for ($i = 0; $i -lt 2; $i++) {
             $r = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
             if ($r.Ok -and $r.Body -match '__DSH_RELOAD_OK') { $hitEmpty++ }
         }
+        Start-Sleep -Milliseconds 120
+        $afterEmpty = Count-Emits
         if ($hitEmpty -gt 0) { throw "空令牌文件仍下发了软重载 $hitEmpty 次 —— 清不掉令牌的机器会无限重插 dsh.js" }
-        # 真令牌：必须发一次，发完立刻失效（第二次不能再发，否则页面被重插两份 dsh.js）
-        # 壁纸那边也在按 40ms 轮询 /scroll.js；令牌写下去后可能被页面的在途请求抢先取走，
-        # 那样本进程这次就拿不到 __DSH_RELOAD_OK（2026-11-14 起偶发）。重试若干次：
-        # 只要有一次「本进程拿到发射、紧接着第二次没有」就算链路正常。
-        $emit1 = $false; $emit2 = $false
-        for ($try = 0; $try -lt 5 -and -not $emit1; $try++) {
-            [System.IO.File]::WriteAllText($rf, [string][long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $try, $enc)
+        if ($afterEmpty -gt $base) { throw ("空令牌文件被当成真令牌：日志里多发了 " + ($afterEmpty - $base) + " 次软重载（页面轮询抢到的那一路也一样）") }
+
+        # 真令牌：必须恰好发一次，发完立刻失效（再发就会把 dsh.js 重插两份）
+        Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 120
+        $base = Count-Emits
+        $sz0 = (Get-Item -LiteralPath $logF).Length
+        [System.IO.File]::WriteAllText($rf, [string][long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), $enc)
+        $mine = $false
+        for ($i = 0; $i -lt 8 -and -not $mine; $i++) {
             $r1 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
-            if (-not ($r1.Ok -and $r1.Body -match '__DSH_RELOAD_OK')) {
-                Start-Sleep -Milliseconds 80
-                continue
-            }
-            $r2 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
-            $emit1 = $true
-            $emit2 = ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK')
+            if ($r1.Ok -and $r1.Body -match '__DSH_RELOAD_OK') { $mine = $true } else { Start-Sleep -Milliseconds 25 }
         }
-        if (-not $emit1) { throw '真令牌没有触发软重载（改坏了：改完壁纸就不会热重载了）' }
-        if ($emit2) { throw '同一个令牌下发了两次 —— 页面会被重插两份 dsh.js' }
-        '判据看有效数字 + 先清后发；空令牌 0 次下发，真令牌只下发 1 次'
+        $gone = $false
+        for ($i = 0; $i -lt 15 -and -not $gone; $i++) {
+            if (-not (Test-Path -LiteralPath $rf)) { $gone = $true } else { Start-Sleep -Milliseconds 60 }
+        }
+        if (-not $gone) { throw '真令牌写下去 1 秒内没人消费 —— /scroll.js 已经不再读令牌了（热重载链路断了）' }
+        Start-Sleep -Milliseconds 150
+        if ((Get-Item -LiteralPath $logF).Length -lt $sz0) { throw 'dsh-agent.log 在用例执行期间被轮转，软重载次数没法对齐（重跑一遍）' }
+        $after = Count-Emits
+        if ($after -ne ($base + 1)) {
+            throw ("一个令牌触发了 " + ($after - $base) + " 次软重载（必须恰好 1 次）：0 = 链路断了，>1 = 页面会被重插多份 dsh.js")
+        }
+        for ($i = 0; $i -lt 3; $i++) {
+            $r2 = Invoke-DshHttp -Path '/scroll.js' -TimeoutMs 2000
+            if ($r2.Ok -and $r2.Body -match '__DSH_RELOAD_OK') { throw '同一个令牌下发了两次 —— 页面会被重插两份 dsh.js' }
+        }
+        $by = $(if ($mine) { '本进程' } else { '页面轮询' })
+        ('判据看有效数字 + 先清后发；空令牌 0 次下发，真令牌恰好 1 次（这次由' + $by + '取到）')
     } finally {
-        try { if (Test-Path $rf) { Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue } } catch { }
+        try { if (Test-Path -LiteralPath $rf) { Remove-Item -LiteralPath $rf -Force -ErrorAction SilentlyContinue } } catch { }
     }
 } -Hint '2026-11-07：Test-Path 判空文件也会发软重载；清不掉令牌时 /scroll.js 40ms 一轮无限重插 dsh.js'
 

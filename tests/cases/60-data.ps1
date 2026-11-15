@@ -220,9 +220,9 @@ Test-Case DAT-009 '数据' '图标重建失败时不毁旧图标' high {
     $src = Join-Path (Get-DshRoot) 'drawer\Build-IconCache.ps1'
     $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('dsh-iconcache-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
     try { [void](New-Item -ItemType Directory -Path $tmpRoot -Force) } catch { }
-    $script = Read-Raw $src
-    $script = $script.Replace('Add-Type -AssemblyName System.Drawing', "throw 'simulated add-type failure'")
-    [System.IO.File]::WriteAllText((Join-Path $tmpRoot 'Build-IconCache.ps1'), $script, (New-Object System.Text.UTF8Encoding($true)))
+    $srcText = Read-Raw $src
+    $srcText = $srcText.Replace('Add-Type -AssemblyName System.Drawing', "throw 'simulated add-type failure'")
+    [System.IO.File]::WriteAllText((Join-Path $tmpRoot 'Build-IconCache.ps1'), $srcText, (New-Object System.Text.UTF8Encoding($true)))
     $icons = Join-Path $tmpRoot 'icons'
     [void](New-Item -ItemType Directory -Path $icons -Force)
     $sentinel = Join-Path $icons 'keep-me.png'
@@ -231,14 +231,31 @@ Test-Case DAT-009 '数据' '图标重建失败时不毁旧图标' high {
 
     # 注意：不能用 & powershell 2>&1 —— 测试库里 $ErrorActionPreference='Stop'，
     # 子进程写到 stderr 的每一行都会变成终止性错误，脚本会直接在这里炸掉。
-    $so = Join-Path $tmpRoot 'run.out.txt'
-    $se = Join-Path $tmpRoot 'run.err.txt'
-    $proc = Start-Process -FilePath 'powershell.exe' -Wait -PassThru -WindowStyle Hidden `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $tmpRoot 'Build-IconCache.ps1')) `
-        -RedirectStandardOutput $so -RedirectStandardError $se
-    $rc = $proc.ExitCode
+    # 也不能用 Start-Process -RedirectStandard*：本机 PS 5.1 的重定向分支会抛
+    # 「已添加项。字典中的关键字:“path”所添加的关键字:“Path”」（与脚本无关，
+    # 单独一行 Start-Process -FilePath cmd -RedirectStandardOutput 就能复现），
+    # 于是这条用例会以「测试手法坏了」的形状报红，看起来像产品缺陷。
+    # 改用 ProcessStartInfo + 异步读流：不写中间文件，也不依赖 Start-Process 的重定向。
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        ('"' + (Join-Path $tmpRoot 'Build-IconCache.ps1') + '"')) -join ' ')
+    $psi.WorkingDirectory = $tmpRoot
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $child = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $child.StandardOutput.ReadToEndAsync()
+    $errTask = $child.StandardError.ReadToEndAsync()
+    if (-not $child.WaitForExit(120000)) {
+        try { $child.Kill() } catch { }
+        throw '子进程 120 秒未退出（Build-IconCache 卡住了）'
+    }
+    $rc = $child.ExitCode
     $errText = ''
-    try { $errText = Read-Raw $se } catch { }
+    try { $errText = $errTask.Result } catch { }
+    try { [void]$outTask.Result } catch { }
     $kept = Test-Path -LiteralPath $sentinel
     $stageLeft = @(Get-ChildItem -LiteralPath $tmpRoot -Directory -Filter 'icons.new-*' -ErrorAction SilentlyContinue).Count
     try { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
