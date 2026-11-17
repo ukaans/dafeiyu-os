@@ -501,3 +501,32 @@ Test-Case STA-021 '静态' '桥存活走互斥体、启动失败留痕' high {
     if ($wb.IndexOf('wheel-bridge" + _id + ".pid') -lt 0) { throw 'wheel-bridge 没有写 pid 文件（卡死时无法定位进程）' }
     '桥用互斥体判存活；启动失败有 stderr + boot 阶段留痕；卡死按 pid 文件 + 心跳处理'
 } -Hint '2026-11-13 事故：桥解析级死亡 35 小时无人知，ensure-all 每 2 分钟"正确地拉起一个必死的桥"'
+Test-Case STA-022 '静态' '游戏守卫在跑时不补抽屉（SessionGuard 热补丁已入库）' high {
+    $root = Get-DshRoot
+    $ens = [IO.File]::ReadAllText((Join-Path $root 'drawer\ensure-all.ps1'), [Text.Encoding]::UTF8)
+
+    # ① 守卫标记必须参与「补抽屉」的判据：守卫在跑时 AutoHotkey 必须保持退出（反作弊会连坐）
+    $flag = $ens.IndexOf('game-guard.on')
+    if ($flag -lt 0) { throw 'ensure-all 没有读 game-guard.on：守卫在跑时仍会把 AutoHotkey 拉起来' }
+    $from = [Math]::Max(0, $flag - 200)
+    $seg = $ens.Substring($from, [Math]::Min(1600, $ens.Length - $from))
+    if ($seg.IndexOf('-lt 120') -lt 0) { throw '守卫标记的陈旧阈值不是 120 秒：守卫崩了以后抽屉会永久不被补起' }
+
+    # ② 守卫激活时只许记日志；拉起抽屉的代码必须在 else 分支里
+    $act = $ens.IndexOf('if ($guardActive)')
+    if ($act -lt 0) { throw '没有 $guardActive 分支' }
+    $else = $ens.IndexOf('elseif (-not (DrawerAlive))', $act)
+    if ($else -lt 0) { throw '守卫分支之后没有接回「抽屉不在就补起」的 elseif（抽屉会不再自愈）' }
+    $start = $ens.IndexOf('StartHidden $ahkExe', $act)
+    if ($start -lt 0 -or $start -lt $else) { throw '拉起抽屉的代码落在守卫分支里：守卫激活时照样会起 AutoHotkey' }
+
+    # ③ 守卫自愈（心跳假死就重拉）只能在「exe 存在」之内：没装守卫的机器不许每轮空转
+    $gx = $ens.IndexOf('SessionGuard\SessionGuard.exe')
+    if ($gx -lt 0) { throw 'ensure-all 没有守卫自愈：守卫崩掉/睡眠假死后没人拉回来' }
+    $tp = $ens.IndexOf('if (Test-Path -LiteralPath $guardExe)')
+    if ($tp -lt 0 -or $tp -lt $gx) { throw '守卫自愈没有先判 exe 是否存在' }
+    if ($ens.IndexOf('guard-heartbeat.txt', $tp) -lt 0) { throw '守卫自愈没有按心跳判假死（只判进程在不在，睡眠后就拉不回来）' }
+    if ($ens.IndexOf('-gt 60', $tp) -lt 0) { throw '守卫心跳的假死阈值不是 60 秒' }
+    if ($ens.IndexOf('SessionGuard start FAILED', $tp) -lt 0) { throw '守卫重拉失败没有留痕' }
+    '守卫激活时只记 skipped、不补抽屉；心跳 >60s 或进程不在就当场重拉；exe 不存在整段跳过'
+} -Hint '2026-11-15 13:32 写进运行目录的热补丁（SessionGuard 反作弊守卫）没进仓库；这段一旦丢了，玩游戏时 AutoHotkey 会被反作弊连坐'

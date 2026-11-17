@@ -142,8 +142,20 @@ function Test-Mutex([string]$name) {
     } catch { return $false }
 }
 
-# 1) 抽屉
-if (-not (DrawerAlive)) {
+# >>> SessionGuard patch A >>>
+# 游戏守卫（SessionGuard.exe）运行期间不补抽屉：反作弊在跑，AutoHotkey 必须保持退出。
+# 标记由守卫每 5s 刷新；>120s 视为陈旧（守卫已死），走正常补抽屉流程，避免永久锁死。
+$guardFlagF = Join-Path $appDir 'game-guard.on'
+$guardActive = $false
+try {
+    if (Test-Path $guardFlagF) {
+        $guardAge = ((Get-Date) - (Get-Item $guardFlagF).LastWriteTime).TotalSeconds
+        if ($guardAge -lt 120) { $guardActive = $true }
+    }
+} catch { $guardActive = $false }
+if ($guardActive) {
+    if (-not (DrawerAlive)) { Log 'ensure: drawer down but game guard active, skipped' }
+} elseif (-not (DrawerAlive)) {
     if ((Test-Path $ahkExe) -and (Test-Path $ahkScript)) {
         StartHidden $ahkExe @(('"' + $ahkScript + '"'))
         Log 'ensure: drawer was down, started'
@@ -151,6 +163,7 @@ if (-not (DrawerAlive)) {
         Log 'ensure: drawer down and files missing'
     }
 }
+# <<< SessionGuard patch A <<<
 
 # 1b) 滚轮桥（wheel-bridge.ps1 → 由 powershell.exe 承载）
 # 为什么要有它：本机 AHK 进程的鼠标通道会整条哑掉（WheelDown/WheelUp 热键不触发、
@@ -304,3 +317,55 @@ if (Test-Path $queueFile) {
         catch { Log ('ensure: queued launch FAILED ' + $p + ' err=' + $_.Exception.Message) }
     }
 }
+
+# >>> SessionGuard patch B >>>
+# 游戏守卫自愈：进程不在、或心跳超过 60s（睡眠/卡死），就杀掉重拉。
+# 守卫自己有单实例互斥体（Local\SessionGuard.SingleInstance），重复启动只留一个，所以这里
+# 宁可多拉一次也不放过假死。心跳由守卫每 5s 写一次；进程名固定 SessionGuard。
+$guardExe = Join-Path $env:LOCALAPPDATA 'SessionGuard\SessionGuard.exe'
+if (Test-Path -LiteralPath $guardExe) {
+    $guardDir = Split-Path -Parent $guardExe
+    $guardBeatF = Join-Path $guardDir 'guard-heartbeat.txt'
+    $guardAge = -1
+    try {
+        if (Test-Path -LiteralPath $guardBeatF) {
+            $guardAge = [int]((Get-Date) - (Get-Item -LiteralPath $guardBeatF).LastWriteTime).TotalSeconds
+        }
+    } catch { $guardAge = -1 }
+    $guardProcs = @(Get-Process -Name 'SessionGuard' -ErrorAction SilentlyContinue)
+    $restart = $false
+    $why = ''
+    if ($guardProcs.Count -eq 0) { $restart = $true; $why = 'process missing' }
+    elseif ($guardAge -gt 60) {
+        foreach ($gp in $guardProcs) {
+            try {
+                if ($gp.Path -ieq $guardExe) { Stop-Process -Id $gp.Id -Force -ErrorAction SilentlyContinue }
+            } catch { }
+        }
+        Start-Sleep -Milliseconds 400
+        $restart = $true
+        $why = 'heartbeat stale ' + $guardAge + 's'
+    }
+    if ($restart) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $guardExe
+        $psi.WorkingDirectory = $guardDir
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $up = $false
+        try {
+            [void][System.Diagnostics.Process]::Start($psi)
+            $t0 = [Environment]::TickCount
+            while ((([Environment]::TickCount - $t0) -lt 8000)) {
+                Start-Sleep -Milliseconds 300
+                if (Test-Path -LiteralPath $guardBeatF) {
+                    $a2 = ((Get-Date) - (Get-Item -LiteralPath $guardBeatF).LastWriteTime).TotalSeconds
+                    if ($a2 -lt 10) { $up = $true; break }
+                }
+            }
+        } catch { }
+        if ($up) { Log ('ensure: SessionGuard restarted (' + $why + '), heartbeat ok') }
+        else { Log ('ensure: SessionGuard start FAILED (' + $why + '), no fresh heartbeat in 8s') }
+    }
+}
+# <<< SessionGuard patch B <<<

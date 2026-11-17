@@ -74,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 
 ## 4. 用例清单
 
-### 10-static · 静态完整性（21 条）
+### 10-static · 静态完整性（22 条）
 | 编号 | 查什么 |
 |---|---|
 | STA-001 | 25 个核心文件在位 |
@@ -98,6 +98,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-019 | 改布局前先拍快照、抛错自动回滚（`LayoutOp`；快照按名字排序、只留最近 40 份） |
 | STA-020 | 拖文件夹时只藏被拖的那一个，其它合成文件夹保持可见 |
 | STA-021 | 滚轮桥存活走**互斥体**（不再按命令行匹配，探针会误匹配）；启动失败要留 stderr + boot 阶段痕迹；卡死按 pid 文件 + 心跳处理 |
+| STA-022 | **游戏守卫在跑时不补抽屉**：`SessionGuard` 的 `game-guard.on` 新鲜（≤120s）时 `ensure-all` 只记 `skipped`；守卫分支之后必须接回 `elseif (-not (DrawerAlive))`（拉起抽屉的代码不许落在守卫分支里）；守卫自愈要有 `Test-Path` 闸、心跳 >60s 或进程不在才重拉且失败留痕 |
 
 ### 20-contract · 契约一致性（20 条）
 | 编号 | 查什么 |
@@ -188,7 +189,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 | DAT-009 | **图标重建失败时不毁旧图标**：在临时副本上把 `Add-Type` 换成必抛异常，验证「非 0 退出 + 旧图标原样保留 + `icons.new-*` 暂存目录清理干净 + stderr 有 `add-type` 提示」。判据用 `ProcessStartInfo` 起子进程（本机 PS 5.1 的 `Start-Process -RedirectStandard*` 有 bug，会以「测试手法坏了」的形状假红，2026-11-15 修） |
 
-合计 90 条。
+合计 91 条。
 
 ---
 
@@ -236,6 +237,7 @@ Test-Case XXX-002 '分类' '需要人工判断的' low {
 - **临时探针绝不放 `tests\out`**：`STA-002`（BOM）与 `STA-004`（Parser 全量 `.ps1`）会扫到，放进去就是假红；一律放 `%TEMP%`，跑完删。
 - **RES-015 / DAT-008 / RES-016 各会写一份临时目录**（`%TEMP%\dsh_audit_*` / `dsh_todo_*` / `dsh_rot_*`）：`RES-015` 把 `Write-Audit` 取出来跑一次轮转，`DAT-008` 只读真实 `todo-data.js`，`RES-016` 先把 `.1` 用只读句柄占住再造一次「改名失败」；跑完自己删目录，**不碰真实 `audit.log`**。
 - **用例里绝对不要用 `/summon.gif` 造测试数据**：那条路由只认 `d=1|hide`，其余一切（包括 `d=diag`）都会写成 `show` —— 深夜跑测试会把抽屉弹到用户脸上（2026-11-09 踩过，改成直接写 `summon.cmd` 文件）。
+- **`STA-022` 只校验仓库里的 `drawer\ensure-all.ps1`**：游戏守卫本体（`SessionGuard.exe` / `.ini`）装在 `%LOCALAPPDATA%\SessionGuard\`、**不在本仓库**，所以这条只咬「守卫联动代码还在不在、判据对不对」，不检查守卫本身是否在跑 —— 换了台没装守卫的机器它照样绿（那是对的：没守卫就该正常补抽屉）。
 - **AHK 不能靠 `/validate` 证明没问题**：本机 `AutoHotkey64.exe /validate <script>` 返回 exit=0 且无任何输出（既不是 Syntax OK，也不是失败），所以别把它当验收。 `DesktopPage.ahk` 只查编码、函数定义位置、原子写模式这些静态特征；**改完仍要重启抽屉看 `wheel.log` / `audit.log` 里动作对不对**。`RUN-011` 只能证明"主循环还在转"。滚轮判定层可脚本化验证：`summon.cmd` 写 `classify=<hwnd>`，壁纸页 WebView2 的 RenderWidgetHost 应回 `desk=1`（root=Progman），Chrome 的应回 `desk=0`。
 - **`schtasks` 被拉黑**：所以测试不验证计划任务是否注册（那是 `verify.ps1` 用 `Get-ScheduledTask` 查的，走的是 COM 不是 exe）。
 - **本机 PS 5.1 的 `Start-Process -RedirectStandardInput/-Output/-Error` 有 bug**：任何一条重定向都会抛「已添加项。字典中的关键字:“path”所添加的关键字:“Path”」，与本仓库代码无关（`Start-Process -FilePath cmd.exe -RedirectStandardOutput x.txt -Wait` 单行即可复现，裸 `ProcessStartInfo` 反而正常）。所以**测子里要拿子进程的输出，一律用 `ProcessStartInfo` + `ReadToEndAsync()`**（`DAT-009`、`tests\ai-review.ps1` 均已改成这套）。历史上它把 `DAT-009` 变成假红、把夜间巡检的「AI 点评」变成永远空的（小工 exit 5、0 字节），2026-11-15 才定位到。
