@@ -505,28 +505,79 @@ Test-Case STA-022 '静态' '游戏守卫在跑时不补抽屉（SessionGuard 热
     $root = Get-DshRoot
     $ens = [IO.File]::ReadAllText((Join-Path $root 'drawer\ensure-all.ps1'), [Text.Encoding]::UTF8)
 
-    # ① 守卫标记必须参与「补抽屉」的判据：守卫在跑时 AutoHotkey 必须保持退出（反作弊会连坐）
-    $flag = $ens.IndexOf('game-guard.on')
-    if ($flag -lt 0) { throw 'ensure-all 没有读 game-guard.on：守卫在跑时仍会把 AutoHotkey 拉起来' }
-    $from = [Math]::Max(0, $flag - 200)
-    $seg = $ens.Substring($from, [Math]::Min(1600, $ens.Length - $from))
-    if ($seg.IndexOf('-lt 120') -lt 0) { throw '守卫标记的陈旧阈值不是 120 秒：守卫崩了以后抽屉会永久不被补起' }
+    # 判据一律「按大括号配对取整块」，不按字符窗口猜：注释里引用旧文案、相邻语句里出现同名字符串都不算数
+    function Get-Block([string]$text, [int]$startIdx) {
+        $open = $text.IndexOf('{', $startIdx)
+        if ($open -lt 0) { throw '找不到代码块起始的 {' }
+        $depth = 0
+        for ($i = $open; $i -lt $text.Length; $i++) {
+            $c = $text[$i]
+            if ($c -eq '{') { $depth++ }
+            elseif ($c -eq '}') { $depth--; if ($depth -eq 0) { return $text.Substring($open, $i - $open + 1) } }
+        }
+        throw '大括号不配对'
+    }
 
-    # ② 守卫激活时只许记日志；拉起抽屉的代码必须在 else 分支里
+    # ① 守卫标记的陈旧阈值必须是 120 秒（守卫崩了不许把抽屉永久锁死）
+    if ($ens -notmatch 'if\s*\(\s*\$guardAge\s+-lt\s+120\s*\)\s*\{\s*\$guardActive\s*=\s*\$true\s*\}') {
+        throw '守卫标记的陈旧判据不是「$guardAge -lt 120 → $guardActive = $true」：守卫死后抽屉会永久不被补起'
+    }
+
+    # ② 守卫分支里只许记日志；拉起抽屉的代码必须在它之后的 elseif 里
     $act = $ens.IndexOf('if ($guardActive)')
-    if ($act -lt 0) { throw '没有 $guardActive 分支' }
-    $else = $ens.IndexOf('elseif (-not (DrawerAlive))', $act)
-    if ($else -lt 0) { throw '守卫分支之后没有接回「抽屉不在就补起」的 elseif（抽屉会不再自愈）' }
-    $start = $ens.IndexOf('StartHidden $ahkExe', $act)
-    if ($start -lt 0 -or $start -lt $else) { throw '拉起抽屉的代码落在守卫分支里：守卫激活时照样会起 AutoHotkey' }
+    if ($act -lt 0) { throw 'ensure-all 没有 $guardActive 分支（守卫在跑时仍会把 AutoHotkey 拉起来）' }
+    $blk = Get-Block $ens $act
+    if ($blk.IndexOf('game guard active, skipped') -lt 0) { throw '守卫活跃时没有记 skipped 日志' }
+    if ($blk.IndexOf('StartHidden') -ge 0) { throw '拉起抽屉的代码落在守卫分支里：守卫激活时照样会起 AutoHotkey' }
+    $rest = $ens.Substring($ens.IndexOf('{', $act) + $blk.Length)
+    if (-not ($rest -match '^\s*elseif\s*\(\s*-not\s*\(DrawerAlive\)\s*\)')) { throw '守卫分支之后没有紧跟 elseif (-not (DrawerAlive))：抽屉不再自愈' }
 
-    # ③ 守卫自愈（心跳假死就重拉）只能在「exe 存在」之内：没装守卫的机器不许每轮空转
-    $gx = $ens.IndexOf('SessionGuard\SessionGuard.exe')
-    if ($gx -lt 0) { throw 'ensure-all 没有守卫自愈：守卫崩掉/睡眠假死后没人拉回来' }
+    # ③ 守卫自愈整段必须在 Test-Path 之内（没装守卫的机器不许每轮空转）
     $tp = $ens.IndexOf('if (Test-Path -LiteralPath $guardExe)')
-    if ($tp -lt 0 -or $tp -lt $gx) { throw '守卫自愈没有先判 exe 是否存在' }
-    if ($ens.IndexOf('guard-heartbeat.txt', $tp) -lt 0) { throw '守卫自愈没有按心跳判假死（只判进程在不在，睡眠后就拉不回来）' }
-    if ($ens.IndexOf('-gt 60', $tp) -lt 0) { throw '守卫心跳的假死阈值不是 60 秒' }
-    if ($ens.IndexOf('SessionGuard start FAILED', $tp) -lt 0) { throw '守卫重拉失败没有留痕' }
-    '守卫激活时只记 skipped、不补抽屉；心跳 >60s 或进程不在就当场重拉；exe 不存在整段跳过'
-} -Hint '2026-11-15 13:32 写进运行目录的热补丁（SessionGuard 反作弊守卫）没进仓库；这段一旦丢了，玩游戏时 AutoHotkey 会被反作弊连坐'
+    if ($tp -lt 0) { throw 'ensure-all 没有守卫自愈段（守卫崩掉 / 睡眠假死后没人拉回来）' }
+    $blk2 = Get-Block $ens $tp
+    if ($blk2.IndexOf('guard-heartbeat.txt') -lt 0) { throw '守卫自愈没有按心跳判活（只判进程在不在，睡眠后就拉不回来）' }
+    if ($blk2 -notmatch '\$guardAge\s+-gt\s+60') { throw '守卫心跳的假死阈值不是 60 秒' }
+    if ($blk2.IndexOf('Stop-Process') -lt 0) { throw '守卫假死时没有先杀掉旧进程就重拉' }
+    if ($blk2.IndexOf('SessionGuard start FAILED') -lt 0) { throw '守卫重拉失败没有留痕' }
+
+    # ④ 行为：把 patch A 段取出来，用桩函数在沙箱里跑两种情形（不碰真实进程、不碰真实记号文件）
+    $mA = $ens.IndexOf('# >>> SessionGuard patch A >>>')
+    $mB = $ens.IndexOf('# <<< SessionGuard patch A <<<')
+    if ($mA -lt 0 -or $mB -le $mA) { throw '找不到 patch A 段（守卫判据被整段删了？）' }
+    $seg = $ens.Substring($mA, $mB - $mA)
+    $tmp = Join-Path $env:TEMP ('dsh_guard_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $out = Join-Path $tmp 'calls.txt'
+        [IO.File]::WriteAllText((Join-Path $tmp 'stub.exe'), '')
+        [IO.File]::WriteAllText((Join-Path $tmp 'stub.ahk'), '')
+        $head = @'
+$appDir = '__SAND__'
+function Log([string]$m) { [IO.File]::AppendAllText('__OUT__', 'log:' + $m + "`n") }
+function DrawerAlive { return $false }
+function StartHidden([string]$exe, $a) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n") }
+$ahkExe = Join-Path $appDir 'stub.exe'
+$ahkScript = Join-Path $appDir 'stub.ahk'
+'@ -replace '__SAND__', $tmp -replace '__OUT__', $out
+        $runner = [scriptblock]::Create($head + $seg)
+
+        # 情形一：守卫在跑（标记新鲜）→ 一次都不许启动，只记 skipped
+        [IO.File]::WriteAllText((Join-Path $tmp 'game-guard.on'), '')
+        & $runner
+        $c1 = [IO.File]::ReadAllText($out)
+        if ($c1 -match '(?m)^start$') { throw ('守卫标记新鲜时仍然启动了抽屉：' + $c1) }
+        if ($c1 -notmatch 'game guard active, skipped') { throw ('守卫活跃时没有记 skipped 日志：' + $c1) }
+
+        # 情形二：守卫已死（标记不在）→ 必须恰好补起一次
+        [IO.File]::Delete((Join-Path $tmp 'game-guard.on'))
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c2 = [IO.File]::ReadAllText($out)
+        if (([regex]::Matches($c2, '(?m)^start$')).Count -ne 1) { throw ('守卫不在时没有恰好补起一次抽屉：' + $c2) }
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+
+    '守卫新鲜时 0 次启动、只记 skipped；守卫不在时恰好补起 1 次；自愈按 60s 心跳判假死且在 Test-Path 闸内（静态 + 沙箱活体）'
+} -Hint '2026-11-15 13:32 写进运行目录的热补丁没进仓库；这段一旦丢了，玩游戏时 AutoHotkey 会被反作弊连坐（2026-11-17 入库并加锁）'
