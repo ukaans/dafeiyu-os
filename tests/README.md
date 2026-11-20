@@ -81,7 +81,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-002 | 编码契约：`.ps1` UTF-8 **带 BOM**、`.vbs` UTF-16LE、`.ahk` 无 BOM |
 | STA-003 | 壁纸 13 个 JS 过 `node --check` |
 | STA-004 | 27 个脚本过 `Parser::ParseFile` |
-| STA-005 | **源工程 ↔ `%LOCALAPPDATA%\DesktopPage` 逐字节一致**（不一致=改了半天跑的还是旧代码） |
+| STA-005 | **源工程 ↔ `%LOCALAPPDATA%\DesktopPage` 逐字节一致**（不一致=改了半天跑的不是仓库这份代码）。detail 里必须带**方向**：`源码较新`（→ 拷到运行时后重启）还是`运行时较新`（→ 先 diff，以运行时为准入库）。方向搞反会删掉跑在本机的前沿补丁且不报错（2026-11-17 游戏守卫差点被这样覆盖） |
 | STA-006 | 上游不可改文件（`app.js` / 两个 css / 两个 exe）未被改动 |
 | STA-007 | `app.js` 依赖的 6 个节点 id 仍在 `index.html` 里 |
 | STA-008 | 源码里没有个人绝对路径（`C:\Users\<你>`） |
@@ -100,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-021 | 滚轮桥存活走**互斥体**（不再按命令行匹配，探针会误匹配）；启动失败要留 stderr + boot 阶段痕迹；卡死按 pid 文件 + 心跳处理 |
 | STA-022 | **游戏守卫在跑时不补抽屉**：`SessionGuard` 的 `game-guard.on` 新鲜（≤120s）时 `ensure-all` 只记 `skipped`；守卫分支之后必须接回 `elseif (-not (DrawerAlive))`（拉起抽屉的代码不许落在守卫分支里）；守卫自愈要有 `Test-Path` 闸、心跳 >60s 或进程不在才重拉且失败留痕 |
 
-### 20-contract · 契约一致性（20 条）
+### 20-contract · 契约一致性（21 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | **代理端口单一配置源**：`drawer\agent-config.ps1` 里 `$AgentPort` 是唯一值；三个 ps1 dot-source 它（`-Port` 默认 0，不再写死）；代理启动写 `agent-port.txt` 与 Lively 目录 `port.js`，AHK / 壁纸都读生成物；`install.ps1` 也生成这两份。运行态再校验 `agent-port.txt` 与配置一致（2026-11-11，原 9 处写死 17433） |
@@ -123,6 +123,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-018 | **图标启动：带参快捷方式也必须走代理/队列**：`LaunchItem` 不许再按 `args = ""` 分流（带参 .lnk 会绕过代理直跑，AHK 祖先让鹰角启动器弹 `Load launcher failed, module init error`）；顺序必须是「代理 → 启动队列 → 直连兜底」（2026-11-08 明日方舟：终末地 `--game=Endfield --reason=4` 点一次弹一次） |
 | CON-019 | **rect 零矩形三端约定**：控制台隐藏时 `dsh.js` 必须显式上报 `x=0&y=0&w=0&h=0`（不能再退回 `aside` 兜底 —— `display:none` 的 `getBoundingClientRect()` 也是 0×0，与「没上报」无法区分）；代理 `Invoke-RectGif` 必须接受 `w=0` 并原子写 `0 0 0 0`；AHK `PanelRect` 读到 `w<=0` 必须返回零矩形且 `ConsoleUnderCursor` 判「不在控制台」（否则面板关掉后右侧栏继续吃滚轮，2026-11-11 修） |
 | CON-020 | **DockAdd 单写者**：AHK `DockAdd` 不许再 `FileAppend` / 自己拼 `DockFile()`，只能发 `AgentDockAdd(...)` → `/dock.gif?op=add`；查重、6 项上限、`Save-Dock` 原子覆盖全在代理。另断言 `op=del` 的整数 `i` 锚定行尾（`i=9831016285b4.png` 这类图标名不能被当 Int32，否则整条 add 返回 `{"ok":false}`，2026-11-11 实测踩到） |
+| CON-021 | **组件契约表与路由表对齐**：`drawer\components.md` 的「**路由**：」那一行必须把 `$script:ROUTES` 的 24 条 + `/icon/` 前缀一条不漏地列全，且不许写路由表里没有的（死路由）。管的是与 `CON-004`（项目地图 §3）**平行的第二份文档** —— 2026-11-20 实测它缺 `/log.js` `/reload.gif` `/dbg.gif` `/iconbuild.gif` `/icons.gif` 五条，排障时照它查「谁调这条接口」会查不到 |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -189,7 +190,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 | DAT-009 | **图标重建失败时不毁旧图标**：在临时副本上把 `Add-Type` 换成必抛异常，验证「非 0 退出 + 旧图标原样保留 + `icons.new-*` 暂存目录清理干净 + stderr 有 `add-type` 提示」。判据用 `ProcessStartInfo` 起子进程（本机 PS 5.1 的 `Start-Process -RedirectStandard*` 有 bug，会以「测试手法坏了」的形状假红，2026-11-15 修） |
 
-合计 91 条。
+合计 92 条。
 
 ---
 

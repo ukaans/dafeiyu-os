@@ -586,3 +586,31 @@ Test-Case CON-020 '契约' 'DockAdd 单写者：AHK 只发 op=add，不再直写
     if (-not $gb.Contains('i=(-?\d+)(?:&|$)')) { throw 'op=del 的整数 i 没有锚定行尾：图标名 i=9831016285b4.png 会被当 Int32 溢出，整条 add 返回 {"ok":false}' }
     'DockAdd 单写者：AHK 发 op=add，代理查重 / 限 6 / 原子落盘'
 } -Hint 'P2（2026-11-11）：AHK FileAppend 与代理 tmp+Move 并发时，代理会把刚追加的那条覆盖掉'
+
+Test-Case CON-021 '契约' '组件契约表与路由表对齐' medium {
+    # drawer\components.md 是三份组件之间的对外契约表。加接口时只改代码、不看它，
+    # 这张表就会静默漂 —— 2026-11-20 实测它缺 /log.js /reload.gif /dbg.gif /iconbuild.gif
+    # /icons.gif 五条，还写着「抽屉出站 /scroll.gif?d=」（抽屉根本不发，它直接追加 scroll.dat）。
+    # 排障时照着它查「谁调这条接口」会查不到，所以把这张表也钉住（与 CON-004 同级，管的是另一份文档）。
+    $t = Contract-RouteTable
+    $doc = Read-Raw (Join-Path (Get-DshRoot) 'drawer\components.md')
+    $m = [regex]::Match($doc, '\*\*路由\*\*：(.+?)(?:<br>|\r?\n)')
+    if (-not $m.Success) { throw 'components.md 里找不到「**路由**：…」那一行（契约表的锚点被改了）' }
+    $line = $m.Groups[1].Value
+
+    $known = @($t.Routes | ForEach-Object { $_.TrimEnd('*') } | Sort-Object -Unique)
+    $docSet = @()
+    foreach ($mm in [regex]::Matches($line, '/[a-z]+\.(?:gif|js)|/state\b|/icon/')) { $docSet += $mm.Value }
+    $docSet = @($docSet | Sort-Object -Unique)
+
+    $undoc = @($known | Where-Object { $docSet -notcontains $_ })
+    $dead = @($docSet | Where-Object { $known -notcontains $_ })
+
+    if ($undoc.Count -gt 0 -or $dead.Count -gt 0) {
+        $msg = @()
+        if ($undoc.Count -gt 0) { $msg += ('契约表漏了 ' + $undoc.Count + ' 条：' + ($undoc -join '、')) }
+        if ($dead.Count -gt 0) { $msg += ('契约表写了路由表里没有的：' + ($dead -join '、')) }
+        throw (($msg -join '；') + ' —— 现在共 ' + $known.Count + ' 条路由')
+    }
+    ('组件契约表与路由表一致（' + $known.Count + ' 条）')
+} -Hint '加路由 = $script:ROUTES 一行 + components.md 路由行 + 项目地图 §3 + 测试；三处缺一处就会漂'

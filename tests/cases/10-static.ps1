@@ -132,6 +132,7 @@ Test-Case STA-005 '静态' '源工程与运行时副本一致' high {
     $inst = Get-DshInstall
     if (-not (Test-Path -LiteralPath $inst)) { return @{ Status = 'skip'; Detail = '运行时目录不存在（还没安装）' } }
     $diff = @()
+    $newer = 0; $stale = 0
     foreach ($n in (Static-DeployedFiles)) {
         $s = Join-Path (Join-Path $root 'drawer') $n
         $d = Join-Path $inst $n
@@ -139,23 +140,43 @@ Test-Case STA-005 '静态' '源工程与运行时副本一致' high {
         if (-not (Test-Path -LiteralPath $d)) { $diff += ($n + '(运行时缺失)'); continue }
         $hs = Static-Sha $s; $hd = Static-Sha $d
         if ($hs -ne $hd) {
-            $ls = (Get-Item -LiteralPath $s).Length
-            $ld = (Get-Item -LiteralPath $d).Length
-            $t = (Get-Item -LiteralPath $s).LastWriteTime.ToString('MM-dd HH:mm')
+            $fs = Get-Item -LiteralPath $s
+            $fd = Get-Item -LiteralPath $d
+            $ls = $fs.Length
+            $ld = $fd.Length
+            $t = $fs.LastWriteTime.ToString('MM-dd HH:mm')
+            # 方向比"不一致"本身更要紧（2026-11-17 的教训）：运行时那份可能比仓库**新**，
+            # 因为功能是先在本机运行目录里改出来的（游戏守卫补丁就是这么来的）。
+            # 老 hint 一律说"把改动拷到运行时"，照着做会把运行中的补丁整段删掉，而且不报错。
+            $dirTag = ''
+            if ($fd.LastWriteTime -gt $fs.LastWriteTime.AddSeconds(2)) {
+                $dirTag = '，运行时较新 ' + $fd.LastWriteTime.ToString('MM-dd HH:mm')
+                $newer += 1
+            } elseif ($fs.LastWriteTime -gt $fd.LastWriteTime.AddSeconds(2)) {
+                $dirTag = '，源码较新 ' + $t
+                $stale += 1
+            }
             # 只差 BOM 的情况单独标出来：扣掉 BOM 后字节一致 → 部署漏了但逻辑没变，
             # 排障优先级低于"代码真不一样"
             if ((Static-ShaNoBom $s) -eq (Static-ShaNoBom $d)) {
-                $diff += ("$n(仅 BOM 差异：源码 ${ls}B/$t vs 运行时 ${ld}B)")
+                $diff += ("$n(仅 BOM 差异：源码 ${ls}B/$t vs 运行时 ${ld}B$dirTag)")
             } else {
-                $diff += ("$n(内容不同：源码 ${ls}B/$t vs 运行时 ${ld}B)")
+                $diff += ("$n(内容不同：源码 ${ls}B/$t vs 运行时 ${ld}B$dirTag)")
             }
         }
     }
     if ($diff.Count -gt 0) {
-        throw ('未同步 ' + $diff.Count + ' 个：' + ($diff -join '、') + ' —— 现在跑的是旧代码')
+        $tail = ' —— 现在跑的不是仓库里这份代码'
+        if ($newer -gt 0) {
+            $tail += '；' + $newer + ' 个是「运行时较新」：先 diff 再决定方向，直接把源码盖过去会删掉运行目录里先改的功能'
+        }
+        if ($stale -gt 0) {
+            $tail += '；' + $stale + ' 个是「源码较新」：拷到 %LOCALAPPDATA%\DesktopPage 后重启'
+        }
+        throw ('未同步 ' + $diff.Count + ' 个：' + ($diff -join '、') + $tail)
     }
     '运行时副本与源码逐字节一致'
-} -Hint '把改动拷到 %LOCALAPPDATA%\DesktopPage 后重启；只改源工程等于没改'
+} -Hint '先 diff 判方向：运行时较新 → 以运行时为准入库（照「拷到运行时」做会删掉正在跑的补丁）；源码较新 → 拷到 %LOCALAPPDATA%\DesktopPage 后重启；只改源工程等于没改'
 
 Test-Case STA-006 '静态' '上游不可改文件基线' medium {
     $root = Get-DshRoot
