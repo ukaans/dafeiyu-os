@@ -91,6 +91,54 @@ if (Test-Path $hb) {
 }
 if (Test-Tcp $AgentPort 600) { Ok "127.0.0.1:$AgentPort 可连接" } else { Bad "127.0.0.1:$AgentPort 连不上（代理没监听）" }
 
+Write-Host "== 游戏守卫（库外进程 SessionGuard）"
+# 守卫装在 %LOCALAPPDATA%\SessionGuard\，**不在本仓库**。它只做一件事：`[games]` 名单里有游戏
+# 在跑时让 AutoHotkey 退出（先 WM_CLOSE、1.5s 不退强杀），免得反作弊看见抽屉。它与桌面系统
+# 没有编译依赖，所以**没装不算失败**（换机 / 不玩游戏的机器本来就不会有）。
+# 判据给了 10 分钟宽限：ensure-all 每 2 分钟自愈一次，刚被重拉的那几秒里「进程在但心跳还没刷」
+# 或「进程还没起来」都是正常过渡，按秒判会变成每次重启都假红（11-14 那串 restart FAILED 的教训）。
+# 超过 10 分钟还没恢复，说明自愈也失败了，那时才判 FAIL，并把 ensure-all 里最后一次失败原文带上。
+$guardExe = Join-Path $env:LOCALAPPDATA 'SessionGuard\SessionGuard.exe'
+if (-not (Test-Path -LiteralPath $guardExe)) {
+    Info "本机没装游戏守卫（$guardExe 不存在）—— 与桌面系统无依赖，跳过"
+} else {
+    $guardDir   = Split-Path -Parent $guardExe
+    $guardBeat  = Join-Path $guardDir 'guard-heartbeat.txt'
+    $guardPidF  = Join-Path $guardDir 'guard.pid'
+    $guardProcs = @(Get-Process -Name 'SessionGuard' -ErrorAction SilentlyContinue)
+    $gAge = -1
+    if (Test-Path -LiteralPath $guardBeat) {
+        try { $gAge = [int]((Get-Date) - (Get-Item -LiteralPath $guardBeat).LastWriteTime).TotalSeconds } catch { $gAge = -1 }
+    }
+    $gProcOk = ($guardProcs.Count -gt 0)
+    $gBeatOk = ($gAge -ge 0 -and $gAge -le 60)
+    if ($gProcOk) { Ok ("游戏守卫运行中 (pid " + ($guardProcs.Id -join ',') + ")") }
+    else { Info "游戏守卫没在跑（ensure-all 每 2 分钟会补一次）" }
+    if ($gBeatOk) { Ok ("守卫心跳新鲜（{0:N0} 秒前）" -f $gAge) }
+    elseif ($gAge -lt 0) { Info "guard-heartbeat.txt 不存在（守卫从没写过心跳）" }
+    else { Info ("守卫心跳已 {0:N0} 秒没更新（>60s 视为卡死，ensure-all 会按 guard.pid 重拉）" -f $gAge) }
+
+    if (-not ($gProcOk -and $gBeatOk)) {
+        # 「多久没恢复」以心跳为准；心跳文件都没有就看 guard.pid，两个都没有 = 从没起来过，只提示
+        $gStale = $gAge
+        if ($gStale -lt 0 -and (Test-Path -LiteralPath $guardPidF)) {
+            try { $gStale = [int]((Get-Date) - (Get-Item -LiteralPath $guardPidF).LastWriteTime).TotalSeconds } catch { $gStale = -1 }
+        }
+        if ($gStale -gt 600) {
+            $gFail = $null
+            $egl = Join-Path $InstallDir 'ensure-all.log'
+            if (Test-Path $egl) {
+                $el = @(Get-Content $egl -Tail 200 -Encoding utf8 | Where-Object { $_ -match 'SessionGuard start FAILED' })
+                if ($el.Count -gt 0) { $gFail = $el[-1].Trim() }
+            }
+            if ($gFail) { Bad ("游戏守卫已 {0:N0} 秒没恢复，自愈也失败过：{1}" -f $gStale, $gFail) }
+            else { Bad ("游戏守卫已 {0:N0} 秒没恢复（进程={1}，心跳={2}s）—— 这期间开游戏，抽屉可能被误拉起" -f $gStale, $gProcOk, $gAge) }
+        } else {
+            Info ("守卫正在恢复中（进程=" + $gProcOk + "，心跳=" + $gAge + "s），10 分钟内不算失败")
+        }
+    }
+}
+
 Write-Host "== HTTP 接口"
 $state = ''
 foreach ($ep in @('/state.js','/log.js','/media.js','/scroll.js','/dock.js','/todo.gif','/rect.gif')) {

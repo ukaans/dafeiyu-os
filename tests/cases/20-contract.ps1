@@ -614,3 +614,78 @@ Test-Case CON-021 '契约' '组件契约表与路由表对齐' medium {
     }
     ('组件契约表与路由表一致（' + $known.Count + ' 条）')
 } -Hint '加路由 = $script:ROUTES 一行 + components.md 路由行 + 项目地图 §3 + 测试；三处缺一处就会漂'
+
+Test-Case CON-022 '契约' 'summon 命令表四处对齐（代码 / 契约表 / 速查表 / 数据文件）' medium {
+    # summon.cmd 是抽屉唯一的「文件召唤」入口（不依赖键鼠钩子）。同一批命令写在四个地方：
+    #   ① drawer\DesktopPage.ahk 的 $SUMMON_CMDS —— 真相
+    #   ② drawer\components.md 的「**文件命令**：」那半句
+    #   ③ 项目地图 §6.1 的故障速查表
+    #   ④ 项目地图 §5 的 `summon.cmd` 数据文件行
+    # 2026-11-21 实测 ④ 少了 rescan / rollback / snaptest 三条（11-14 才加的快照回滚与重扫），
+    # 照着 §5 排障的人会以为抽屉没有这两个入口。CON-021 只管「路由」那一行，这里管命令表。
+    $ahk = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+    $mapM = [regex]::Match($ahk, '(?s)global\s+SUMMON_CMDS\s*:=\s*Map\((.*?)\r?\n\)')
+    if (-not $mapM.Success) { throw 'DesktopPage.ahk 里找不到 $SUMMON_CMDS 表（锚点被改了）' }
+    $cmds = @()
+    $fns = @()
+    foreach ($m in [regex]::Matches($mapM.Groups[1].Value, '"([^"]+)"\s*,\s*\{\s*fn:\s*([A-Za-z0-9_]+)')) {
+        $cmds += $m.Groups[1].Value
+        $fns += $m.Groups[2].Value
+    }
+    $cmds = @($cmds | Sort-Object -Unique)
+    if ($cmds.Count -lt 3) { throw ('$SUMMON_CMDS 只解析出 ' + $cmds.Count + ' 条命令，解析规则和代码对不上了') }
+
+    # 每个命令的处理函数必须真的存在（改名或删函数后，表里那条就成了死引用）
+    $deadFn = @($fns | Sort-Object -Unique | Where-Object { $ahk -notmatch ('(?m)^[ \t]*' + [regex]::Escape($_) + '[ \t]*\(') })
+    if ($deadFn.Count -gt 0) { throw ('$SUMMON_CMDS 指向了不存在的函数：' + ($deadFn -join '、')) }
+
+    # 文档里一条命令可能写成 `foldertest=<路径>` / `log=<N>`，比对前把 <> 占位值抹掉
+    function script:Resolve-SummonToken([string]$t) {
+        $t = $t.Trim().Trim('`').Trim()
+        $t = $t -replace '=<[^>]*>\s*$', '='
+        return $t
+    }
+    function script:Split-SummonTokens([string]$s) {
+        $o = @()
+        foreach ($p in ($s -split '/')) {
+            $x = Resolve-SummonToken $p
+            if ($x -and $x -match '^[a-z]') { $o += $x }
+        }
+        return @($o | Sort-Object -Unique)
+    }
+
+    $msg = @()
+
+    $doc = Read-Raw (Join-Path (Get-DshRoot) 'drawer\components.md')
+    $dm = [regex]::Match($doc, '\*\*文件命令\*\*：.+?（(.+?)，表在')
+    if (-not $dm.Success) { throw 'components.md 里找不到「**文件命令**：…（…，表在 `SUMMON_CMDS`）」那句（锚点被改了）' }
+    $docCmds = Split-SummonTokens $dm.Groups[1].Value
+
+    $map = Read-Raw (Join-Path (Get-DshRoot) 'docs\项目地图.md')
+    $s61 = [regex]::Match($map, '(?s)### 6\.1.*?(?=\r?\n### 6\.2)')
+    if (-not $s61.Success) { throw '项目地图 里找不到 §6.1 那段（锚点被改了）' }
+    $quick = @()
+    foreach ($row in [regex]::Matches($s61.Value, '(?m)^\|[ \t]*([^|\r\n]+?)[ \t]*\|')) {
+        $cell = $row.Groups[1].Value
+        if ($cell -match '^内容$' -or $cell -match '^-+$') { continue }
+        $quick += Split-SummonTokens $cell
+    }
+    $quick = @($quick | Sort-Object -Unique)
+
+    foreach ($pair in @(@{ Name = 'components.md 的文件命令'; Set = $docCmds }, @{ Name = '项目地图 §6.1 速查表'; Set = $quick })) {
+        $miss = @($cmds | Where-Object { $pair.Set -notcontains $_ })
+        $extra = @($pair.Set | Where-Object { $cmds -notcontains $_ })
+        if ($miss.Count -gt 0) { $msg += ($pair.Name + ' 漏了 ' + $miss.Count + ' 条：' + ($miss -join '、')) }
+        if ($extra.Count -gt 0) { $msg += ($pair.Name + ' 写了表里没有的：' + ($extra -join '、')) }
+    }
+
+    # §5 那一列允许写 `<路径>` 占位、也允许 `edge=0|1` 合并写法，所以只要求命令名被提到
+    $s5 = [regex]::Match($map, '(?m)^\|[ \t]*`summon\.cmd`[ \t]*\|.*$')
+    if (-not $s5.Success) { throw '项目地图 §5 里找不到 `summon.cmd` 那一行' }
+    $bare = @($cmds | ForEach-Object { ($_ -replace '=.*$', '') } | Sort-Object -Unique)
+    $miss5 = @($bare | Where-Object { $s5.Value -notmatch [regex]::Escape($_) })
+    if ($miss5.Count -gt 0) { $msg += ('项目地图 §5 的 summon.cmd 行没提到：' + ($miss5 -join '、')) }
+
+    if ($msg.Count -gt 0) { throw (($msg -join '；') + ' —— 真相现在共 ' + $cmds.Count + ' 条命令') }
+    ('summon 命令表四处一致（' + $cmds.Count + ' 条，处理函数都在）')
+} -Hint '加 summon 命令 = $SUMMON_CMDS 一行 + Summon_CmdXxx 函数 + components.md 文件命令 + 项目地图 §5 与 §6.1'
