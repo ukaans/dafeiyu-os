@@ -100,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-021 | 滚轮桥存活走**互斥体**（不再按命令行匹配，探针会误匹配）；启动失败要留 stderr + boot 阶段痕迹；卡死按 pid 文件 + 心跳处理 |
 | STA-022 | **游戏守卫在跑时不补抽屉**：`SessionGuard` 的 `game-guard.on` 新鲜（≤120s）时 `ensure-all` 只记 `skipped`；守卫分支之后必须接回 `elseif (-not (DrawerAlive))`（拉起抽屉的代码不许落在守卫分支里）；守卫自愈要有 `Test-Path` 闸、心跳 >60s 或进程不在才重拉且失败留痕 |
 
-### 20-contract · 契约一致性（22 条）
+### 20-contract · 契约一致性（23 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | **代理端口单一配置源**：`drawer\agent-config.ps1` 里 `$AgentPort` 是唯一值；三个 ps1 dot-source 它（`-Port` 默认 0，不再写死）；代理启动写 `agent-port.txt` 与 Lively 目录 `port.js`，AHK / 壁纸都读生成物；`install.ps1` 也生成这两份。运行态再校验 `agent-port.txt` 与配置一致（2026-11-11，原 9 处写死 17433） |
@@ -125,6 +125,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-020 | **DockAdd 单写者**：AHK `DockAdd` 不许再 `FileAppend` / 自己拼 `DockFile()`，只能发 `AgentDockAdd(...)` → `/dock.gif?op=add`；查重、6 项上限、`Save-Dock` 原子覆盖全在代理。另断言 `op=del` 的整数 `i` 锚定行尾（`i=9831016285b4.png` 这类图标名不能被当 Int32，否则整条 add 返回 `{"ok":false}`，2026-11-11 实测踩到） |
 | CON-021 | **组件契约表与路由表对齐**：`drawer\components.md` 的「**路由**：」那一行必须把 `$script:ROUTES` 的 24 条 + `/icon/` 前缀一条不漏地列全，且不许写路由表里没有的（死路由）。管的是与 `CON-004`（项目地图 §3）**平行的第二份文档** —— 2026-11-20 实测它缺 `/log.js` `/reload.gif` `/dbg.gif` `/iconbuild.gif` `/icons.gif` 五条，排障时照它查「谁调这条接口」会查不到 |
 | CON-022 | **summon 命令表四处对齐**：`$SUMMON_CMDS`（真相）↔ `components.md` 的「**文件命令**」半句 ↔ `项目地图 §6.1` 速查表（这两处双向：漏了/多写都报）↔ `项目地图 §5` 的 `summon.cmd` 数据文件行（那一列允许 `<路径>` 占位，只要求命令名被提到）。另断言表里每个 `fn:` 都能在 `DesktopPage.ahk` 里找到同名函数定义（改名后留下死引用）。2026-11-21 实测 §5 少了 `rescan` / `rollback` / `snaptest` 三条（11-14 才加的快照回滚与重扫），照着它排障的人会以为抽屉没这两个入口 |
+| CON-023 | **summon 前缀命令：`prefix` 字段与 `SummonTick` 匹配逻辑一致**。三组断言：①静态形状 —— `SummonTick` 必须仍是「先精确（`SUMMON_CMDS.Has(cmd)`）再只对 `prefix:true` 走前缀」，`if !e.prefix` 后必须紧接 `continue`，前缀比较与取参仍是 `SubStr(cmd,1,StrLen(name))` / `SubStr(cmd,StrLen(name)+1)`；②表自洽 —— `prefix:true` 的名字必须以 `=` 结尾（否则任何以它开头的输入都被吞），`prefix:false` 的不许以 `=` 结尾（否则参数永远进不来），两两不许互为前缀（否则结果依赖声明顺序）；③可达性模拟 —— 按真实顺序跑一遍，12 条命令的样本必须各自唯一命中自己。2026-11-22 新增：这个字段此前没人盯，把 `log=` 改成 `prefix:false` 会让 `log=200` 永久不可达，而 `SummonTick` 对未知命令静默忽略、日志干净，表现成「写了 `summon.cmd` 没反应」 |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -191,7 +192,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 | DAT-009 | **图标重建失败时不毁旧图标**：在临时副本上把 `Add-Type` 换成必抛异常，验证「非 0 退出 + 旧图标原样保留 + `icons.new-*` 暂存目录清理干净 + stderr 有 `add-type` 提示」。判据用 `ProcessStartInfo` 起子进程（本机 PS 5.1 的 `Start-Process -RedirectStandard*` 有 bug，会以「测试手法坏了」的形状假红，2026-11-15 修） |
 
-合计 93 条。
+合计 94 条。
 
 ---
 

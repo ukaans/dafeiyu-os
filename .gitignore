@@ -13,6 +13,8 @@ tests/out/
 *_old*
 *.orig
 *.rej
+# 归档目录（备份 / 探针副本都 Move 到这里，不删文件）
+_backup_*/
 
 # ---- 代理 / 编辑器 / 系统 ----
 .workbuddy/

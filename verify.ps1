@@ -181,9 +181,49 @@ if (Test-Path $wheel) {
 
 $sal = Join-Path $InstallDir 'start-all.log'
 if (Test-Path $sal) {
-    $sl = @(Get-Content $sal -Tail 12 -Encoding utf8)
-    if (@($sl | Where-Object { $_ -match 'STILL DOWN' }).Count -ge 1) { Bad "start-all.log 出现 STILL DOWN（有东西没拉起来）" } else { Ok "start-all.log 无 STILL DOWN" }
-    if (@($sl | Where-Object { $_ -match 'done$' }).Count -ge 1) { Ok "启动链路最近一轮走到 done" } else { Info "start-all.log 最近没有 done" }
+    # 「末尾 N 行里出现过 STILL DOWN 就失败」是假红制造机：一轮启动只写 4~6 行，末 12 行
+    # 里能同时躺着两轮多，一次失败会连着红好几轮。历史上有两条（11-05 21:47、11-14 0:38），
+    # 之后几十轮全是 done —— 按老写法只要它还留在窗口里就一直报。与 RES-008 同一套判据：
+    # 按 "start: appDir=" 切轮次，只看最近一轮能判的：
+    #   有 done              → 成功，再确认这一轮没有 STILL DOWN
+    #   没 done 且 ≤120s     → 这一轮还在跑，跳过
+    #   没 done 且 >120s     → 卡住（11-05 那次 start-all.vbs 漏 Dim 就是这个形状）
+    $sl = @(Get-Content $sal -Tail 300 -Encoding utf8)
+    $rounds = @(); $cur = $null
+    foreach ($l in $sl) {
+        if ($l -match 'start:\s*appDir=') { if ($cur) { $rounds += , @($cur) }; $cur = @($l) }
+        elseif ($cur) { $cur += $l }
+    }
+    if ($cur) { $rounds += , @($cur) }
+    if ($rounds.Count -eq 0) {
+        Info "start-all.log 里没有轮次标记（start: appDir=），无从判断启动链"
+    } else {
+        $verdict = $null
+        for ($i = $rounds.Count - 1; $i -ge 0; $i--) {
+            $r = @($rounds[$i])
+            $ageSec = 999999.0
+            if ($r[0] -match '^(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}:\d{2})') {
+                # 小时不补零（11-14 那轮写的是 0:38:35），格式串用单字符 M/H
+                try { $ageSec = ((Get-Date) - [datetime]::ParseExact($matches[1], 'yyyy-M-d H:mm:ss', $null)).TotalSeconds } catch { $ageSec = 999999.0 }
+            }
+            $hasDone = [bool]($r -match 'done\s*$')
+            if (-not $hasDone -and $i -eq ($rounds.Count - 1) -and $ageSec -le 120) { continue }
+            $verdict = $r
+            break
+        }
+        if (-not $verdict) {
+            Info "启动链路最近一轮还在跑（≤120 秒未到 done，本轮不下结论）"
+        } else {
+            $down = @($verdict -match 'STILL DOWN')
+            if ($down.Count -gt 0) {
+                Bad ("启动链路最近一轮有 STILL DOWN：" + $down[-1])
+            } elseif (-not [bool]($verdict -match 'done\s*$')) {
+                Bad ("启动链路最近一轮卡住了（没走到 done，wscript 可能弹着模态框）：" + $verdict[-1])
+            } else {
+                Ok ("启动链路最近一轮走到 done，无 STILL DOWN（本轮 " + $verdict.Count + " 行 / 窗口内 " + $rounds.Count + " 轮）")
+            }
+        }
+    }
 } else { Info "start-all.log 不存在（还没通过计划任务启动过）" }
 
 $awl = Join-Path $InstallDir 'agent-watch.log'

@@ -689,3 +689,78 @@ Test-Case CON-022 '契约' 'summon 命令表四处对齐（代码 / 契约表 / 
     if ($msg.Count -gt 0) { throw (($msg -join '；') + ' —— 真相现在共 ' + $cmds.Count + ' 条命令') }
     ('summon 命令表四处一致（' + $cmds.Count + ' 条，处理函数都在）')
 } -Hint '加 summon 命令 = $SUMMON_CMDS 一行 + Summon_CmdXxx 函数 + components.md 文件命令 + 项目地图 §5 与 §6.1'
+Test-Case CON-023 '契约' 'summon 前缀命令：prefix 字段与 SummonTick 匹配逻辑一致' medium {
+    # $SUMMON_CMDS 里每条命令都带 prefix 字段，它决定这条命令怎么被匹配：
+    #   prefix: false → 只走精确匹配（SUMMON_CMDS.Has(cmd)），写的时候必须一字不差
+    #   prefix: true  → 精确匹配落空后再走前缀匹配，log=200 里的 200 就是参数
+    # 这个字段此前没有任何判据盯着。把它从 true 改成 false，log=200 立刻永久不可达
+    # （Has('log=200') 落空、前缀分支又被 if !e.prefix 跳过），而 SummonTick 对未知命令
+    # 是静默忽略、日志干净 —— 表现成「写了 summon.cmd 没反应」，跟文件通道坏了长得一样。
+    $ahk = Read-Raw (Join-Path (Get-DshRoot) 'drawer\DesktopPage.ahk')
+    $mapM = [regex]::Match($ahk, '(?s)global\s+SUMMON_CMDS\s*:=\s*Map\((.*?)\r?\n\)')
+    if (-not $mapM.Success) { throw 'DesktopPage.ahk 里找不到 $SUMMON_CMDS 表（锚点被改了）' }
+    $body = $mapM.Groups[1].Value
+
+    # 条目总数用「"名字", {」计：解析结果必须一条不少（格式一变宁可报错，不要静默少数）
+    $declared = ([regex]::Matches($body, '"[^"]+"\s*,\s*\{')).Count
+    $rows = @()
+    foreach ($m in [regex]::Matches($body, '"([^"]+)"\s*,\s*\{\s*fn:\s*([A-Za-z0-9_]+)\s*,\s*prefix:\s*(true|false)')) {
+        $rows += [pscustomobject]@{ Name = $m.Groups[1].Value; Fn = $m.Groups[2].Value; Prefix = ($m.Groups[3].Value -eq 'true') }
+    }
+    if ($rows.Count -eq 0) { throw '$SUMMON_CMDS 一条都没解析出来（解析规则和代码对不上了）' }
+    if ($rows.Count -ne $declared) { throw ('$SUMMON_CMDS 有 ' + $declared + ' 条，只解析出 ' + $rows.Count + ' 条 —— 有条目缺 fn 或 prefix 字段，那条命令会静默走不到') }
+
+    $msg = @()
+
+    # ---- ① 静态形状：SummonTick 必须仍是「先精确、再只对 prefix 走前缀」----
+    $st = [regex]::Match($ahk, '(?ms)^SummonTick\(\)\s*\{(.*?)^\}')
+    if (-not $st.Success) { throw 'DesktopPage.ahk 里找不到 SummonTick() 函数体（锚点被改了）' }
+    $stBody = $st.Groups[1].Value
+    $iExact = $stBody.IndexOf('SUMMON_CMDS.Has(cmd)')
+    $iLoop = $stBody.IndexOf('for name, e in SUMMON_CMDS')
+    if ($iExact -lt 0) { $msg += 'SummonTick 里没有精确匹配分支（SUMMON_CMDS.Has(cmd)）—— 无参命令会全落到前缀匹配上' }
+    if ($iLoop -lt 0) { $msg += 'SummonTick 里没有 for name, e in SUMMON_CMDS 前缀匹配循环' }
+    if ($iExact -ge 0 -and $iLoop -ge 0 -and $iExact -gt $iLoop) { $msg += 'SummonTick 的前缀循环跑在精确匹配前面 —— 短命令会抢走长命令（log= 抢 log=200）' }
+    if ($stBody -notmatch '(?m)^\s*if\s*!\s*e\.prefix\s*$') { $msg += 'SummonTick 的前缀循环不再过滤 e.prefix —— 所有命令都变前缀匹配（diagx 也会触发 diag）' }
+    elseif ($stBody -notmatch '(?m)^\s*if\s*!\s*e\.prefix\s*\r?\n\s*continue\s*$') { $msg += 'SummonTick 的 if !e.prefix 后面没有紧接 continue，前缀循环会继续往下走' }
+    if ($stBody -notmatch 'SubStr\(cmd,\s*1,\s*StrLen\(name\)\)\s*=\s*name') { $msg += 'SummonTick 的前缀比较不再是 SubStr(cmd, 1, StrLen(name)) = name' }
+    if ($stBody -notmatch 'SubStr\(cmd,\s*StrLen\(name\)\s*\+\s*1\)') { $msg += 'SummonTick 取参数不再是 SubStr(cmd, StrLen(name) + 1)' }
+
+    # ---- ② 表自洽：prefix 的取值必须与名字写法对得上 ----
+    foreach ($r in $rows) {
+        if ($r.Prefix -and -not $r.Name.EndsWith('=')) {
+            $msg += ('"' + $r.Name + '" 标了 prefix: true 却不以 = 结尾 —— 任何以它开头的输入都会被吞掉')
+        }
+        if (-not $r.Prefix -and $r.Name.EndsWith('=')) {
+            $msg += ('"' + $r.Name + '" 带 = 却是 prefix: false —— 参数永远进不来，只有一字不差写 "' + $r.Name + '" 才命中')
+        }
+    }
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        for ($j = 0; $j -lt $rows.Count; $j++) {
+            if ($i -eq $j) { continue }
+            if ($rows[$i].Name.Length -lt $rows[$j].Name.Length -and $rows[$j].Name.StartsWith($rows[$i].Name)) {
+                $msg += ('"' + $rows[$i].Name + '" 是 "' + $rows[$j].Name + '" 的前缀 —— 结果依赖声明顺序，改成后者先声明就会抢走前者')
+            }
+        }
+    }
+
+    # ---- ③ 可达性模拟：按 SummonTick 的真实顺序跑一遍，每条命令的样本必须命中自己 ----
+    function script:Resolve-SummonCmd([string]$cmd, $table) {
+        foreach ($e in $table) { if ($e.Name -eq $cmd) { return $e } }      # 精确（Map 键查找）
+        foreach ($e in $table) {                                            # 前缀（只对 prefix:true）
+            if (-not $e.Prefix) { continue }
+            if ($cmd.StartsWith($e.Name)) { return $e }
+        }
+        return $null
+    }
+    foreach ($r in $rows) {
+        $sample = if ($r.Prefix) { $r.Name + 'SAMPLE' } else { $r.Name }
+        $hit = Resolve-SummonCmd $sample $rows
+        if (-not $hit) { $msg += ('"' + $sample + '" 一条路径都命中不了（这条命令实际不可用）') }
+        elseif ($hit.Name -ne $r.Name) { $msg += ('"' + $sample + '" 命中的是 "' + $hit.Name + '" 而不是 "' + $r.Name + '"') }
+    }
+
+    $nPrefix = @($rows | Where-Object { $_.Prefix }).Count
+    if ($msg.Count -gt 0) { throw (($msg -join '；') + ' —— 表里共 ' + $rows.Count + ' 条（prefix:true ' + $nPrefix + ' 条）') }
+    ('前缀语义一致（' + $rows.Count + ' 条命令：prefix:true ' + $nPrefix + ' 条，每条都能唯一命中自己）')
+} -Hint '带参命令写成 "xxx=" + prefix: true；无参命令写成 "xxx" + prefix: false。改 prefix 前先想清楚 SummonTick 是先精确、再只对 prefix 走前缀'
