@@ -4,6 +4,7 @@
 $mtx = New-Object System.Threading.Mutex($false, 'Global\DesktopPage_wxmon')
 if (-not $mtx.WaitOne(0)) { exit 0 }
 $pidFile = Join-Path $env:LOCALAPPDATA 'DesktopPage\wxmon.pid'
+$hbFile  = Join-Path $env:LOCALAPPDATA 'DesktopPage\wxmon.hb'
 [System.IO.File]::WriteAllText($pidFile, "$PID")
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
@@ -332,6 +333,17 @@ while ($true) {
             Move-Item -LiteralPath $tmpFile -Destination $outFile -Force
         } catch { }
     }
+
+    # 每轮写一次心跳（2026-11-24 新增）：ensure-all.ps1 靠「pid 在 + 心跳新鲜」区分
+    # 「活着」与「卡在某个调用里」。实测那次 wxmon 进程还在、wx-data.js 12 小时没写 ——
+    # 采样循环卡在一个没有超时的调用里（-TimeoutSec 管不到 DNS 解析），日志一行不写、
+    # 天气面板冻在前一晚的温度上；只有心跳能让 2 分钟兜底巡检看出「它不动了」。
+    try {
+        [System.IO.File]::WriteAllText($hbFile + '.tmp',
+            ("ts=" + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + "`r`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath ($hbFile + '.tmp') -Destination $hbFile -Force
+    } catch { }
 
     Start-Sleep -Seconds $Interval
 }

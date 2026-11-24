@@ -2490,13 +2490,24 @@ BridgeAnnounce() {
     ; 写入用「临时文件 + 覆盖移动」，避免桥正好读在 FileDelete 与 FileAppend 之间的空窗。
     ; 注意：AHK v2 的 FileDelete 在「没有文件可删」时会抛 (2) 系统找不到指定的文件，
     ; 所以它必须单独 try —— 放在同一个 try 里会让整个落盘流程一次都不执行（2026-11-05 踩过）。
-    tmp := BRIDGE_FILE ".tmp"
+    ; tmp 名字带 pid：两份抽屉并存时（单实例保险的漏网情况）共用同一个 tmp 会撞
+    ; ERROR_SHARING_VIOLATION(32)，announce 直接失败、桥停在旧 hwnd 上（2026-11-24 实测
+    ; 日志里连续多条「err=(32) 另一个程序正在使用此文件」）。覆盖仍会互相顶掉，但那时
+    ; 谁先写谁赢、写进去的都是活着的 hwnd，不会再「谁都写不进去」。
+    ; 本机 AHK v2.0.31 没有 A_ProcessID 这个内置变量（2026-11-24 实测：「This local variable has not
+    ; been assigned a value.」，announce 直接失败），pid 一律走 DllCall，与写 drawer.pid 那处一致。
+    tmp := BRIDGE_FILE "." DllCall("GetCurrentProcessId", "UInt") ".tmp"
     try FileDelete(tmp)
     try {
         FileAppend(A_ScriptHwnd "`n", tmp, "UTF-8")
         FileMove(tmp, BRIDGE_FILE, 1)
     } catch as e {
-        LogWrite("bridge: announce 落盘失败 file=" BRIDGE_FILE " err=" e.Message)
+        Sleep 15
+        try {
+            FileMove(tmp, BRIDGE_FILE, 1)
+        } catch as e2 {
+            LogWrite("bridge: announce 落盘失败 file=" BRIDGE_FILE " err=" e2.Message)
+        }
     }
     if (A_TickCount - BRIDGE_ANNOUNCE_LOG > 60000) {
         BRIDGE_ANNOUNCE_LOG := A_TickCount

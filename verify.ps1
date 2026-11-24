@@ -174,8 +174,23 @@ Write-Host "== 日志健康"
 $wheel = Join-Path $InstallDir 'wheel.log'
 if (Test-Path $wheel) {
     $wl = @(Get-Content $wheel -Tail 400 -Encoding utf8)
-    $errs = @($wl | Where-Object { $_ -match 'ERROR' })
-    if ($errs.Count -eq 0) { Ok "wheel.log 末 400 行无 ERROR" } else { Bad ("wheel.log 有 $($errs.Count) 条 ERROR，末条：" + $errs[-1]) }
+    # 「末 400 行出现过 ERROR 就失败」是假红制造机（与 start-all.log 的 -Tail 12 是同一个病）：
+    # wheel.log 只在事件时写，一次历史 ERROR 会一直红下去 —— 2026-11-24 实测：12:21 那版脚本
+    # 的 `A_ProcessID` 未定义报错留在日志里，12:22 修好重启后 verify 仍然红，而当时抽屉一切正常。
+    # 改成按轮次判：抽屉每次启动写一行 `startup: items=`，只看**最后一次启动之后**的 ERROR。
+    # 没找到 startup 行（日志刚轮转 / 刚装）才退回按全窗口判。
+    $lastStart = -1
+    for ($i = 0; $i -lt $wl.Count; $i++) { if ($wl[$i] -match 'startup: items=') { $lastStart = $i } }
+    $scope = '末 400 行'
+    if ($lastStart -ge 0) {
+        $scope = "本次启动之后（从第 $($lastStart + 1) 行起）"
+        $tail = @()
+        if ($lastStart -lt ($wl.Count - 1)) { $tail = @($wl[($lastStart + 1)..($wl.Count - 1)]) }
+        $errs = @($tail | Where-Object { $_ -match 'ERROR' })
+    } else {
+        $errs = @($wl | Where-Object { $_ -match 'ERROR' })
+    }
+    if ($errs.Count -eq 0) { Ok ("wheel.log $scope 无 ERROR") } else { Bad ("wheel.log $scope 有 $($errs.Count) 条 ERROR，末条：" + $errs[-1]) }
     if (@($wl | Where-Object { $_ -match 'rawinput: register=1' }).Count -ge 1) { Ok "滚轮 Raw Input 已注册" } else { Info "wheel.log 里没看到 rawinput: register=1" }
 } else { Bad "wheel.log 不存在" }
 

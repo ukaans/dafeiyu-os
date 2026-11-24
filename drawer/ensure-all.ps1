@@ -130,6 +130,21 @@ function DrawerAlive {
         try { $nm = (Get-Process -Id $dp).ProcessName } catch { }
         if ($nm -like 'AutoHotkey*') { return $true }
     }
+    # 兜底二（2026-11-24）：抽屉要到启动末段才写 drawer.pid（前面 LoadItems / RestoreIconState
+    # 还要走代理，实测 40 秒以上），这段窗口里 pid 文件已被上一实例的 OnExit 删掉、gDrawer
+    # 也还没建 —— 旧判据直接判死，于是每 2 分钟拉一个新实例。11-23 21:33:03 就是这样起了
+    # 第二份，两份并存 15 小时（announce 每 30 秒互相覆盖，桥在两个 hwnd 之间来回切）。
+    # 给「刚起来、还没自报家门」的实例 120 秒宽限，与 agent-watch.ps1 的 45 秒宽限同一个思路。
+    $starting = @()
+    try {
+        $starting = @(Get-Process -Name 'AutoHotkey64' -ErrorAction SilentlyContinue |
+            Where-Object { ((Get-Date) - $_.StartTime).TotalSeconds -lt 120 })
+    } catch { $starting = @() }
+    if ($starting.Count -gt 0) {
+        $age = [int]((Get-Date) - $starting[0].StartTime).TotalSeconds
+        Log ('ensure: drawer starting (pid=' + $starting[0].Id + ', age=' + $age + 's), left alone')
+        return $true
+    }
     return $false
 }
 
@@ -284,6 +299,31 @@ if (-not (ProcAlive $agentPid)) {
 } elseif (-not (AgentHealthy)) {
     Log ('ensure: agent alive but unhealthy (pid=' + $agentPid + '), left to watch')
 }
+# 3b) 采样进程（wxmon 300s 一轮）—— 2026-11-24 新增
+# 为什么：本脚本管抽屉、代理、看门狗、桥、守卫，唯独采样脚本没人管。它们死了天气面板就冻在
+# 最后一帧；更糟的是「进程还在、循环卡住」用 pid 完全看不出来 —— 2026-11-24 实测 wxmon 活了
+# 12 小时、wx-data.js 一个字节没写（卡在一个没有超时的调用里，-TimeoutSec 管不到 DNS）。
+# 判据：pid 不在 → 拉起；pid 在但心跳（wxmon.hb，每轮写一次）超过 3 个周期 → 杀掉重拉。
+# 与桥的处理同构（定点杀 + 当场拉），不把恢复留给下一轮。没有心跳文件时不判杀（首次安装）。
+$wxPidF   = Join-Path $appDir 'wxmon.pid'
+$wxHbF    = Join-Path $appDir 'wxmon.hb'
+$wxScript = Join-Path $appDir 'wxmon.ps1'
+if (Test-Path $wxScript) {
+    $wxPid = ReadPid $wxPidF
+    $wxAge = -1
+    if (Test-Path $wxHbF) { $wxAge = [int]((Get-Date) - (Get-Item $wxHbF).LastWriteTime).TotalSeconds }
+    $wxArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $wxScript + '"'))
+    if (-not (ProcAlive $wxPid)) {
+        StartHidden 'powershell.exe' $wxArgs
+        Log ('ensure: wxmon missing (pid=' + $wxPid + '), started')
+    } elseif ($wxAge -gt 900) {
+        & taskkill.exe /PID $wxPid /T /F 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 300
+        StartHidden 'powershell.exe' $wxArgs
+        Log ('ensure: wxmon hung (no heartbeat ' + $wxAge + 's), killed pid=' + $wxPid + ', restarted')
+    }
+}
+
 # 4) 启动队列：抽屉点图标时代理不在 → 它写 launch-queue.txt 而不是让 AHK 自己 Run
 #    （AHK 祖先会让鹰角启动器报 Load launcher failed）。看门狗通常 1 秒内就处理了；
 #    这里处理"看门狗也死了"的情形，阈值放宽到 3 分钟，超过就丢弃并记日志。
