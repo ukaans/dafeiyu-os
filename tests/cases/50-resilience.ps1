@@ -13,7 +13,14 @@ function Res-ReadLog([string]$path, [int]$maxLines = 300) {
         # start-all.log 是 UTF-16（vbs 写的），其余是 UTF-8：按 BOM 判
         $b = Read-FirstBytes $path 2
         $enc = if ($b.Length -ge 2 -and $b[0] -eq 0xFF -and $b[1] -eq 0xFE) { [System.Text.Encoding]::Unicode } else { [System.Text.Encoding]::UTF8 }
-        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        # 重试：AHK 每次 FileAppend 都会短暂独占这些日志（share 权限给得很小），
+        # 读的时候正撞上就是「正由另一进程使用」。撞上要重读，不能当成判据失败（2026-11-25）。
+        $fs = $null
+        for ($try = 0; $try -lt 8; $try++) {
+            try { $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite'); break }
+            catch { Start-Sleep -Milliseconds 80 }
+        }
+        if (-not $fs) { return @() }
         try {
             $sr = New-Object System.IO.StreamReader($fs, $enc)
             $all = $sr.ReadToEnd(); $sr.Dispose()
@@ -313,6 +320,9 @@ Test-Case RES-009 '健壮' '采样进程在持续写数据' medium {
     $inst = Get-DshInstall
     $awake = Get-DshAwake
     $awakeSec = if ($awake) { [int]$awake.Seconds } else { -1 }
+    # 宽限只给「一个看护周期」（900s = ensure-all 判 wxmon 假死的阈值），不按年龄放开：
+    # 否则机器每醒一次就把过期全部解释掉，真卡死也能躲过去。
+    $grace = 900
     $bad = @()
     $soft = @()
     $rows = @()
@@ -327,9 +337,9 @@ Test-Case RES-009 '健壮' '采样进程在持续写数据' medium {
         if ($age -le $c.MaxAgeSec) { continue }
         $msg = $c.File + ' 已 ' + $age + 's 没更新（阈值 ' + $c.MaxAgeSec + 's）'
         $pAge = Res-SamplerAge $inst $c.Pid
-        if ($awakeSec -ge 0 -and $awakeSec -lt $age) {
-            $soft += ($msg + '；机器 ' + $awakeSec + 's 前才恢复通电（此前睡眠，计时被冻结）')
-        } elseif ($pAge -ge 0 -and $pAge -lt ($age + 60)) {
+        if ($awakeSec -ge 0 -and $awakeSec -lt $grace) {
+            $soft += ($msg + '；机器 ' + $awakeSec + 's 前才恢复通电（睡眠期间计时被冻结，不足一个判据周期）')
+        } elseif ($pAge -ge 0 -and $pAge -lt ($c.MaxAgeSec + 300)) {
             $soft += ($msg + '；采样进程 ' + $pAge + 's 前才启动，第一轮还没落盘')
         } else {
             $bad += $msg
@@ -570,7 +580,6 @@ Test-Case RES-014 '健壮' '文件召唤：删掉才算消费（AHK SummonTick�
         }
     }
     if ($bad.Count -gt 0) { throw ($bad -join '；') }
-    if ($bad.Count -gt 0) { throw ($bad -join '；') }
 
     # 活体：走**文件通道**写一条 diag（和 RUN-011 同一条路）。
     # 不要用 /summon.gif：那条路由只认 d=1|hide，其余一律写 show —— 深夜会把抽屉弹开。
@@ -582,7 +591,15 @@ Test-Case RES-014 '健壮' '文件召唤：删掉才算消费（AHK SummonTick�
     $countDiag = {
         param($p)
         if (-not (Test-Path -LiteralPath $p)) { return 0 }
-        $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+        $fs = $null
+        # AHK 每次 FileAppend 都会独占 wheel.log 一小会儿（shared 权限只给读或干脆不给）。
+        # 2026-11-25 的整轮测试就被撞上过：`RES-014` 报「正由另一进程使用，因此该进程无法访问此文件」
+        # —— 那是「撞上写入」，不是判据失败。读它必须重试（与 DAT-005 快照同一条教训）。
+        for ($try = 0; $try -lt 8; $try++) {
+            try { $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite'); break }
+            catch { Start-Sleep -Milliseconds 80 }
+        }
+        if (-not $fs) { throw ('连续 8 次都读不到（一直被别的进程独占）：' + $p) }
         try { $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8); $all = $sr.ReadToEnd(); $sr.Dispose() } finally { $fs.Dispose() }
         return @([regex]::Matches($all, 'diag:')).Count
     }
@@ -869,7 +886,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 function Log([string]$m) { [IO.File]::AppendAllText('__OUT__', 'log:' + $m + "`n") }
 function ReadPid([string]$p) { if (Test-Path -LiteralPath $p) { return 999998 } return 0 }
 function ProcAlive([int]$q) { return ($q -eq 999998) }
-function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n"); return $true }
+function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n") }
 '@ -replace '__SAND__', $tmp -replace '__OUT__', $out
         $runner = [scriptblock]::Create($head + "`n" + $seg)
 

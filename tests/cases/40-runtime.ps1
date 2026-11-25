@@ -333,3 +333,31 @@ Test-Case RUN-013 '运行时' 'log.js 会话正文通道可用' high {
     }
     ('__DSH_LOG ' + $b.Length + ' 字符（' + $r.Ms + 'ms）；sig=' + $sig)
 } -Hint '红了先 curl http://127.0.0.1:17433/log.js 看回包；sig 一直不变说明 Get-LogSig 读不到 dsh-run.log（代理没权限或路径不对）'
+
+Test-Case RUN-014 '运行时' 'wxmon 心跳新鲜（进程在且循环在转）' medium {
+    # pid 只能证明进程还在；「进程在、循环不动」是这台机器上真实发生过的静默故障
+    # （2026-11-24 冻 12 小时、2026-11-25 睡眠后延迟两分半），两种都只有心跳看得出来。
+    # 阈值与 ensure-all 的采样段一致：900s（3 个周期）。机器刚恢复通电时按清晰度折算 ——
+    # 睡眠期间心跳本来就写不出来，那不是故障。
+    $inst = Get-DshInstall
+    $hb = Join-Path $inst 'wxmon.hb'
+    if (-not (Test-Path -LiteralPath $hb)) { throw '没有 wxmon.hb：采样进程从没写过心跳，ensure-all 判不出「进程在但不动」' }
+    $raw = [System.IO.File]::ReadAllText($hb)
+    if ($raw -notmatch 'ts=(\d{10,})') { throw ('wxmon.hb 内容不是 ts=<epoch毫秒>：' + $raw.Trim()) }
+    $tsMs = [long]$Matches[1]
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if (($nowMs - $tsMs) -lt -120000) { throw ('wxmon.hb 的时间戳在未来 ' + [int](($tsMs - $nowMs) / 1000) + 's（时钟或写入逻辑有问题）') }
+    $age = [int]((Get-Date) - (Get-Item -LiteralPath $hb).LastWriteTime).TotalSeconds
+    $limit = 900
+    $awake = Get-DshAwake
+    $awakeSec = if ($awake) { [int]$awake.Seconds } else { -1 }
+    if ($awakeSec -ge 0 -and $awakeSec -lt $limit) {
+        return ('心跳 ' + $age + 's 前；机器 ' + $awakeSec + 's 前才恢复通电（阈值 ' + $limit + 's 内不判）')
+    }
+    if ($age -gt $limit) {
+        throw ('心跳已 ' + $age + 's 没更新（阈值 ' + $limit + 's）—— 进程在但循环停了，等 ensure-all 的采样段兜底' )
+    }
+    $pidTxt = ''
+    try { $pidTxt = ([System.IO.File]::ReadAllText((Join-Path $inst 'wxmon.pid'))).Trim() } catch { }
+    ('心跳 ' + $age + 's 前（阈值 ' + $limit + 's）；pid=' + $pidTxt)
+} -Hint '心跳停了但进程还在 = 卡在某个调用里（wxmon.log 末行能看到卡在哪一步）；ensure-all 每 2 分钟按 900s 判一次并定点重拉'
