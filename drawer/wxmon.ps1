@@ -345,5 +345,18 @@ while ($true) {
         Move-Item -LiteralPath ($hbFile + '.tmp') -Destination $hbFile -Force
     } catch { }
 
-    Start-Sleep -Seconds $Interval
+    # 睡到「墙钟上的截止时刻」，不再用 Start-Sleep -Seconds $Interval（2026-11-25 修复）：
+    # 系统睡眠会冻结 Start-Sleep 的计时器，醒来后它还要把「剩余时间」睡完 —— 实测 00:21 睡下、
+    # 12:31:49 唤醒，wx-data.js 到 12:34 才更新，天气面板在唤醒后两分半里显示的是昨晚的温度。
+    # 改成每 5 秒看一眼墙钟：睡多久都不影响，唤醒后最多 5 秒就进入下一轮（RES-021 咬住）。
+    $deadline = (Get-Date).AddSeconds($Interval)
+    $roundEnd = Get-Date
+    while ($true) {
+        $left = ($deadline - (Get-Date)).TotalSeconds
+        if ($left -le 0) { break }
+        if ($left -gt 5) { Start-Sleep -Seconds 5 } else { Start-Sleep -Milliseconds 300 }
+    }
+    # 睡过头（合盖 / 睡眠 / 休眠）要留痕：否则「醒来数据是旧的」只能靠猜
+    $gap = [int]((Get-Date) - $roundEnd).TotalSeconds
+    if ($gap -gt ($Interval + 120)) { Write-WxLog ('wake gap ' + $gap + 's, refreshing now') }
 }

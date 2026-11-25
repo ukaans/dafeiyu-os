@@ -60,6 +60,43 @@ function Read-Raw([string]$path) {
     return [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
 }
 
+# ---------------------------------------------------------------- 系统「清醒时长」
+
+# 为什么需要它（2026-11-25 教训）：这台机器晚上是睡眠的，不是关机。睡眠期间常驻脚本的
+# Start-Sleep 计时会被冻结（实测：00:21 睡下、12:31 唤醒，wxmon 还要把剩下 300 秒睡完，
+# wx-data.js 到 12:34 才更新）。于是「唤醒后立刻跑的那一轮测试」必然看到采样数据过期
+# 43 分钟~12 小时 —— 这是判据不认识「机器刚醒」，不是采样进程坏了。
+# 判据里想区分这两件事，就得知道「机器真正醒着多久」。取开机时间与最近一次
+# Power-Troubleshooter 的「已从低功耗状态恢复」事件，取较晚的那个；读不到返回 $null。
+$script:DshAwakeCache = $null
+function Get-DshAwake {
+    if ($null -ne $script:DshAwakeCache) { return $script:DshAwakeCache }
+    $now = Get-Date
+    $t = $null
+    try {
+        $t = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+    } catch { }
+    try {
+        $e = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Power-Troubleshooter'; Id = 1 } -MaxEvents 5 -ErrorAction Stop |
+            Sort-Object TimeCreated -Descending)
+        if ($e.Count -gt 0 -and $e[0].TimeCreated) {
+            if (-not $t -or $e[0].TimeCreated -gt $t) { $t = $e[0].TimeCreated }
+        }
+    } catch { }
+    try {
+        $e2 = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 107 } -MaxEvents 5 -ErrorAction Stop |
+            Sort-Object TimeCreated -Descending)
+        if ($e2.Count -gt 0 -and $e2[0].TimeCreated) {
+            if (-not $t -or $e2[0].TimeCreated -gt $t) { $t = $e2[0].TimeCreated }
+        }
+    } catch { }
+    if (-not $t) { $script:DshAwakeCache = $null; return $null }
+    $sw = [int]($now - $t).TotalSeconds
+    if ($sw -lt 0) { $sw = 0 }
+    $script:DshAwakeCache = @{ Seconds = $sw; Since = $t }
+    return $script:DshAwakeCache
+}
+
 function Read-FirstBytes([string]$path, [int]$n = 4) {
     $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
     try {

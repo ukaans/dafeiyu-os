@@ -29,6 +29,20 @@ function Res-Size([string]$path) {
     return (Get-Item -LiteralPath $path).Length
 }
 
+# 采样进程（hwmon / wxmon）的进程年龄：<pid>.pid 里的 pid 还活着就返回秒数，否则 -1。
+# 用途：分辨「数据过期是因为进程刚起、还没走完一轮」和「进程一直在、就是不动了」。
+function Res-SamplerAge([string]$inst, [string]$name) {
+    try {
+        $pf = Join-Path $inst ($name + '.pid')
+        if (-not (Test-Path -LiteralPath $pf)) { return -1 }
+        $v = ([System.IO.File]::ReadAllText($pf)).Trim()
+        if ($v -notmatch '^\d+') { return -1 }
+        $pr = Get-Process -Id ([int](($v -split '\|')[0])) -ErrorAction SilentlyContinue
+        if (-not $pr) { return -1 }
+        return [int]((Get-Date) - $pr.StartTime).TotalSeconds
+    } catch { return -1 }
+}
+
 function Res-KB([long]$b) { return ([math]::Round($b / 1KB, 1).ToString() + 'KB') }
 
 Test-Case RES-001 '健壮' '无轮转的日志会无限增长' medium {
@@ -288,21 +302,43 @@ Test-Case RES-008 '健壮' '启动链没有失败记录' high {
 Test-Case RES-009 '健壮' '采样进程在持续写数据' medium {
     $wall = Get-DshWall
     if (-not $wall -or -not (Test-Path -LiteralPath $wall)) { return @{ Status = 'skip'; Detail = '没解析到壁纸目录' } }
+    # 「过期」有两种，2026-11-25 之前只认第一种：
+    #   ①采样进程真的不动了（11-24 那次：进程在、12 小时没写盘）→ 必须红；
+    #   ②机器刚睡醒 / 刚开机 —— 常驻脚本的 Start-Sleep 计时跟进程一起被冻结（实测 12:31:49
+    #     唤醒时 wx-data.js 还是 00:21 的，12:34 才由 wxmon 自己补上；那轮首跑就报了 43853s）。
+    # ②照旧判红，等于每天早上醒来第一条就是假红（红一多就没人看）。所以过期时再取两个证据：
+    # 机器真醒着多久（Get-DshAwake）、采样进程活了多久。过期窗口里只要有一段「机器不在」
+    # 或「进程不在」，说明这段空窗不是采样逻辑的错 → 降级 warn 并写清；机器全程醒着、
+    # 进程也一直在，仍然 fail。
+    $inst = Get-DshInstall
+    $awake = Get-DshAwake
+    $awakeSec = if ($awake) { [int]$awake.Seconds } else { -1 }
     $bad = @()
+    $soft = @()
     $rows = @()
     foreach ($c in @(
-            @{ File = 'hw-data.js'; MaxAgeSec = 15 }
-            @{ File = 'wx-data.js'; MaxAgeSec = 330 }
+            @{ File = 'hw-data.js'; MaxAgeSec = 15; Pid = 'hwmon' }
+            @{ File = 'wx-data.js'; MaxAgeSec = 330; Pid = 'wxmon' }
         )) {
         $p = Join-Path $wall $c.File
         if (-not (Test-Path -LiteralPath $p)) { $bad += ($c.File + ' 不存在'); continue }
-        $age = ((Get-Date) - (Get-Item -LiteralPath $p).LastWriteTime).TotalSeconds
-        $rows += ($c.File + ' ' + [int]$age + 's')
-        if ($age -gt $c.MaxAgeSec) { $bad += ($c.File + ' 已 ' + [int]$age + 's 没更新（阈值 ' + $c.MaxAgeSec + 's）') }
+        $age = [int]((Get-Date) - (Get-Item -LiteralPath $p).LastWriteTime).TotalSeconds
+        $rows += ($c.File + ' ' + $age + 's')
+        if ($age -le $c.MaxAgeSec) { continue }
+        $msg = $c.File + ' 已 ' + $age + 's 没更新（阈值 ' + $c.MaxAgeSec + 's）'
+        $pAge = Res-SamplerAge $inst $c.Pid
+        if ($awakeSec -ge 0 -and $awakeSec -lt $age) {
+            $soft += ($msg + '；机器 ' + $awakeSec + 's 前才恢复通电（此前睡眠，计时被冻结）')
+        } elseif ($pAge -ge 0 -and $pAge -lt ($age + 60)) {
+            $soft += ($msg + '；采样进程 ' + $pAge + 's 前才启动，第一轮还没落盘')
+        } else {
+            $bad += $msg
+        }
     }
     if ($bad.Count -gt 0) { throw ($bad -join '、' + ' —— 面板会一直是 --') }
+    if ($soft.Count -gt 0) { return @{ Status = 'warn'; Detail = (($soft -join '；') + '（' + ($rows -join '，') + '）') } }
     ($rows -join '，')
-} -Hint 'hwmon 2s 一轮、wxmon 300s 一轮；没更新先看对应 pid 与 Resolve-WallpaperDir() 解析到的目录'
+} -Hint 'hwmon 2s 一轮、wxmon 300s 一轮；wxmon 卡死由 ensure-all 的采样段（h* 心跳 900s）兜底。红了先看 wxmon.hb / hwmon 的 pid 与 Resolve-WallpaperDir() 解析到的目录，再看机器是不是刚从睡眠恢复'
 
 Test-Case RES-010 '健壮' '滚轮意图队列有上限' medium {
     # scroll.dat 是「抽屉写一行、壁纸每 80ms 取走并清空」的意图队列。
@@ -793,3 +829,106 @@ Test-Case RES-019 '健壮' '代理重启只有一个动手者（看门狗杀+拉
     if ($watch -notmatch 'watch: restart ') { throw '看门狗没有 restart 结论行（失败时无从判断是进程死了还是没起来）' }
     'ensure-all 只补缺失（不 taskkill、不健康交回看门狗）；杀 + 拉起只有 agent-watch 一处'
 } -Hint '同一件事有两个动手者时，先定权威再写判据（2026-11-14 重启风暴的教训）'
+
+Test-Case RES-020 '健壮' '采样进程看护：缺失才补、心跳老了才杀' medium {
+    # 2026-11-24 加的「3b) 采样进程段」此前只有手测证据（把 wxmon.hb 改老 20 分钟再手跑
+    # ensure-all 看日志），没有任何用例咬住 —— 而它正是「进程在、循环不动」这类静默故障的
+    # 唯一自动恢复手段。这里既咬形状，也在沙箱里跑三种形态（不碰真实进程）。
+    $root = Get-DshRoot
+    $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
+    $wx  = Read-Raw (Join-Path $root 'drawer\wxmon.ps1')
+
+    $s = $ens.IndexOf('# 3b) 采样进程')
+    $e = $ens.IndexOf('# 4) 启动队列')
+    if ($s -lt 0 -or $e -le $s) { throw 'ensure-all 里找不到「3b) 采样进程」段（wxmon 假死后没人管）' }
+    $seg = $ens.Substring($s, $e - $s)
+
+    # 阈值必须与 wxmon 的轮询周期挂钩：300s 一轮 × 3 = 900s
+    if ($wx -notmatch '\$Interval\s*=\s*300') { throw 'wxmon.ps1 的默认 Interval 不再是 300s（ensure-all 的 900s 阈值要跟着改）' }
+    if ($seg -notmatch '\$wxAge\s+-gt\s+900') { throw '采样段的心跳阈值不是 900s（3 个周期）—— 杀早了会把正常出网的一轮当成卡死' }
+    if ($seg -notmatch 'wxmon\.hb') { throw '采样段没有看 wxmon.hb 心跳（只判 pid 在不在，看不出「进程在但不动」）' }
+    if ($seg -notmatch 'taskkill\.exe /PID \$wxPid') { throw '采样段判卡死后没有定点杀（会一直拉起新实例，互斥体把它们全挡掉）' }
+    if ($seg -notmatch 'wxmon missing') { throw '采样段没有「pid 不在才补起」的分支' }
+    if ($seg -notmatch 'wxmon hung') { throw '采样段卡死时没留痕（事后不知道它被谁杀过）' }
+
+    # 心跳必须是 tmp + 原子覆盖：直接 WriteAllText 会让读到空文件的 ensure-all 判错
+    if ($wx -notmatch "WriteAllText\(\`$hbFile \+ '\.tmp'") { throw 'wxmon 的心跳不是先写 .tmp' }
+    if ($wx -notmatch "Move-Item -LiteralPath \(\`$hbFile \+ '\.tmp'") { throw 'wxmon 的心跳没有原子覆盖（Move-Item -Force）' }
+
+    # 行为：把采样段取到沙箱，用桩函数跑三种形态
+    $tmp = Join-Path $env:TEMP ('dsh_wxwd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $out = Join-Path $tmp 'calls.txt'
+        [IO.File]::WriteAllText((Join-Path $tmp 'wxmon.ps1'), '# stub')
+        $hb = Join-Path $tmp 'wxmon.hb'
+        $pf = Join-Path $tmp 'wxmon.pid'
+        $head = @'
+$appDir = '__SAND__'
+$ErrorActionPreference = 'SilentlyContinue'
+function Log([string]$m) { [IO.File]::AppendAllText('__OUT__', 'log:' + $m + "`n") }
+function ReadPid([string]$p) { if (Test-Path -LiteralPath $p) { return 999998 } return 0 }
+function ProcAlive([int]$q) { return ($q -eq 999998) }
+function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n"); return $true }
+'@ -replace '__SAND__', $tmp -replace '__OUT__', $out
+        $runner = [scriptblock]::Create($head + "`n" + $seg)
+
+        # 形态一：pid 不在 → 恰好补起一次
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c1 = [IO.File]::ReadAllText($out)
+        if (([regex]::Matches($c1, '(?m)^start$')).Count -ne 1) { throw ('wxmon 缺失时没有恰好补起一次：' + $c1) }
+        if ($c1 -notmatch 'wxmon missing') { throw ('wxmon 缺失时没记 missing 日志：' + $c1) }
+
+        # 形态二：pid 在、心跳 2000s 前 → 杀掉 + 当场重拉
+        [IO.File]::WriteAllText($pf, '999998')
+        [IO.File]::WriteAllText($hb, 'ts=1')
+        (Get-Item -LiteralPath $hb).LastWriteTime = (Get-Date).AddSeconds(-2000)
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c2 = [IO.File]::ReadAllText($out)
+        if ($c2 -notmatch 'wxmon hung') { throw ('心跳老化时没有判卡死：' + $c2) }
+        if (([regex]::Matches($c2, '(?m)^start$')).Count -ne 1) { throw ('心跳老化后没有重拉：' + $c2) }
+
+        # 形态三：pid 在、心跳新鲜 → 一个动作都不许有
+        (Get-Item -LiteralPath $hb).LastWriteTime = (Get-Date).AddSeconds(-20)
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c3 = [IO.File]::ReadAllText($out)
+        if ($c3 -match '(?m)^start$') { throw ('心跳新鲜时仍然重拉了 wxmon（会把正在采样的进程杀掉）：' + $c3) }
+        if ($c3 -match 'wxmon hung') { throw ('心跳新鲜时被判成卡死：' + $c3) }
+    } finally {
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+
+    '心跳 >900s 才杀 + 当场重拉；pid 缺失才补；心跳新鲜时零动作（静态 + 沙箱活体三形态）'
+} -Hint '这段是「进程在但循环不动」唯一的自动恢复手段（2026-11-24 wxmon 12 小时不写盘）；改 ensure-all 时别把它删了'
+
+Test-Case RES-021 '健壮' '睡眠恢复后采样不拖延（排程按墙钟，不按 Start-Sleep）' medium {
+    # 2026-11-25 实测：00:21 睡下、12:31:49 唤醒，wxmon 还在把剩下的 300 秒睡完 ——
+    # 天气面板在唤醒后两分半里显示的是昨晚的温度（wx-data.js 直到 12:34 才更新）。
+    # 根因是 Start-Sleep 的计时随系统睡眠一起被冻结，而它醒来后要继续睡完「剩余时间」。
+    # 改法：睡到墙钟上的截止时刻（每 5 秒看一眼 Get-Date），唤醒后最多 5 秒进入下一轮。
+    $root = Get-DshRoot
+    $wx = Read-Raw (Join-Path $root 'drawer\wxmon.ps1')
+
+    if ($wx -match '(?m)^\s*Start-Sleep -Seconds \$Interval\s*$') {
+        throw 'wxmon 主循环还在用 Start-Sleep -Seconds $Interval（睡眠会冻结它的计时，唤醒后仍要睡完剩余时间）'
+    }
+    if ($wx -notmatch '\$deadline\s*=\s*\(Get-Date\)\.AddSeconds\(\$Interval\)') {
+        throw 'wxmon 没有按墙钟算截止时刻（$deadline = (Get-Date).AddSeconds($Interval)）'
+    }
+    if ($wx -notmatch '\$left\s*=\s*\(\$deadline - \(Get-Date\)\)\.TotalSeconds') {
+        throw 'wxmon 的等待循环没有用墙钟判断剩余时间'
+    }
+    # 轮询粒度必须够细：唤醒后要几秒内就重采，而不是再等一整轮
+    if ($wx -notmatch 'Start-Sleep -Seconds 5') { throw 'wxmon 的墙钟轮询粒度不是 5 秒（醒来后可能白等几十秒）' }
+    # 睡过头要留痕：否则「醒来数据是旧的」只能靠猜
+    if ($wx -notmatch 'wake gap') { throw 'wxmon 睡过头没有留痕（wake gap …）' }
+
+    # 对照：hwmon 2s 一轮，睡眠冻结 2 秒可以忽略，不该跟着改（避免为了统一而引入新风险）
+    $hw = Read-Raw (Join-Path $root 'drawer\hwmon.ps1')
+    if ($hw -match '\$deadline\s*=\s*\(Get-Date\)') { throw 'hwmon 也改成了墙钟排程：它 2 秒一轮，睡眠冻结可忽略，不必冒这个险' }
+
+    'wxmon 按墙钟排程（5 秒粒度）+ 睡过头留痕；hwmon 保持 2 秒直睡'
+} -Hint '症状：合盖/睡眠唤醒后天气面板显示昨晚的天气，几分钟后自己变对。这条一旦退回 Start-Sleep，睡醒延迟就回来了'
