@@ -42,6 +42,10 @@ function Resolve-WallpaperDir {
 $dir = Resolve-WallpaperDir
 $outFile = Join-Path $dir 'hw-data.js'
 $tmpFile = Join-Path $dir 'hw-data.tmp'
+# 心跳文件（2026-11-26 新增）：pid 只能证明进程还在，「进程在、循环不动」在本机真发生过
+# （2026-11-24 wxmon 活了 12 小时没写一个字节）。ensure-all 的采样段按它判 hwmon 还在不在转；
+# 2 秒一轮 → 阈值 180s（90 轮），满载时偶尔慢几秒属正常，判太紧会反复重拉。
+$hbFile = Join-Path $env:LOCALAPPDATA 'DesktopPage\hwmon.hb'
 
 try {
     $proc = Get-CimInstance Win32_Processor | Select-Object -First 1
@@ -120,6 +124,12 @@ while ($true) {
     try {
         [System.IO.File]::WriteAllText($tmpFile, $js, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmpFile -Destination $outFile -Force
+    } catch { }
+
+    # 心跳：tmp + 原子覆盖（读到空文件会让 ensure-all 判成「刚起来」，与 wxmon.hb 同一套）
+    try {
+        [System.IO.File]::WriteAllText($hbFile + '.tmp', ('ts=' + $ts), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath ($hbFile + '.tmp') -Destination $hbFile -Force
     } catch { }
 
     Start-Sleep -Seconds $Interval

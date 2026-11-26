@@ -299,28 +299,46 @@ if (-not (ProcAlive $agentPid)) {
 } elseif (-not (AgentHealthy)) {
     Log ('ensure: agent alive but unhealthy (pid=' + $agentPid + '), left to watch')
 }
-# 3b) 采样进程（wxmon 300s 一轮）—— 2026-11-24 新增
-# 为什么：本脚本管抽屉、代理、看门狗、桥、守卫，唯独采样脚本没人管。它们死了天气面板就冻在
+# 3b) 采样进程（wxmon 300s 一轮 / hwmon 2s 一轮）—— 2026-11-24 新增，2026-11-26 扩到 hwmon
+# 为什么：本脚本管抽屉、代理、看门狗、桥、守卫，唯独采样脚本没人管。它们死了面板就冻在
 # 最后一帧；更糟的是「进程还在、循环卡住」用 pid 完全看不出来 —— 2026-11-24 实测 wxmon 活了
 # 12 小时、wx-data.js 一个字节没写（卡在一个没有超时的调用里，-TimeoutSec 管不到 DNS）。
-# 判据：pid 不在 → 拉起；pid 在但心跳（wxmon.hb，每轮写一次）超过 3 个周期 → 杀掉重拉。
+# 判据（逐条按各自周期）：pid 不在 → 拉起；pid 在但心跳超过阈值 → 杀掉重拉。
+# 阈值必须跟着周期走：wxmon 300s×3 = 900s；hwmon 2s 一轮，用 180s（90 轮）而不是 6s ——
+# 满载时单轮偶尔慢几秒是常态，判太紧会把正常采样当卡死反复重拉。
 # 与桥的处理同构（定点杀 + 当场拉），不把恢复留给下一轮。没有心跳文件时不判杀（首次安装）。
-$wxPidF   = Join-Path $appDir 'wxmon.pid'
-$wxHbF    = Join-Path $appDir 'wxmon.hb'
-$wxScript = Join-Path $appDir 'wxmon.ps1'
-if (Test-Path $wxScript) {
-    $wxPid = ReadPid $wxPidF
-    $wxAge = -1
-    if (Test-Path $wxHbF) { $wxAge = [int]((Get-Date) - (Get-Item $wxHbF).LastWriteTime).TotalSeconds }
-    $wxArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $wxScript + '"'))
-    if (-not (ProcAlive $wxPid)) {
-        StartHidden 'powershell.exe' $wxArgs
-        Log ('ensure: wxmon missing (pid=' + $wxPid + '), started')
-    } elseif ($wxAge -gt 900) {
-        & taskkill.exe /PID $wxPid /T /F 2>&1 | Out-Null
-        Start-Sleep -Milliseconds 300
-        StartHidden 'powershell.exe' $wxArgs
-        Log ('ensure: wxmon hung (no heartbeat ' + $wxAge + 's), killed pid=' + $wxPid + ', restarted')
+$samplers = @(
+    @{ name = 'wxmon'; script = (Join-Path $appDir 'wxmon.ps1'); pidF = (Join-Path $appDir 'wxmon.pid'); hbF = (Join-Path $appDir 'wxmon.hb'); maxAge = 900 },
+    @{ name = 'hwmon'; script = (Join-Path $appDir 'hwmon.ps1'); pidF = (Join-Path $appDir 'hwmon.pid'); hbF = (Join-Path $appDir 'hwmon.hb'); maxAge = 180 }
+)
+foreach ($sp in $samplers) {
+    if (-not (Test-Path $sp.script)) { continue }
+    $spPid = ReadPid $sp.pidF
+    $spAge = -1
+    if (Test-Path $sp.hbF) { $spAge = [int]((Get-Date) - (Get-Item $sp.hbF).LastWriteTime).TotalSeconds }
+    $spArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $sp.script + '"'))
+    if (-not (ProcAlive $spPid)) {
+        StartHidden 'powershell.exe' $spArgs
+        Log ('ensure: ' + $sp.name + ' missing (pid=' + $spPid + '), started')
+    } elseif ($spAge -gt $sp.maxAge) {
+        # 心跳老了先复核再杀：机器刚从睡眠恢复时心跳本来就是旧的（写不出来），而 wxmon 一轮
+        # 300s —— 只看一次 mtime 会在唤醒后的窗口里误杀一个正在跑的采样进程（2026-11-25 的
+        # 「睡眠冻结计时」就是这么来的）。2 秒内 mtime 前进了 = 它还在转，记一行就放走。
+        $recheck = -1
+        for ($i = 0; $i -lt 3; $i++) {
+            Start-Sleep -Milliseconds 700
+            if (-not (Test-Path $sp.hbF)) { break }
+            $recheck = [int]((Get-Date) - (Get-Item $sp.hbF).LastWriteTime).TotalSeconds
+            if ($recheck -lt $spAge) { break }
+        }
+        if ($recheck -ge 0 -and $recheck -lt $spAge) {
+            Log ('ensure: ' + $sp.name + ' heartbeat refreshed (' + $spAge + 's -> ' + $recheck + 's), left alone')
+        } else {
+            & taskkill.exe /PID $spPid /T /F 2>&1 | Out-Null
+            Start-Sleep -Milliseconds 300
+            StartHidden 'powershell.exe' $spArgs
+            Log ('ensure: ' + $sp.name + ' hung (no heartbeat ' + $spAge + 's), killed pid=' + $spPid + ', restarted')
+        }
     }
 }
 

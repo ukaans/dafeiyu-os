@@ -361,3 +361,32 @@ Test-Case RUN-014 '运行时' 'wxmon 心跳新鲜（进程在且循环在转）'
     try { $pidTxt = ([System.IO.File]::ReadAllText((Join-Path $inst 'wxmon.pid'))).Trim() } catch { }
     ('心跳 ' + $age + 's 前（阈值 ' + $limit + 's）；pid=' + $pidTxt)
 } -Hint '心跳停了但进程还在 = 卡在某个调用里（wxmon.log 末行能看到卡在哪一步）；ensure-all 每 2 分钟按 900s 判一次并定点重拉'
+
+Test-Case RUN-015 '运行时' 'hwmon 心跳新鲜（进程在且循环在转）' medium {
+    # 与 RUN-014 同构：hwmon 每 2 秒写一次 hw-data.js，进程卡住时面板只是冻在最后一帧，
+    # 而 pid 判活完全看不出来 —— 2026-11-26 起它每轮也写 hwmon.hb，ensure-all 的采样段
+    # 按 180s（90 轮）判卡死并定点重拉。阈值在这里必须与那段一致。
+    $inst = Get-DshInstall
+    $hb = Join-Path $inst 'hwmon.hb'
+    if (-not (Test-Path -LiteralPath $hb)) {
+        throw '没有 hwmon.hb：hwmon 从没写过心跳（跑的还是旧脚本，或它根本没起），ensure-all 判不出「进程在但不动」'
+    }
+    $raw = [System.IO.File]::ReadAllText($hb)
+    if ($raw -notmatch 'ts=(\d{10,})') { throw ('hwmon.hb 内容不是 ts=<epoch毫秒>：' + $raw.Trim()) }
+    $tsMs = [long]$Matches[1]
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if (($nowMs - $tsMs) -lt -120000) { throw ('hwmon.hb 的时间戳在未来 ' + [int](($tsMs - $nowMs) / 1000) + 's（时钟或写入逻辑有问题）') }
+    $age = [int]((Get-Date) - (Get-Item -LiteralPath $hb).LastWriteTime).TotalSeconds
+    $limit = 180
+    $awake = Get-DshAwake
+    $awakeSec = if ($awake) { [int]$awake.Seconds } else { -1 }
+    if ($awakeSec -ge 0 -and $awakeSec -lt $limit) {
+        return ('心跳 ' + $age + 's 前；机器 ' + $awakeSec + 's 前才恢复通电（阈值 ' + $limit + 's 内不判）')
+    }
+    if ($age -gt $limit) {
+        throw ('心跳已 ' + $age + 's 没更新（阈值 ' + $limit + 's = 2s 一轮 × 90）—— 进程在但循环停了，等 ensure-all 的采样段兜底')
+    }
+    $pidTxt = ''
+    try { $pidTxt = ([System.IO.File]::ReadAllText((Join-Path $inst 'hwmon.pid'))).Trim() } catch { }
+    ('心跳 ' + $age + 's 前（阈值 ' + $limit + 's）；pid=' + $pidTxt)
+} -Hint '红了先看 hwmon.pid 的进程在不在、hwmon.ps1 里那段心跳写没写；ensure-all 每 2 分钟按 180s 判一次并定点重拉'

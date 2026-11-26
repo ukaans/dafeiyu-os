@@ -850,76 +850,95 @@ Test-Case RES-019 '健壮' '代理重启只有一个动手者（看门狗杀+拉
 Test-Case RES-020 '健壮' '采样进程看护：缺失才补、心跳老了才杀' medium {
     # 2026-11-24 加的「3b) 采样进程段」此前只有手测证据（把 wxmon.hb 改老 20 分钟再手跑
     # ensure-all 看日志），没有任何用例咬住 —— 而它正是「进程在、循环不动」这类静默故障的
-    # 唯一自动恢复手段。这里既咬形状，也在沙箱里跑三种形态（不碰真实进程）。
+    # 唯一自动恢复手段。2026-11-26 起这段从「只管 wxmon」改成表驱动（wxmon + hwmon），
+    # 用例也跟着两个采样进程各验一遍；沙箱里跑三种形态，不碰真实进程。
     $root = Get-DshRoot
     $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
     $wx  = Read-Raw (Join-Path $root 'drawer\wxmon.ps1')
+    $hw  = Read-Raw (Join-Path $root 'drawer\hwmon.ps1')
 
     $s = $ens.IndexOf('# 3b) 采样进程')
     $e = $ens.IndexOf('# 4) 启动队列')
     if ($s -lt 0 -or $e -le $s) { throw 'ensure-all 里找不到「3b) 采样进程」段（wxmon 假死后没人管）' }
     $seg = $ens.Substring($s, $e - $s)
 
-    # 阈值必须与 wxmon 的轮询周期挂钩：300s 一轮 × 3 = 900s
+    # 阈值必须与各自周期挂钩：wxmon 300s 一轮 × 3 = 900s；hwmon 2s 一轮，取 180s（90 轮）
     if ($wx -notmatch '\$Interval\s*=\s*300') { throw 'wxmon.ps1 的默认 Interval 不再是 300s（ensure-all 的 900s 阈值要跟着改）' }
-    if ($seg -notmatch '\$wxAge\s+-gt\s+900') { throw '采样段的心跳阈值不是 900s（3 个周期）—— 杀早了会把正常出网的一轮当成卡死' }
+    if ($seg -notmatch "name = 'wxmon';.*maxAge = 900") { throw '采样段的 wxmon 阈值不是 900s（3 个周期）—— 杀早了会把正常出网的一轮当成卡死' }
+    if ($seg -notmatch "name = 'hwmon';.*maxAge = 180") { throw '采样段没有把 hwmon 纳进来，或它的阈值不是 180s（2s 一轮 × 90 轮）' }
     if ($seg -notmatch 'wxmon\.hb') { throw '采样段没有看 wxmon.hb 心跳（只判 pid 在不在，看不出「进程在但不动」）' }
-    if ($seg -notmatch 'taskkill\.exe /PID \$wxPid') { throw '采样段判卡死后没有定点杀（会一直拉起新实例，互斥体把它们全挡掉）' }
-    if ($seg -notmatch 'wxmon missing') { throw '采样段没有「pid 不在才补起」的分支' }
-    if ($seg -notmatch 'wxmon hung') { throw '采样段卡死时没留痕（事后不知道它被谁杀过）' }
+    if ($seg -notmatch 'hwmon\.hb') { throw '采样段没有看 hwmon.hb 心跳（hwmon 死了硬件面板会冻在最后一帧，没人补）' }
+    if ($seg -notmatch 'taskkill\.exe /PID \$spPid') { throw '采样段判卡死后没有定点杀（会一直拉起新实例，互斥体把它们全挡掉）' }
+    if ($seg -notmatch "' missing \(pid='") { throw '采样段没有「pid 不在才补起」的分支' }
+    if ($seg -notmatch "' hung \(no heartbeat '") { throw '采样段卡死时没留痕（事后不知道它被谁杀过）' }
+    if ($seg -notmatch 'heartbeat refreshed') { throw '采样段没有「复核后心跳前进了就放走」的分支（机器刚唤醒时心跳本来就是旧的，照旧杀会误杀正在跑的采样）' }
 
     # 心跳必须是 tmp + 原子覆盖：直接 WriteAllText 会让读到空文件的 ensure-all 判错
     if ($wx -notmatch "WriteAllText\(\`$hbFile \+ '\.tmp'") { throw 'wxmon 的心跳不是先写 .tmp' }
     if ($wx -notmatch "Move-Item -LiteralPath \(\`$hbFile \+ '\.tmp'") { throw 'wxmon 的心跳没有原子覆盖（Move-Item -Force）' }
+    if ($hw -notmatch "WriteAllText\(\`$hbFile \+ '\.tmp'") { throw 'hwmon 的心跳不是先写 .tmp' }
+    if ($hw -notmatch "Move-Item -LiteralPath \(\`$hbFile \+ '\.tmp'") { throw 'hwmon 的心跳没有原子覆盖（Move-Item -Force）' }
 
-    # 行为：把采样段取到沙箱，用桩函数跑三种形态
+    # 行为：把采样段取到沙箱，用桩函数跑三种形态。pid 取一个真实探测过不存在的号，
+    # 这样段里的 taskkill.exe /PID 打的是空靶（绝不碰真实进程）。
+    $fakePid = 999999
+    while (Get-Process -Id $fakePid -ErrorAction SilentlyContinue) { $fakePid = $fakePid - 7 }
     $tmp = Join-Path $env:TEMP ('dsh_wxwd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     [void](New-Item -ItemType Directory -Path $tmp -Force)
     try {
         $out = Join-Path $tmp 'calls.txt'
         [IO.File]::WriteAllText((Join-Path $tmp 'wxmon.ps1'), '# stub')
-        $hb = Join-Path $tmp 'wxmon.hb'
-        $pf = Join-Path $tmp 'wxmon.pid'
+        [IO.File]::WriteAllText((Join-Path $tmp 'hwmon.ps1'), '# stub')
+        $wxHb = Join-Path $tmp 'wxmon.hb'
+        $hwHb = Join-Path $tmp 'hwmon.hb'
+        $wxPf = Join-Path $tmp 'wxmon.pid'
+        $hwPf = Join-Path $tmp 'hwmon.pid'
         $head = @'
 $appDir = '__SAND__'
+$fakePid = __FAKE__
 $ErrorActionPreference = 'SilentlyContinue'
 function Log([string]$m) { [IO.File]::AppendAllText('__OUT__', 'log:' + $m + "`n") }
-function ReadPid([string]$p) { if (Test-Path -LiteralPath $p) { return 999998 } return 0 }
-function ProcAlive([int]$q) { return ($q -eq 999998) }
+function ReadPid([string]$p) { if (Test-Path -LiteralPath $p) { return $fakePid } return 0 }
+function ProcAlive([int]$q) { return ($q -eq $fakePid) }
 function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n") }
-'@ -replace '__SAND__', $tmp -replace '__OUT__', $out
+'@ -replace '__SAND__', $tmp -replace '__OUT__', $out -replace '__FAKE__', "$fakePid"
         $runner = [scriptblock]::Create($head + "`n" + $seg)
 
-        # 形态一：pid 不在 → 恰好补起一次
+        # 形态一：两个 pid 都不在 → 各恰好补起一次
         [IO.File]::WriteAllText($out, '')
         & $runner
         $c1 = [IO.File]::ReadAllText($out)
-        if (([regex]::Matches($c1, '(?m)^start$')).Count -ne 1) { throw ('wxmon 缺失时没有恰好补起一次：' + $c1) }
-        if ($c1 -notmatch 'wxmon missing') { throw ('wxmon 缺失时没记 missing 日志：' + $c1) }
+        if (([regex]::Matches($c1, '(?m)^start$')).Count -ne 2) { throw ('采样进程都缺失时没有各补起一次：' + $c1) }
+        if ($c1 -notmatch 'wxmon missing' -or $c1 -notmatch 'hwmon missing') { throw ('缺失时没记 missing 日志：' + $c1) }
 
-        # 形态二：pid 在、心跳 2000s 前 → 杀掉 + 当场重拉
-        [IO.File]::WriteAllText($pf, '999998')
-        [IO.File]::WriteAllText($hb, 'ts=1')
-        (Get-Item -LiteralPath $hb).LastWriteTime = (Get-Date).AddSeconds(-2000)
+        # 形态二：两个都在、wxmon 心跳 2000s 前、hwmon 心跳新鲜 → 只杀重拉 wxmon
+        [IO.File]::WriteAllText($wxPf, "$fakePid")
+        [IO.File]::WriteAllText($hwPf, "$fakePid")
+        [IO.File]::WriteAllText($wxHb, 'ts=1')
+        [IO.File]::WriteAllText($hwHb, 'ts=1')
+        (Get-Item -LiteralPath $wxHb).LastWriteTime = (Get-Date).AddSeconds(-2000)
+        (Get-Item -LiteralPath $hwHb).LastWriteTime = (Get-Date).AddSeconds(-2)
         [IO.File]::WriteAllText($out, '')
         & $runner
         $c2 = [IO.File]::ReadAllText($out)
-        if ($c2 -notmatch 'wxmon hung') { throw ('心跳老化时没有判卡死：' + $c2) }
-        if (([regex]::Matches($c2, '(?m)^start$')).Count -ne 1) { throw ('心跳老化后没有重拉：' + $c2) }
+        if ($c2 -notmatch 'wxmon hung') { throw ('wxmon 心跳老化时没有判卡死：' + $c2) }
+        if ($c2 -match 'hwmon hung') { throw ('hwmon 心跳新鲜时也被判成卡死（会把正在采样的进程杀掉）：' + $c2) }
+        if (([regex]::Matches($c2, '(?m)^start$')).Count -ne 1) { throw ('只有 wxmon 该重拉，实际启动次数不对：' + $c2) }
 
-        # 形态三：pid 在、心跳新鲜 → 一个动作都不许有
-        (Get-Item -LiteralPath $hb).LastWriteTime = (Get-Date).AddSeconds(-20)
+        # 形态三：两个心跳都新鲜 → 一个动作都不许有
+        (Get-Item -LiteralPath $wxHb).LastWriteTime = (Get-Date).AddSeconds(-5)
+        (Get-Item -LiteralPath $hwHb).LastWriteTime = (Get-Date).AddSeconds(-2)
         [IO.File]::WriteAllText($out, '')
         & $runner
         $c3 = [IO.File]::ReadAllText($out)
-        if ($c3 -match '(?m)^start$') { throw ('心跳新鲜时仍然重拉了 wxmon（会把正在采样的进程杀掉）：' + $c3) }
-        if ($c3 -match 'wxmon hung') { throw ('心跳新鲜时被判成卡死：' + $c3) }
+        if ($c3 -match '(?m)^start$') { throw ('心跳新鲜时仍然重拉了采样进程（会把正在采样的进程杀掉）：' + $c3) }
+        if ($c3 -match 'hung') { throw ('心跳新鲜时被判成卡死：' + $c3) }
     } finally {
         try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
     }
 
-    '心跳 >900s 才杀 + 当场重拉；pid 缺失才补；心跳新鲜时零动作（静态 + 沙箱活体三形态）'
-} -Hint '这段是「进程在但循环不动」唯一的自动恢复手段（2026-11-24 wxmon 12 小时不写盘）；改 ensure-all 时别把它删了'
+    'wxmon 900s / hwmon 180s 心跳老了才杀 + 当场重拉；pid 缺失才补；心跳新鲜时零动作（静态 + 沙箱活体三形态）'
+} -Hint '这段是「进程在但循环不动」唯一的自动恢复手段（2026-11-24 wxmon 12 小时不写盘）；改 ensure-all 时别把它删了，也别把 hwmon 拿掉'
 
 Test-Case RES-021 '健壮' '睡眠恢复后采样不拖延（排程按墙钟，不按 Start-Sleep）' medium {
     # 2026-11-25 实测：00:21 睡下、12:31:49 唤醒，wxmon 还在把剩下的 300 秒睡完 ——
