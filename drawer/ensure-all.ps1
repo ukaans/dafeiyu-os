@@ -376,6 +376,22 @@ if (Test-Path $queueFile) {
     }
 }
 
+
+# 4b) 快捷启动栏的「添加」宿主（dock-add-host.ps1）—— 2026-11-27 新增
+# 为什么：它由 start-all.vbs 在登录链末段拉起，此后没有任何人看护（2026-11-26 挂账）。
+# 挂掉的表现非常安静：抽屉顶栏点「＋」→ 代理只写 dock-add.trigger → 没有人消费 →
+# 用户看到的就是「点了没反应」，而且那条 trigger 会一直留着，下次登录宿主一启动就
+# 自己弹出「选择程序」框（看着像见鬼）。它挂了也不影响别的功能，所以优先级低。
+# 判活只看它自己持有的互斥体 Global\DesktopPage_dockpick（与桥、看门狗同一套姿势，
+# 不按命令行扫进程 —— 探针命令会误匹配）。重复拉起无害：拿不到互斥体时它 WaitOne(0)
+# 直接 exit 0，所以这里宁可多拉一次。
+$dockHostScript = Join-Path $appDir 'dock-add-host.ps1'
+if (Test-Path $dockHostScript) {
+    if (-not (Test-Mutex 'Global\DesktopPage_dockpick')) {
+        StartHidden 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('"' + $dockHostScript + '"'))
+        Log 'ensure: dock-add-host missing (mutex down), started'
+    }
+}
 # >>> SessionGuard patch B >>>
 # 游戏守卫自愈：进程不在、或心跳超过 60s（睡眠/卡死），就杀掉重拉。
 # 守卫自己有单实例互斥体（Local\SessionGuard.SingleInstance），重复启动只留一个，所以这里

@@ -764,3 +764,97 @@ Test-Case CON-023 '契约' 'summon 前缀命令：prefix 字段与 SummonTick �
     if ($msg.Count -gt 0) { throw (($msg -join '；') + ' —— 表里共 ' + $rows.Count + ' 条（prefix:true ' + $nPrefix + ' 条）') }
     ('前缀语义一致（' + $rows.Count + ' 条命令：prefix:true ' + $nPrefix + ' 条，每条都能唯一命中自己）')
 } -Hint '带参命令写成 "xxx=" + prefix: true；无参命令写成 "xxx" + prefix: false。改 prefix 前先想清楚 SummonTick 是先精确、再只对 prefix 走前缀'
+
+Test-Case CON-024 '契约' '架构图自检：结构完整、整体图路由一条不漏、点名的文件真实存在' low {
+    # 三张架构图在仓库外（E:\DSHWORK\pkg\），没有版本控制，画坏了没人看得到：
+    # 2026-11-26 就发现整体图的文件 IPC 表里有一处 </tr 少了结尾的 > —— 浏览器能容忍，
+    # 肉眼看不出，但那一行之后整张表的结构都是错的（是靠手算 tr 开闭才发现的）。
+    # 每次重画后都要人工做的那几步自检，写成可重复的判据：
+    #   ①文件在、以 </html> 结尾、标签开闭相等、没有半截闭合标签
+    #   ②整体图必须把 $script:ROUTES 一条不漏地画进去（它是路由全表那张）
+    #   ③图里出现的路由不许是幻影（代码里没有的路由，照着图排障会查不到）
+    #   ④图里点名的 .ps1/.ahk/.vbs 必须真实存在于仓库
+    #   ⑤角标带 commit 短哈希与日期（「依据哪一版画的」是这三张图唯一的溯源信息）
+    # 目录不在就 skip：架构图只在本机发布包目录，别的机器上跑这条没有意义。
+    $pkg = 'E:\DSHWORK\pkg'
+    if ($env:DSH_PKG) { $pkg = $env:DSH_PKG }
+    if (-not (Test-Path -LiteralPath $pkg)) {
+        return @{ Status = 'skip'; Detail = ('本机没有发布包目录 ' + $pkg + '（架构图不在仓库里，只有本机有）') }
+    }
+
+    $root = Get-DshRoot
+    $rt = Contract-RouteTable
+    $knownRoutes = @()
+    foreach ($r in $rt.Routes) {
+        if ($r.EndsWith('*')) { $knownRoutes += $r.TrimEnd('*') } else { $knownRoutes += $r }
+    }
+    if ($knownRoutes.Count -lt 20) { throw ('从 dsh-agent.ps1 只解析出 ' + $knownRoutes.Count + ' 条路由，路由表结构可能被改了') }
+
+    # 仓库里真实存在的文件名（架构图里唯一允许点名的范围）
+    $knownFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue)) {
+        if ($f.FullName -match '\\\.git\\') { continue }
+        [void]$knownFiles.Add($f.Name)
+    }
+
+    $maps = @(
+        @{ Name = '整体'; File = '大肥鱼-整体架构图.html';       AllRoutes = $true }
+        @{ Name = '桌面'; File = '大肥鱼-桌面系统-架构图.html';   AllRoutes = $false }
+        @{ Name = '抽屉'; File = '大肥鱼-抽屉系统-架构图.html';   AllRoutes = $false }
+    )
+    # 源码示例里的占位路由（桌面图把信标写成 new Image().src = '…/xxx.gif?…'）
+    $placeholders = @('/xxx.gif')
+    $tags = @('div', 'section', 'table', 'svg', 'tr', 'td', 'g')
+    $msg = @()
+    $nFiles = 0
+    $nRoutes = 0
+
+    foreach ($m in $maps) {
+        $p = Join-Path $pkg $m.File
+        if (-not (Test-Path -LiteralPath $p)) { $msg += ($m.Name + '图缺失：' + $m.File); continue }
+        $t = Read-Raw $p
+
+        if (-not $t.TrimEnd().EndsWith('</html>')) { $msg += ($m.Name + '图没有正常结束（末尾不是 </html>，可能被截断）') }
+        foreach ($tag in $tags) {
+            $o = ([regex]::Matches($t, '<' + $tag + '[\s>]')).Count
+            $c = ([regex]::Matches($t, '</' + $tag + '\s*>')).Count
+            if ($o -ne $c) { $msg += ($m.Name + '图 <' + $tag + '> 开闭不相等（' + $o + ' 开 / ' + $c + ' 闭）') }
+        }
+        $broken = [regex]::Matches($t, '</(div|section|table|svg|tr|td|g)(?![^<>]*>)')
+        if ($broken.Count -gt 0) { $msg += ($m.Name + '图有 ' + $broken.Count + ' 处半截闭合标签（' + $broken[0].Value + '… 少了 >）') }
+
+        # 路由：画进来的每条都必须在代码里（否则是幻影），整体图还必须一条不漏
+        $drawn = @()
+        foreach ($mm in [regex]::Matches($t, '(?<![A-Za-z0-9_.\-])/[A-Za-z0-9_\-]+\.(?:gif|js)')) { $drawn += $mm.Value }
+        $drawn = @($drawn | Sort-Object -Unique)
+        $phantom = @($drawn | Where-Object { $placeholders -notcontains $_ -and $knownRoutes -notcontains $_ })
+        if ($phantom.Count -gt 0) { $msg += ($m.Name + '图里有代码中不存在的路由：' + ($phantom -join '、')) }
+        $nRoutes += $drawn.Count
+        if ($m.AllRoutes) {
+            $missing = @()
+            foreach ($r in $knownRoutes) {
+                if ($r -eq '/icon/') { if ($t -notmatch [regex]::Escape('/icon/')) { $missing += $r }; continue }
+                if ($t -notmatch [regex]::Escape($r)) { $missing += $r }
+            }
+            if ($missing.Count -gt 0) { $msg += ($m.Name + '图漏了 ' + $missing.Count + ' 条路由：' + ($missing -join '、')) }
+        }
+
+        # 点名的文件必须真实存在（图里写了个不存在的文件，改代码的人会去找不到）
+        $bad = @()
+        foreach ($mm in [regex]::Matches($t, '[A-Za-z0-9_.\-]+\.(?:ps1|ahk|vbs)')) {
+            $n = $mm.Value
+            if (-not $knownFiles.Contains($n)) { if ($bad -notcontains $n) { $bad += $n } }
+        }
+        if ($bad.Count -gt 0) { $msg += ($m.Name + '图里点了仓库中不存在的文件：' + ($bad -join '、')) }
+        $nFiles += ([regex]::Matches($t, '[A-Za-z0-9_.\-]+\.(?:ps1|ahk|vbs)')).Count
+
+        # 角标：依据哪个 commit、哪天画的
+        if ($t -notmatch 'class="foot"') { $msg += ($m.Name + '图没有页脚（改动落点那条）') }
+        if ($t -notmatch '依据\s*dev\s*分支\s*<code>[0-9a-f]{7,40}</code>') { $msg += ($m.Name + '图的角标没有「依据 dev 分支 <code>哈希</code>」') }
+        if ($t -notmatch '20\d\d-\d\d-\d\d') { $msg += ($m.Name + '图的角标没有生成日期') }
+    }
+
+    if ($msg.Count -gt 0) { throw ($msg -join '；') }
+    ('三张结构完整（结尾 / 标签开闭 / 无半截闭合）+ 整体图 ' + $knownRoutes.Count + ' 条路由全在 + 图内 ' +
+        $nFiles + ' 处文件名真实存在 + 角标齐全（共画到 ' + $nRoutes + ' 处路由引用）')
+} -Hint '重画架构图后跑这条；红了先改图，不要改代码去迁就图（目录可用 DSH_PKG 覆盖）'

@@ -968,3 +968,138 @@ Test-Case RES-021 '健壮' '睡眠恢复后采样不拖延（排程按墙钟，�
 
     'wxmon 按墙钟排程（5 秒粒度）+ 睡过头留痕；hwmon 保持 2 秒直睡'
 } -Hint '症状：合盖/睡眠唤醒后天气面板显示昨晚的天气，几分钟后自己变对。这条一旦退回 Start-Sleep，睡醒延迟就回来了'
+
+Test-Case RES-022 '健壮' '代理看护：不健康时既不许杀也不许补起（沙箱活体）' medium {
+    # RES-019 只做静态文本断言（有没有 taskkill、有没有 left to watch 那行）。「文本对、行为错」
+    # 的变异能躲过它：在 elseif (-not (AgentHealthy)) 分支里补一句 StartHidden，文本上仍然干净
+    # （没有 taskkill、left to watch 也还在），行为却变成「每 2 分钟拉起一个新代理」——
+    # 正是 2026-11-14 那场重启风暴的另一半形状。所以这条把代理段取到沙箱里，只看行为。
+    # 与 RES-020（采样段）、STA-022（守卫段）同一套手法：段内 taskkill 用真探测过不存在的 pid 打空靶。
+    $root = Get-DshRoot
+    $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
+    $s = $ens.IndexOf('# 3) 代理')
+    $e = $ens.IndexOf('# 3b) 采样进程')
+    if ($s -lt 0 -or $e -le $s) { throw 'ensure-all 里找不到「3) 代理」段（代理只看 pid 在不在，不健康就没人管了）' }
+    $seg = $ens.Substring($s, $e - $s)
+    # 3b 之前的这一段必须真的走到「不健康 → 交回看门狗」分支，否则沙箱里三种形态都验不出意义
+    if ($seg -notmatch 'left to watch') { throw '「3) 代理」段里没有 left to watch 分支（取了错段，或收敛被改回去了）' }
+
+    $fakePid = 999999
+    while (Get-Process -Id $fakePid -ErrorAction SilentlyContinue) { $fakePid = $fakePid - 7 }
+    $tmp = Join-Path $env:TEMP ('dsh_agentwd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $out = Join-Path $tmp 'calls.txt'
+        [IO.File]::WriteAllText((Join-Path $tmp 'dsh-agent.ps1'), '# stub')
+        $pidF = Join-Path $tmp 'dsh-agent.pid'
+        $head = @'
+$appDir = '__SAND__'
+$fakePid = __FAKE__
+$ErrorActionPreference = 'SilentlyContinue'
+$agentPidF   = Join-Path $appDir 'dsh-agent.pid'
+$agentHbF    = Join-Path $appDir 'dsh-agent.hb'
+$agentScript = Join-Path $appDir 'dsh-agent.ps1'
+$AgentPort   = 1
+function Log([string]$m) { [IO.File]::AppendAllText('__OUT__', 'log:' + $m + "`n") }
+function ReadPid([string]$p) { if (Test-Path -LiteralPath $p) { return $fakePid } return 0 }
+function ProcAlive([int]$q) { return ($q -eq $fakePid) }
+function AgentHealthy { return [bool]$global:__dshHealthy }
+function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n") }
+'@ -replace '__SAND__', $tmp -replace '__OUT__', $out -replace '__FAKE__', "$fakePid"
+        $runner = [scriptblock]::Create($head + "`n" + $seg)
+
+        # 形态一：pid 不在 → 恰好补起一次
+        if (Test-Path -LiteralPath $pidF) { [IO.File]::Delete($pidF) }
+        $global:__dshHealthy = $true
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c1 = [IO.File]::ReadAllText($out)
+        if (([regex]::Matches($c1, '(?m)^start$')).Count -ne 1) { throw ('代理缺失时没有恰好补起一次：' + $c1) }
+        if ($c1 -notmatch 'agent missing') { throw ('代理缺失时没记 missing 日志：' + $c1) }
+
+        # 形态二：pid 在、但不健康 → 一行 left to watch，不许拉、不许杀
+        [IO.File]::WriteAllText($pidF, "$fakePid")
+        $global:__dshHealthy = $false
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c2 = [IO.File]::ReadAllText($out)
+        if ($c2 -match '(?m)^start$') { throw ('代理活着但不健康时又拉起了一个（第二个动手者，重启风暴就是这么来的）：' + $c2) }
+        if ($c2 -notmatch 'left to watch') { throw ('代理不健康时没有交回看门狗（变成静默不管）：' + $c2) }
+
+        # 形态三：pid 在、健康 → 一个动作、一行日志都不许有
+        $global:__dshHealthy = $true
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c3 = [IO.File]::ReadAllText($out)
+        if ($c3.Trim() -ne '') { throw ('代理健康时仍然动手了（每 2 分钟一次无谓动作）：' + $c3) }
+    } finally {
+        $global:__dshHealthy = $null
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+
+    '代理段只补缺失：pid 不在恰好起一次、不健康只记 left to watch、健康时零动作（沙箱活体三形态）'
+} -Hint '2026-11-15「重启权收敛成一个」的行为级护栏：ensure-all 一旦又开始拉/杀不健康的代理，重启风暴就会复发'
+
+Test-Case RES-023 '健壮' '快捷启动栏宿主有看护：互斥体不在就拉起' low {
+    # 2026-11-26 挂账：ensure-all 管着抽屉 / 代理 / 看门狗 / 桥 / 两个采样 / 游戏守卫，
+    # 唯独 dock-add-host.ps1（快捷启动栏的「添加」宿主）没人管 —— 它只在登录时被拉起一次。
+    # 挂掉以后表现极安静：点「＋」→ 代理写 dock-add.trigger → 无人消费 → 「点了没反应」，
+    # 而且那条 trigger 会一直留着，下次登录宿主一上来就自己弹出选择框。
+    # 判活只看互斥体（不扫命令行：探针命令会误匹配，11-14 桥就是这么误判的），
+    # 所以两边写的互斥体名必须逐字一致 —— 错一个字符就变成「每 2 分钟拉一个、每个都立刻退」。
+    $root = Get-DshRoot
+    $ens = Read-Raw (Join-Path $root 'drawer\ensure-all.ps1')
+    $host_ = Read-Raw (Join-Path $root 'drawer\dock-add-host.ps1')
+
+    $mHost = [regex]::Match($host_, 'New-Object System\.Threading\.Mutex\(\$false,\s*''([^'']+)''\)')
+    if (-not $mHost.Success) { throw 'dock-add-host.ps1 里找不到它申请互斥体那一行（判活依据消失了）' }
+    $mtxHost = $mHost.Groups[1].Value
+
+    $s = $ens.IndexOf('# 4b) 快捷启动栏')
+    $e = $ens.IndexOf('# >>> SessionGuard patch B >>>')
+    if ($s -lt 0 -or $e -le $s) { throw 'ensure-all 里找不到「4b) 快捷启动栏」段（宿主挂了没人补）' }
+    $seg = $ens.Substring($s, $e - $s)
+
+    $mEns = [regex]::Match($seg, "Test-Mutex '([^']+)'")
+    if (-not $mEns.Success) { throw 'ensure-all 的宿主看护段没有用 Test-Mutex 判活（扫命令行会误匹配探针）' }
+    if ($mEns.Groups[1].Value -ne $mtxHost) {
+        throw ('两边的互斥体名不一致（宿主申请 [' + $mtxHost + ']，巡检等 [' + $mEns.Groups[1].Value + ']）—— 会每 2 分钟拉起一个立刻退出的进程')
+    }
+    if ($seg -notmatch 'dock-add-host\.ps1') { throw '看护段没有指向 dock-add-host.ps1' }
+    if ($seg -notmatch "dock-add-host missing") { throw '拉起宿主时没有留痕（事后不知道它被谁拉起来过）' }
+    if ($seg -notmatch 'StartHidden') { throw '看护段没有真正拉起宿主（只记日志不补）' }
+
+    # 行为：互斥体在 → 一个动作都不许有；不在 → 恰好拉起一次
+    $tmp = Join-Path $env:TEMP ('dsh_dockwd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory -Path $tmp -Force)
+    try {
+        $out = Join-Path $tmp 'calls.txt'
+        [IO.File]::WriteAllText((Join-Path $tmp 'dock-add-host.ps1'), '# stub')
+        $head = @'
+$appDir = '__SAND__'
+$ErrorActionPreference = 'SilentlyContinue'
+function Log([string]$m) { [IO.File]::AppendAllText('__OUT__', 'log:' + $m + "`n") }
+function Test-Mutex([string]$n) { return [bool]$global:__dshMtx }
+function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('__OUT__', 'start' + "`n") }
+'@ -replace '__SAND__', $tmp -replace '__OUT__', $out
+        $runner = [scriptblock]::Create($head + "`n" + $seg)
+
+        $global:__dshMtx = $true
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c1 = [IO.File]::ReadAllText($out)
+        if ($c1.Trim() -ne '') { throw ('宿主还在跑时仍然动手了（每 2 分钟拉一个多余进程）：' + $c1) }
+
+        $global:__dshMtx = $false
+        [IO.File]::WriteAllText($out, '')
+        & $runner
+        $c2 = [IO.File]::ReadAllText($out)
+        if (([regex]::Matches($c2, '(?m)^start$')).Count -ne 1) { throw ('宿主不在时没有恰好拉起一次：' + $c2) }
+        if ($c2 -notmatch 'dock-add-host missing') { throw ('宿主不在时没记日志：' + $c2) }
+    } finally {
+        $global:__dshMtx = $null
+        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
+    }
+
+    ('宿主互斥体 ' + $mtxHost + ' 两边逐字一致；互斥体在零动作、不在恰好拉起一次（静态 + 沙箱活体）')
+} -Hint '症状：抽屉里点「＋」没反应，而 /adddock.gif 明明回了 GIF。查 ensure-all.log 有没有 dock-add-host missing；改互斥体名要两边一起改'

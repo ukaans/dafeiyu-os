@@ -100,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | STA-021 | 滚轮桥存活走**互斥体**（不再按命令行匹配，探针会误匹配）；启动失败要留 stderr + boot 阶段痕迹；卡死按 pid 文件 + 心跳处理 |
 | STA-022 | **游戏守卫在跑时不补抽屉**：`SessionGuard` 的 `game-guard.on` 新鲜（≤120s）时 `ensure-all` 只记 `skipped`；守卫分支之后必须接回 `elseif (-not (DrawerAlive))`（拉起抽屉的代码不许落在守卫分支里）；守卫自愈要有 `Test-Path` 闸、心跳 >60s 或进程不在才重拉且失败留痕 |
 
-### 20-contract · 契约一致性（23 条）
+### 20-contract · 契约一致性（24 条）
 | 编号 | 查什么 |
 |---|---|
 | CON-001 | **代理端口单一配置源**：`drawer\agent-config.ps1` 里 `$AgentPort` 是唯一值；三个 ps1 dot-source 它（`-Port` 默认 0，不再写死）；代理启动写 `agent-port.txt` 与 Lively 目录 `port.js`，AHK / 壁纸都读生成物；`install.ps1` 也生成这两份。运行态再校验 `agent-port.txt` 与配置一致（2026-11-11，原 9 处写死 17433） |
@@ -126,6 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-021 | **组件契约表与路由表对齐**：`drawer\components.md` 的「**路由**：」那一行必须把 `$script:ROUTES` 的 24 条 + `/icon/` 前缀一条不漏地列全，且不许写路由表里没有的（死路由）。管的是与 `CON-004`（项目地图 §3）**平行的第二份文档** —— 2026-11-20 实测它缺 `/log.js` `/reload.gif` `/dbg.gif` `/iconbuild.gif` `/icons.gif` 五条，排障时照它查「谁调这条接口」会查不到 |
 | CON-022 | **summon 命令表四处对齐**：`$SUMMON_CMDS`（真相）↔ `components.md` 的「**文件命令**」半句 ↔ `项目地图 §6.1` 速查表（这两处双向：漏了/多写都报）↔ `项目地图 §5` 的 `summon.cmd` 数据文件行（那一列允许 `<路径>` 占位，只要求命令名被提到）。另断言表里每个 `fn:` 都能在 `DesktopPage.ahk` 里找到同名函数定义（改名后留下死引用）。2026-11-21 实测 §5 少了 `rescan` / `rollback` / `snaptest` 三条（11-14 才加的快照回滚与重扫），照着它排障的人会以为抽屉没这两个入口 |
 | CON-023 | **summon 前缀命令：`prefix` 字段与 `SummonTick` 匹配逻辑一致**。三组断言：①静态形状 —— `SummonTick` 必须仍是「先精确（`SUMMON_CMDS.Has(cmd)`）再只对 `prefix:true` 走前缀」，`if !e.prefix` 后必须紧接 `continue`，前缀比较与取参仍是 `SubStr(cmd,1,StrLen(name))` / `SubStr(cmd,StrLen(name)+1)`；②表自洽 —— `prefix:true` 的名字必须以 `=` 结尾（否则任何以它开头的输入都被吞），`prefix:false` 的不许以 `=` 结尾（否则参数永远进不来），两两不许互为前缀（否则结果依赖声明顺序）；③可达性模拟 —— 按真实顺序跑一遍，12 条命令的样本必须各自唯一命中自己。2026-11-22 新增：这个字段此前没人盯，把 `log=` 改成 `prefix:false` 会让 `log=200` 永久不可达，而 `SummonTick` 对未知命令静默忽略、日志干净，表现成「写了 `summon.cmd` 没反应」 |
+| CON-024 | **架构图自检**：三张 HTML（`E:\DSHWORK\pkg\`，仓库外、无版本控制）必须①以 `</html>` 结尾、`div/section/table/svg/tr/td/g` 开闭相等、没有半截闭合标签（`</tr` 少个 `>` 浏览器能容忍、肉眼看不出来，2026-11-26 真踩过）；②整体图必须把 `$script:ROUTES` 的 24 条路由一条不漏地画进去；③图里出现的路由不许是代码中不存在的（照着幻影路由排障会查空）；④图里点名的 `.ps1/.ahk/.vbs` 必须真实存在；⑤角标带「依据 dev 分支 `<code>哈希</code>` + 日期」。目录不在就 `skip`（架构图只在本机发布包目录）。目录可用 `DSH_PKG` 覆盖，便于在沙箱里做负向验证 |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -158,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RUN-014 | **`wxmon.hb` 心跳新鲜**：pid 只能证明进程还在，「进程在、循环不动」这台机器上真发生过两次（2026-11-24 冻 12 小时、11-25 睡眠后延迟两分半）。判据 = 心跳文件存在、内容是 `ts=<epoch毫秒>`、不晚于当前时间 120s 以上、mtime 距今 ≤900s（3 个周期）；机器恢复通电不足 900s 时只报数值不判红 |
 | RUN-015 | **`hwmon.hb` 心跳新鲜**：与 `RUN-014` 同构（2026-11-26 加）。`hwmon` 每 2 秒写一次 `hw-data.js`，卡住时硬件面板只是冻在最后一帧、pid 判活看不出来；判据 = 心跳文件存在、内容 `ts=<epoch毫秒>`、mtime 距今 ≤180s（2s × 90 轮，与 `ensure-all` 采样段的阈值一致），机器恢复通电不足 180s 时只报数不判红 |
 
-### 50-resilience · 健壮性与容量（21 条）
+### 50-resilience · 健壮性与容量（23 条）
 | 编号 | 查什么 |
 |---|---|
 | RES-001 | `wheel.log` / `dsh-run.log` **有 256KB 轮转**（查写入方代码里的阈值 + `FileMove`/`Move-Item` 改名，不只看尺寸）+ 未超 1MB |
@@ -182,6 +183,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-019 | **代理重启只有一个动手者**：`agent-watch.ps1`（5s 一轮）与 `ensure-all.ps1`（2min 一轮）原来都会 `taskkill` + 重新拉起代理，2026-11-14 21:39~22:06 两者交替动手把重启打成了风暴（`watch: restart FAILED` 与 `ensure: agent restart FAILED` 混着出现）。现在唯一权威是看门狗：`ensure-all.ps1` 只在 `-not (ProcAlive $agentPid)`（进程根本不在）时补起一个并记 `ensure: agent missing … started`，「在但不健康」只记 `ensure: agent alive but unhealthy …, left to watch`、**不许再 `taskkill`**；静态同时咬住看门狗仍保留 `taskkill.exe /PID $pid2` 与 `watch: restart ` 结论行，防止收敛过头变成两边都不动手（2026-11-15 收敛） |
 | RES-020 | **采样进程看护（`ensure-all` 3b 段）**：表驱动管两个采样进程（2026-11-26 从「只管 wxmon」扩到 `wxmon` + `hwmon`）。静态咬住「`wxmon` 阈值 900s（300s×3）/ `hwmon` 阈值 180s（2s×90）」「两个心跳文件都要看」「卡死留痕」「复核后心跳前进就放走」；再在沙箱里用桩函数跑三形态 —— 两个 pid 都缺失时各补起一次、只有 `wxmon` 心跳 2000s 前时只重拉它（`hwmon` 心跳新鲜不许被杀）、两个都新鲜时**零动作**（段里的 `taskkill` 打的是真实探测过不存在的 pid）。这条段 2026-11-24 加上时只有手测证据 |
 | RES-021 | **睡眠恢复后采样不拖延**：`wxmon` 主循环不许再 `Start-Sleep -Seconds $Interval`（系统睡眠会冻结它，醒来后仍要睡完剩余时间），必须按墙钟算 `$deadline = (Get-Date).AddSeconds($Interval)` 并 5 秒粒度轮询、睡过头记 `wake gap`；`hwmon`（2s 一轮）不许跟着改 |
+| RES-022 | **代理看护的行为级护栏（`ensure-all` 代理段）**：`RES-019` 只做静态文本断言，能在 `elseif (-not (AgentHealthy))` 分支里塞一句 `StartHidden` 而不被它发现（文本上仍然没有 `taskkill`、`left to watch` 也还在），行为却变回「每 2 分钟拉起一个新代理」。这条把代理段取到沙箱、用桩函数跑三形态：pid 不在 → 恰好补起一次；pid 在但不健康 → 只记 `left to watch`、**不许拉也不许杀**；pid 在且健康 → 一个动作一行日志都不许有 |
+| RES-023 | **快捷启动栏宿主有看护（`ensure-all` 4b 段）**：`dock-add-host.ps1` 原来只在登录时被拉起一次、之后没人管，挂了的表现是「点＋没反应」（代理只写 `dock-add.trigger`），而那条 trigger 会一直留着、下次登录自己弹框。要求和 `dock-add-host.ps1` 里新建互斥体时用的名字**逐字一致**（错一个字符就变成每 2 分钟拉一个立刻退出的进程，而日志看起来很像是它在自愈），只按互斥体判活（扫命令行会被探针命令误匹配）；沙箱两形态：互斥体在 → 零动作、不在 → 恰好拉起一次 |
 
 ### 60-data · 数据完整性（9 条）
 | 编号 | 查什么 |
@@ -196,7 +199,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | DAT-008 | **待办生成物整份替换**：`SyncTodoFile` 不许「先 `FileDelete(TODO_JS)` 再 `FileAppend`」（删成功后有「文件不存在」空窗，壁纸 10 秒热加载会读到空面板；删失败则追加在旧内容后面，每次同步再叠一份 `__TODO_TS`，只增不减且 `node --check` 照样过）；必须走 `WriteFileAtomic`（tmp + `FileMove`，`UTF-8-RAW` 与代理侧一致）。活体看真实 `todo-data.js` 是否只有 1 份定义（2026-11-10 修） |
 | DAT-009 | **图标重建失败时不毁旧图标**：在临时副本上把 `Add-Type` 换成必抛异常，验证「非 0 退出 + 旧图标原样保留 + `icons.new-*` 暂存目录清理干净 + stderr 有 `add-type` 提示」。判据用 `ProcessStartInfo` 起子进程（本机 PS 5.1 的 `Start-Process -RedirectStandard*` 有 bug，会以「测试手法坏了」的形状假红，2026-11-15 修） |
 
-合计 98 条。
+合计 101 条。
 
 ---
 
