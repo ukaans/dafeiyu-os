@@ -159,8 +159,43 @@ Test-Case RES-005 '健壮' '数据落盘使用原子替换' medium {
         elseif ($agent -notmatch ('Move-Item[^\r\n]*' + $pair.Dst + '[^\r\n]*-Force')) { $bad += ('dsh-agent.ps1 写 ' + $pair.Name + ' 没做原子覆盖') }
     }
 
+        # 2026-11-28 补：dock-add-host.ps1（快捷启动栏的「添加」宿主）也是 dock.txt 的写者。
+    # 它原来是 WriteAllLines 直写 —— 先把文件截成 0 字节再补齐，而 dock.txt 被代理的 Get-Dock
+    # （每次 /dock.js 都读，壁纸左侧 6 格）与 /launchpath.gif 的白名单共读，撞上就是「快捷启动少几项」；
+    # dock-add.state 同理，代理每轮 /dock.js 都读它判「选择框还开着」，读到空就把 busy 判成 0。
+    # （AHK 里那句「dock.txt 只有代理 Save-Dock 一个写者」在 2026-11-28 之前是错的，注释已订正。）
+    $dh = Read-Raw (Join-Path $root 'drawer\dock-add-host.ps1')
+    if ($dh -notmatch 'function Write-Atomic') { $bad += 'dock-add-host.ps1 没有 Write-Atomic（tmp + 原子覆盖）' }
+    elseif ($dh -notmatch 'Move-Item[^\r\n]*-Destination\s+\$path[^\r\n]*-Force') { $bad += 'dock-add-host.ps1 的 Write-Atomic 没做原子覆盖（Move-Item -Force）' }
+    if ($dh -match 'WriteAllLines\(\s*\$dock') { $bad += 'dock-add-host.ps1 还在直写 dock.txt（WriteAllLines）' }
+    if ($dh -match 'WriteAllText\(\s*\$state') { $bad += 'dock-add-host.ps1 还在直写 dock-add.state（WriteAllText）' }
+
+    # 活体（函数级）：把 Write-Atomic 取出来在临时目录真跑一次。
+    # 静态判据只看「是不是按格式写的」，行为要真验 —— 这也是本轮改动的运行时证据：
+    # 真实写入路径要先弹「选择程序」框，夜间不可能走（会惊扰用户），只能函数级验。
+    $mFn = [regex]::Match($dh, '(?s)function Write-Atomic.*?\r?\n\}')
+    if (-not $mFn.Success) { $bad += 'dock-add-host.ps1 里取不出 Write-Atomic 函数体（行为段无法验证）' }
+    else {
+        $tmpA = Join-Path $env:TEMP ('dsh_atomic_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        [void](New-Item -ItemType Directory -Path $tmpA -Force)
+        try {
+            . ([scriptblock]::Create($mFn.Value))
+            $fpA = Join-Path $tmpA 'dock.txt'
+            [System.IO.File]::WriteAllText($fpA, "old|old|old.png`r`n", (New-Object System.Text.UTF8Encoding($false)))
+            Write-Atomic $fpA "a|A|a.png`r`nb|B|b.png`r`n"
+            $gotA = [System.IO.File]::ReadAllText($fpA, [System.Text.Encoding]::UTF8)
+            if ($gotA -ne "a|A|a.png`r`nb|B|b.png`r`n") { $bad += ('Write-Atomic 没把内容换掉（读到 ' + $gotA.Trim() + '）') }
+            if (Test-Path -LiteralPath ($fpA + '.tmp')) { $bad += 'Write-Atomic 留下了 .tmp（说明是复制而不是改名覆盖）' }
+            # 目标文件不存在时也要建得出来：第一次加项时 dock.txt 可能还没有
+            $fpB = Join-Path $tmpA 'dock2.txt'
+            Write-Atomic $fpB "x|X|x.png`r`n"
+            if (-not (Test-Path -LiteralPath $fpB)) { $bad += 'Write-Atomic 建不出新文件（dock.txt 不存在时第一次加项会丢）' }
+            elseif (([System.IO.File]::ReadAllText($fpB, [System.Text.Encoding]::UTF8)) -ne "x|X|x.png`r`n") { $bad += 'Write-Atomic 建新文件时内容不对' }
+        } catch { $bad += ('Write-Atomic 活体跑挂了：' + $_.Exception.Message) }
+        finally { try { [System.IO.Directory]::Delete($tmpA, $true) } catch { } }
+    }
     if ($bad.Count -gt 0) { throw ($bad -join '；') }
-    'hw-data / wx-data / layout / todo / todo-data / dock 六处都是 tmp + 原子覆盖'
+    'hw-data / wx-data / layout / todo / todo-data / dock 六处 + dock-add-host 两处（dock.txt / dock-add.state）都是 tmp + 原子覆盖'
 } -Hint '不要用「先删再写」：进程被杀就丢布局；tmp 要同盘同目录（跨盘 Move 会退化成复制+删除）'
 
 Test-Case RES-006 '健壮' 'panel-rect 内容合法' low {
@@ -1069,6 +1104,15 @@ Test-Case RES-023 '健壮' '快捷启动栏宿主有看护：互斥体不在就�
     if ($seg -notmatch "dock-add-host missing") { throw '拉起宿主时没有留痕（事后不知道它被谁拉起来过）' }
     if ($seg -notmatch 'StartHidden') { throw '看护段没有真正拉起宿主（只记日志不补）' }
 
+    # 第三个地方也写着这个互斥体名：verify.ps1（自检里判「宿主在不在」）。三处必须逐字一致 ——
+    # 只改宿主与巡检、漏了自检，自检就永远报「宿主没在跑」（那是 info，不挡退出码，慢慢就没人信了）。
+    $vfy = Read-Raw (Join-Path $root 'verify.ps1')
+    $iV = $vfy.IndexOf('快捷启动栏宿主')
+    if ($iV -lt 0) { throw 'verify.ps1 没有「快捷启动栏宿主」这一段（宿主挂了自检看不见，只能翻 ensure-all.log）' }
+    $mV = [regex]::Match($vfy.Substring($iV), "OpenExisting\('([^']+)'\)")
+    if (-not $mV.Success) { throw 'verify.ps1 判宿主存活没有走互斥体（OpenExisting），扫命令行或看 pid 都会误判' }
+    if ($mV.Groups[1].Value -ne $mtxHost) { throw ('verify.ps1 的互斥体名与宿主不一致（宿主 [' + $mtxHost + ']，自检 [' + $mV.Groups[1].Value + ']）—— 自检会永远说「宿主没在跑」') }
+
     # 行为：互斥体在 → 一个动作都不许有；不在 → 恰好拉起一次
     $tmp = Join-Path $env:TEMP ('dsh_dockwd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     [void](New-Item -ItemType Directory -Path $tmp -Force)
@@ -1101,5 +1145,5 @@ function StartHidden([string]$exe, [string[]]$argv) { [IO.File]::AppendAllText('
         try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
     }
 
-    ('宿主互斥体 ' + $mtxHost + ' 两边逐字一致；互斥体在零动作、不在恰好拉起一次（静态 + 沙箱活体）')
+    ('宿主互斥体 ' + $mtxHost + ' 三处（宿主 / ensure-all / verify.ps1）逐字一致；互斥体在零动作、不在恰好拉起一次（静态 + 沙箱活体）')
 } -Hint '症状：抽屉里点「＋」没反应，而 /adddock.gif 明明回了 GIF。查 ensure-all.log 有没有 dock-add-host missing；改互斥体名要两边一起改'

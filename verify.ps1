@@ -46,7 +46,7 @@ function Read-Pid([string]$file) {
 }
 
 Write-Host "== 文件"
-foreach ($f in @('AutoHotkey64.exe','DesktopPage.ahk','dsh-agent.ps1','agent-watch.ps1','agent-config.ps1','ensure-all.ps1','ensure-all.vbs','start-all.vbs','hwmon.ps1','wxmon.ps1','items.tsv','layout.dat')) {
+foreach ($f in @('AutoHotkey64.exe','DesktopPage.ahk','dsh-agent.ps1','agent-watch.ps1','agent-config.ps1','ensure-all.ps1','ensure-all.vbs','start-all.vbs','hwmon.ps1','wxmon.ps1','wheel-bridge.ps1','dock-add-host.ps1','items.tsv','layout.dat')) {
     if (Test-Path (Join-Path $InstallDir $f)) { Ok "$f 存在" } else { Bad "$f 缺失（$InstallDir）" }
 }
 
@@ -78,6 +78,44 @@ if ($watchPid -gt 0 -and (Get-Process -Id $watchPid -ErrorAction SilentlyContinu
     Ok "代理看门狗运行中 (agent-watch.pid=$watchPid)"
 } else {
     Bad "代理看门狗未运行（假死时没人重启代理）"
+}
+
+Write-Host "== 快捷启动栏宿主"
+# dock-add-host.ps1 由 start-all.vbs 在登录链末段拉起一次，2026-11-27 起由 ensure-all 每 2 分钟看护
+# （判活只认它自己持有的互斥体，不扫命令行）。它挂了**不留任何日志**，表现只是「抽屉顶栏点＋没反应」，
+# 以前只能翻 ensure-all.log 才知道它被补起过 —— 自检里得能看见它。
+# 只有「反复被拉起」才判失败：ensure-all 2 分钟一轮，正常只在开机补一次；20 分钟内 3 次以上说明
+# 它起来就退（Add-Type 装不上 WinForms / 互斥体名对不上），那种状态下点＋永远是没反应的。
+$dockMtx = $false
+try {
+    $dm = [System.Threading.Mutex]::OpenExisting('Global\DesktopPage_dockpick')
+    $dm.Dispose()
+    $dockMtx = $true
+} catch { $dockMtx = $false }
+if ($dockMtx) {
+    Ok "快捷启动栏宿主运行中（互斥体 Global\DesktopPage_dockpick 在）"
+} else {
+    $dlog = Join-Path $InstallDir 'ensure-all.log'
+    $nStart = 0
+    if (Test-Path $dlog) {
+        $nowD = Get-Date
+        foreach ($ln in @(Get-Content $dlog -Tail 300 -Encoding utf8)) {
+            if ($ln -notmatch 'ensure: dock-add-host missing') { continue }
+            # ensure-all 的 Log() 只写 MM-dd（没有年份），跨年靠「超过未来一天就减一年」兜
+            $m2 = [regex]::Match($ln, '^(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})')
+            if (-not $m2.Success) { continue }
+            try {
+                $dt2 = [datetime]::ParseExact(($m2.Groups[1].Value + '-' + $m2.Groups[2].Value + ' ' + $m2.Groups[3].Value + ':' + $m2.Groups[4].Value + ':' + $m2.Groups[5].Value), 'MM-dd HH:mm:ss', $null)
+                if ($dt2 -gt $nowD.AddDays(1)) { $dt2 = $dt2.AddYears(-1) }
+                if (($nowD - $dt2).TotalMinutes -le 20) { $nStart++ }
+            } catch { }
+        }
+    }
+    if ($nStart -ge 3) {
+        Bad ("快捷启动栏宿主没站住：20 分钟内被 ensure-all 拉起 " + $nStart + " 次（起来就退，看 dock-add-host.ps1 的 Add-Type / 互斥体名；这期间点＋没反应）")
+    } else {
+        Info "快捷启动栏宿主没在跑（ensure-all 每 2 分钟会补一次；这期间点＋没反应）"
+    }
 }
 
 Write-Host "== 代理心跳与端口"

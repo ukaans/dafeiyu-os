@@ -126,7 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | CON-021 | **组件契约表与路由表对齐**：`drawer\components.md` 的「**路由**：」那一行必须把 `$script:ROUTES` 的 24 条 + `/icon/` 前缀一条不漏地列全，且不许写路由表里没有的（死路由）。管的是与 `CON-004`（项目地图 §3）**平行的第二份文档** —— 2026-11-20 实测它缺 `/log.js` `/reload.gif` `/dbg.gif` `/iconbuild.gif` `/icons.gif` 五条，排障时照它查「谁调这条接口」会查不到 |
 | CON-022 | **summon 命令表四处对齐**：`$SUMMON_CMDS`（真相）↔ `components.md` 的「**文件命令**」半句 ↔ `项目地图 §6.1` 速查表（这两处双向：漏了/多写都报）↔ `项目地图 §5` 的 `summon.cmd` 数据文件行（那一列允许 `<路径>` 占位，只要求命令名被提到）。另断言表里每个 `fn:` 都能在 `DesktopPage.ahk` 里找到同名函数定义（改名后留下死引用）。2026-11-21 实测 §5 少了 `rescan` / `rollback` / `snaptest` 三条（11-14 才加的快照回滚与重扫），照着它排障的人会以为抽屉没这两个入口 |
 | CON-023 | **summon 前缀命令：`prefix` 字段与 `SummonTick` 匹配逻辑一致**。三组断言：①静态形状 —— `SummonTick` 必须仍是「先精确（`SUMMON_CMDS.Has(cmd)`）再只对 `prefix:true` 走前缀」，`if !e.prefix` 后必须紧接 `continue`，前缀比较与取参仍是 `SubStr(cmd,1,StrLen(name))` / `SubStr(cmd,StrLen(name)+1)`；②表自洽 —— `prefix:true` 的名字必须以 `=` 结尾（否则任何以它开头的输入都被吞），`prefix:false` 的不许以 `=` 结尾（否则参数永远进不来），两两不许互为前缀（否则结果依赖声明顺序）；③可达性模拟 —— 按真实顺序跑一遍，12 条命令的样本必须各自唯一命中自己。2026-11-22 新增：这个字段此前没人盯，把 `log=` 改成 `prefix:false` 会让 `log=200` 永久不可达，而 `SummonTick` 对未知命令静默忽略、日志干净，表现成「写了 `summon.cmd` 没反应」 |
-| CON-024 | **架构图自检**：三张 HTML（`E:\DSHWORK\pkg\`，仓库外、无版本控制）必须①以 `</html>` 结尾、`div/section/table/svg/tr/td/g` 开闭相等、没有半截闭合标签（`</tr` 少个 `>` 浏览器能容忍、肉眼看不出来，2026-11-26 真踩过）；②整体图必须把 `$script:ROUTES` 的 24 条路由一条不漏地画进去；③图里出现的路由不许是代码中不存在的（照着幻影路由排障会查空）；④图里点名的 `.ps1/.ahk/.vbs` 必须真实存在；⑤角标带「依据 dev 分支 `<code>哈希</code>` + 日期」。目录不在就 `skip`（架构图只在本机发布包目录）。目录可用 `DSH_PKG` 覆盖，便于在沙箱里做负向验证 |
+| CON-024 | **架构图自检**：三张 HTML（`E:\DSHWORK\pkg\`，仓库外、无版本控制）必须①以 `</html>` 结尾、`div/section/table/svg/tr/td/g` 开闭相等、没有半截闭合标签（`</tr` 少个 `>` 浏览器能容忍、肉眼看不出来，2026-11-26 真踩过）；②整体图必须把 `$script:ROUTES` 里带 `.gif/.js` 尾巴的 23 条路由**一条不漏、也不许多画**（按 token 集合相等判，不按「子串出现过」—— 旧判据下图上写了 `/state.js`，`/state` 这条就永远算「有」）；不带尾巴的 `/state` 与 `/icon/` 前缀按子串判；③图里出现的路由不许是代码中不存在的（照着幻影路由排障会查空）；④图里点名的 `.ps1/.ahk/.vbs` 必须真实存在；⑤角标带「依据 dev 分支 `<code>哈希</code>` + 日期」。目录不在就 `skip`（架构图只在本机发布包目录）。目录可用 `DSH_PKG` 覆盖，便于在沙箱里做负向验证 |
 
 ### 30-security · 安全风险（8 条）
 | 编号 | 查什么 |
@@ -166,7 +166,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-002 | 有上限的 4 份日志未超限 |
 | RES-003 | 安装目录 `.bak` 堆积情况（`layout.bak`/`hidden.bak` 是 `--selftest` 的功能文件，不算堆积） |
 | RES-004 | `launch-queue.txt` 无残留（有残留=点了图标没反应） |
-| RES-005 | 数据落盘用 tmp + 原子覆盖（hw / wx / 代理侧 todo、todo-data、dock 共六处） |
+| RES-005 | 数据落盘用 tmp + 原子覆盖（hw / wx / 代理侧 todo、todo-data、dock 六处，**外加 `dock-add-host.ps1` 的 `dock.txt` / `dock-add.state`**）。宿主那侧 2026-11-28 才补：它原来 `WriteAllLines` 直写，而 `dock.txt` 每次 `/dock.js` 都被读、`/launchpath.gif` 的白名单也读它 —— 静态四条（有 `Write-Atomic`、里面是 `Move-Item -Force`、不再 `WriteAllLines($dock)`、不再 `WriteAllText($state)`）+ 活体（把 `Write-Atomic` 取出来在临时目录真跑：内容换掉、不留 `.tmp`、目标不存在时也建得出来） |
 | RES-006 | `panel-rect.txt` 是 4 个 0..10000 的整数 |
 | RES-007 | 看门狗没有「还在发生」的重启风暴：①**`restart FAILED` 只报仍然失败的**——最近 60 分钟内失败过，或最后一次动手失败之后没有成功重启；几小时前排掉的历史失败写成 detail 不报红（机器满载时冷启动十几秒，看门狗会正常记一条 FAILED，下一轮就好了）；②「10 分钟内 ≥3 次」的风暴按**风暴窗口的最后一次**（`$burstEnd`，不是全局最后一次重启）算是否还在发生 —— 一次合法的单发自愈不该把几小时前的旧风暴重新标成"仍在发生"（2026-11-15 修） |
 | RES-008 | `start-all.log` **最近一轮**走到 `done`、无 `STILL DOWN`。按 `start: appDir=` 切轮次，不拿末尾 N 行一刀切（一轮只写 4~6 行，40 行窗口里能躺 8 轮，一次失败会连着红七八轮）；最新一轮若还在跑（无 `done` 且 ≤120 秒）先跳过、判上一轮；**没 `done` 又超过 120 秒 = 卡住了**（2026-11-05 `start-all.vbs` 漏 `Dim`，wscript 弹不可见模态框，日志停在中途、计划任务一直 `Running`，旧判据只会报 `STILL DOWN` 或干脆看不出来） |
@@ -184,7 +184,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1 -Intrusive
 | RES-020 | **采样进程看护（`ensure-all` 3b 段）**：表驱动管两个采样进程（2026-11-26 从「只管 wxmon」扩到 `wxmon` + `hwmon`）。静态咬住「`wxmon` 阈值 900s（300s×3）/ `hwmon` 阈值 180s（2s×90）」「两个心跳文件都要看」「卡死留痕」「复核后心跳前进就放走」；再在沙箱里用桩函数跑三形态 —— 两个 pid 都缺失时各补起一次、只有 `wxmon` 心跳 2000s 前时只重拉它（`hwmon` 心跳新鲜不许被杀）、两个都新鲜时**零动作**（段里的 `taskkill` 打的是真实探测过不存在的 pid）。这条段 2026-11-24 加上时只有手测证据 |
 | RES-021 | **睡眠恢复后采样不拖延**：`wxmon` 主循环不许再 `Start-Sleep -Seconds $Interval`（系统睡眠会冻结它，醒来后仍要睡完剩余时间），必须按墙钟算 `$deadline = (Get-Date).AddSeconds($Interval)` 并 5 秒粒度轮询、睡过头记 `wake gap`；`hwmon`（2s 一轮）不许跟着改 |
 | RES-022 | **代理看护的行为级护栏（`ensure-all` 代理段）**：`RES-019` 只做静态文本断言，能在 `elseif (-not (AgentHealthy))` 分支里塞一句 `StartHidden` 而不被它发现（文本上仍然没有 `taskkill`、`left to watch` 也还在），行为却变回「每 2 分钟拉起一个新代理」。这条把代理段取到沙箱、用桩函数跑三形态：pid 不在 → 恰好补起一次；pid 在但不健康 → 只记 `left to watch`、**不许拉也不许杀**；pid 在且健康 → 一个动作一行日志都不许有 |
-| RES-023 | **快捷启动栏宿主有看护（`ensure-all` 4b 段）**：`dock-add-host.ps1` 原来只在登录时被拉起一次、之后没人管，挂了的表现是「点＋没反应」（代理只写 `dock-add.trigger`），而那条 trigger 会一直留着、下次登录自己弹框。要求和 `dock-add-host.ps1` 里新建互斥体时用的名字**逐字一致**（错一个字符就变成每 2 分钟拉一个立刻退出的进程，而日志看起来很像是它在自愈），只按互斥体判活（扫命令行会被探针命令误匹配）；沙箱两形态：互斥体在 → 零动作、不在 → 恰好拉起一次 |
+| RES-023 | **快捷启动栏宿主有看护（`ensure-all` 4b 段）**：`dock-add-host.ps1` 原来只在登录时被拉起一次、之后没人管，挂了的表现是「点＋没反应」（代理只写 `dock-add.trigger`），而那条 trigger 会一直留着、下次登录自己弹框。要求和 `dock-add-host.ps1` 里新建互斥体时用的名字**逐字一致**（错一个字符就变成每 2 分钟拉一个立刻退出的进程，而日志看起来很像是它在自愈），只按互斥体判活（扫命令行会被探针命令误匹配）；**三处**（宿主 / `ensure-all` / `verify.ps1`）的互斥体名必须逐字一致 —— 只改前两处、漏了自检，自检就永远报「宿主没在跑」（那是 info，不挡退出码，慢慢就没人信了）；沙箱两形态：互斥体在 → 零动作、不在 → 恰好拉起一次 |
 
 ### 60-data · 数据完整性（9 条）
 | 编号 | 查什么 |

@@ -771,7 +771,7 @@ Test-Case CON-024 '契约' '架构图自检：结构完整、整体图路由一�
     # 肉眼看不出，但那一行之后整张表的结构都是错的（是靠手算 tr 开闭才发现的）。
     # 每次重画后都要人工做的那几步自检，写成可重复的判据：
     #   ①文件在、以 </html> 结尾、标签开闭相等、没有半截闭合标签
-    #   ②整体图必须把 $script:ROUTES 一条不漏地画进去（它是路由全表那张）
+    #   ②整体图必须把 $script:ROUTES 一条不漏地画进去、也不许多画（token 集合相等，不是子串出现过）
     #   ③图里出现的路由不许是幻影（代码里没有的路由，照着图排障会查不到）
     #   ④图里点名的 .ps1/.ahk/.vbs 必须真实存在于仓库
     #   ⑤角标带 commit 短哈希与日期（「依据哪一版画的」是这三张图唯一的溯源信息）
@@ -797,6 +797,9 @@ Test-Case CON-024 '契约' '架构图自检：结构完整、整体图路由一�
         [void]$knownFiles.Add($f.Name)
     }
 
+    # 带 .gif/.js 尾巴的路由能单独成 token，按集合比；不带尾巴的（/state、/icon/ 前缀）只能按子串判
+    $tokenRoutes = @($knownRoutes | Where-Object { $_ -match '\.(?:gif|js)$' })
+    $plainRoutes = @($knownRoutes | Where-Object { $_ -notmatch '\.(?:gif|js)$' })
     $maps = @(
         @{ Name = '整体'; File = '大肥鱼-整体架构图.html';       AllRoutes = $true }
         @{ Name = '桌面'; File = '大肥鱼-桌面系统-架构图.html';   AllRoutes = $false }
@@ -831,12 +834,14 @@ Test-Case CON-024 '契约' '架构图自检：结构完整、整体图路由一�
         if ($phantom.Count -gt 0) { $msg += ($m.Name + '图里有代码中不存在的路由：' + ($phantom -join '、')) }
         $nRoutes += $drawn.Count
         if ($m.AllRoutes) {
-            $missing = @()
-            foreach ($r in $knownRoutes) {
-                if ($r -eq '/icon/') { if ($t -notmatch [regex]::Escape('/icon/')) { $missing += $r }; continue }
-                if ($t -notmatch [regex]::Escape($r)) { $missing += $r }
-            }
+            # 2026-11-28：从「子串出现过」改成「token 集合相等」。子串判据两头漏：
+            # ①同族前缀互相顶替 —— 图上写了 /state.js，/state 这条就永远算「有」，少画也看不出来；
+            # ②只查「漏」不查「多」—— 多画一条不存在的通道不报，照着图排障会去查一个假接口。
+            # 现在：带尾巴的路由要求「画到的集合 == 路由表里带尾巴的集合」（多画由上面的幻影判据报）。
+            $missing = @($tokenRoutes | Where-Object { $drawn -notcontains $_ })
             if ($missing.Count -gt 0) { $msg += ($m.Name + '图漏了 ' + $missing.Count + ' 条路由：' + ($missing -join '、')) }
+            $missPlain = @($plainRoutes | Where-Object { $t -notmatch [regex]::Escape($_) })
+            if ($missPlain.Count -gt 0) { $msg += ($m.Name + '图没提到：' + ($missPlain -join '、')) }
         }
 
         # 点名的文件必须真实存在（图里写了个不存在的文件，改代码的人会去找不到）
@@ -855,6 +860,7 @@ Test-Case CON-024 '契约' '架构图自检：结构完整、整体图路由一�
     }
 
     if ($msg.Count -gt 0) { throw ($msg -join '；') }
-    ('三张结构完整（结尾 / 标签开闭 / 无半截闭合）+ 整体图 ' + $knownRoutes.Count + ' 条路由全在 + 图内 ' +
-        $nFiles + ' 处文件名真实存在 + 角标齐全（共画到 ' + $nRoutes + ' 处路由引用）')
+    ('三张结构完整（结尾 / 标签开闭 / 无半截闭合）+ 整体图 ' + $tokenRoutes.Count + ' 条带尾巴路由集合相等（另有 ' +
+        $plainRoutes.Count + ' 条按子串判）+ 图内 ' + $nFiles + ' 处文件名真实存在 + 角标齐全（共画到 ' +
+        $nRoutes + ' 处路由引用）')
 } -Hint '重画架构图后跑这条；红了先改图，不要改代码去迁就图（目录可用 DSH_PKG 覆盖）'

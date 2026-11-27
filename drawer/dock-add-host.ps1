@@ -17,8 +17,18 @@ try {
     Add-Type -AssemblyName System.Drawing
 } catch { exit 1 }
 
+function Write-Atomic([string]$path, [string]$text) {
+    # tmp + Move-Item 覆盖（与代理的 Save-Dock / hwmon 同一范式）。
+    # dock.txt 与 dock-add.state 都有人高频读：代理的 Get-Dock 每次 /dock.js 都读 dock.txt
+    # （壁纸左侧那 6 格），/launchpath.gif 的白名单也读它；dock-add.state 则每轮 /dock.js 读一次
+    # 来判断「选择框还开着」。直写是「先截断成 0 字节再补齐」，撞上读者就是「快捷启动少几项」
+    # 或 busy 误判成 0。写不动就抛给调用方，由它决定这一轮不写，绝不退回直写。
+    $tmp = $path + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
+}
 function Set-State([string]$s) {
-    try { [System.IO.File]::WriteAllText($state, $s, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    try { Write-Atomic $state $s } catch { }
 }
 Set-State 'idle'
 
@@ -45,7 +55,11 @@ function Add-Paths([string[]]$paths) {
         $name = [System.IO.Path]::GetFileNameWithoutExtension($f)
         $rows += ($f + '|' + $name + '|' + $icon)
     }
-    try { [System.IO.File]::WriteAllLines($dock, $rows, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+    # 原子写：dock.txt 由代理 / 壁纸 / 本宿主三方共读（见 Write-Atomic 的注释）。
+    # WriteAllLines 的换行与 AppendLine 一致（都是 CRLF），内容格式不变。
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($r in $rows) { [void]$sb.AppendLine($r) }
+    try { Write-Atomic $dock $sb.ToString() } catch { }
 }
 
 while ($true) {

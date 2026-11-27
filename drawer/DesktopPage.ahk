@@ -607,7 +607,7 @@ AgentToken() {
         return ""
 }
 
-; 快捷启动栏的加项也走代理：dock.txt 只有代理 Save-Dock 一个写者（tmp + 原子覆盖）。
+; 快捷启动栏的加项也走代理：dock.txt 的写者只有代理 Save-Dock 与常驻的 dock-add-host.ps1（选择框），两处都是 tmp + 原子覆盖。
 ; AHK 直接 FileAppend 会和代理 /dock.gif?op=del 的「读旧→覆盖」抢文件：
 ; 代理刚删完一项并覆盖，AHK 紧接着按旧内容追加，删除就被静默回滚。
 AgentDockAdd(path, name, iconName) {
